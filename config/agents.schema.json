@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Seggs agent configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "fullscreen": {"type": "boolean", "default": true},
+    "agents": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "argv"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[!-~]+$", "description": "Unique among all configured agents."},
+          "name": {"type": "string", "minLength": 1, "maxLength": 64, "pattern": "^[ -~]+$"},
+          "argv": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"type": "string", "maxLength": 16384, "pattern": "^[^\\u0000]*$"}, "description": "Executable and arguments. The first argument must not be empty. No shell expansion occurs."},
+          "cwd": {"type": ["string", "null"], "description": "Absolute path to a worktree. An absent value uses the UI workspace."}
+        }
+      }
+    }
+  }
+}

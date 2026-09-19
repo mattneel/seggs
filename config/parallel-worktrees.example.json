@@ -1,0 +1,8 @@
+{
+  "fullscreen": true,
+  "agents": [
+    {"id": "omp", "name": "Oh-My-Pi / plan", "argv": ["omp", "acp"], "cwd": "/absolute/path/to/worktree-plan"},
+    {"id": "codex", "name": "Codex / implement", "argv": ["codex-acp"], "cwd": "/absolute/path/to/worktree-implement"},
+    {"id": "claude", "name": "Claude / review", "argv": ["claude-agent-acp"], "cwd": "/absolute/path/to/worktree-review"}
+  ]
+}

@@ -1,0 +1,47 @@
+name: Seggs validation
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  core:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install exact Zig release
+        run: |
+          python3 tools/install_zig.py
+          echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
+      - name: Pure core tests
+        run: zig build test
+      - name: Python fixture tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Repository contracts
+        run: python3 tools/check_repo.py
+  native-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake git pkg-config python3 \
+            libfreetype6-dev libx11-dev libxext-dev libxrandr-dev \
+            libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxrender-dev \
+            glslang-tools libvulkan-dev mesa-vulkan-drivers fonts-dejavu-core xvfb
+      - name: Install Zig and SDL baseline
+        run: |
+          python3 tools/bootstrap.py --install-zig
+          echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
+      - name: Core, native ACP, and compile gates
+        run: zig build verify
+      - name: Vulkan window smoke
+        env:
+          SDL_VIDEODRIVER: x11
+        run: |
+          LVP=$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)
+          test -n "$LVP"
+          VK_ICD_FILENAMES="$LVP" xvfb-run -a zig build run -- --windowed --frames 8

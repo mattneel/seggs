@@ -1,0 +1,9 @@
+{
+  "fullscreen": true,
+  "agents": [
+    {"id": "omp", "name": "Oh-My-Pi", "argv": ["omp", "acp"]},
+    {"id": "codex", "name": "Codex", "argv": ["codex-acp"]},
+    {"id": "claude", "name": "Claude Code", "argv": ["claude-agent-acp"]},
+    {"id": "mock", "name": "Local mock", "argv": ["python3", "tools/mock_agent.py"]}
+  ]
+}

@@ -1,0 +1,11 @@
+.zig-cache/
+zig-out/
+.deps/
+.env
+.env.*
+!.env.example
+config/local.json
+*.seggs-tmp-*
+__pycache__/
+*.pyc
+.DS_Store

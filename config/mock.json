@@ -1,0 +1,8 @@
+{
+  "fullscreen": false,
+  "agents": [
+    {"id": "alpha", "name": "Mock Alpha", "argv": ["python3", "tools/mock_agent.py", "--name", "alpha", "--fragment", "3"]},
+    {"id": "beta", "name": "Mock Beta", "argv": ["python3", "tools/mock_agent.py", "--name", "beta", "--fragment", "5"]},
+    {"id": "gamma", "name": "Mock Gamma", "argv": ["python3", "tools/mock_agent.py", "--name", "gamma", "--fragment", "7"]}
+  ]
+}

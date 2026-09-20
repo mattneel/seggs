@@ -10,22 +10,37 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+      - name: Restore the Zig toolchain
+        id: zig
+        uses: actions/cache@v4
+        with:
+          path: .deps/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: Install exact Zig release
-        run: |
-          python3 tools/install_zig.py
-          echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
+        if: steps.zig.outputs.cache-hit != 'true'
+        run: python3 tools/install_zig.py
+      - name: Zig on PATH
+        run: echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
       - name: Pure core tests
         run: zig build test
       - name: Python fixture tests
         run: python3 -m unittest discover -s tests -v
       - name: Repository contracts
         run: python3 tools/check_repo.py
+      - name: Restore mdBook
+        id: mdbook
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/mdbook
+          key: mdbook-0.5.4-${{ runner.os }}-${{ runner.arch }}
       - name: Install mdBook
+        if: steps.mdbook.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$HOME/.local/bin"
           curl -sSL https://github.com/rust-lang/mdBook/releases/download/v0.5.4/mdbook-v0.5.4-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xz -C "$HOME/.local/bin"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: mdBook on PATH
+        run: echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Book
         run: mdbook build
   native-linux:
@@ -42,12 +57,39 @@ jobs:
             libxtst-dev glslang-tools libvulkan-dev mesa-vulkan-drivers \
             vulkan-validationlayers \
             fonts-dejavu-core fonts-wqy-zenhei xvfb
+      - name: Restore the Zig toolchain
+        id: zig
+        uses: actions/cache@v4
+        with:
+          path: .deps/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
+      - name: Restore the SDL prefix
+        uses: actions/cache@v4
+        with:
+          path: |
+            .deps/src
+            .deps/build
+            .deps/install
+          key: sdl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: Install Zig and SDL baseline
         run: |
-          python3 tools/bootstrap.py --install-zig
+          # `--install-zig` refuses to replace an existing toolchain, which is
+          # what a restored cache already is.
+          if [ -d .deps/zig ]; then python3 tools/bootstrap.py; else python3 tools/bootstrap.py --install-zig; fi
           echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
+      - name: Restore the Zig package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zigpkg-${{ runner.os }}-${{ runner.arch }}-
       - name: Core, native ACP, and compile gates
         run: zig build verify
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extensions/package-lock.json
       - name: Extension bundles
         run: |
           # esbuild is a development dependency, so the bundles need it installed.
@@ -76,11 +118,34 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Restore the Zig toolchain
+        id: zig
+        uses: actions/cache@v4
+        with:
+          path: .deps/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
+      - name: Restore Homebrew downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/Library/Caches/Homebrew
+          key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}-moltenvk
+      - name: Restore the Zig package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zigpkg-${{ runner.os }}-${{ runner.arch }}-
       - name: Install Zig and SDL
         run: |
-          python3 tools/install_zig.py
+          # The toolchain installer refuses to replace what a cache restored.
+          if [ ! -d .deps/zig ]; then python3 tools/install_zig.py; fi
           echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
           brew install sdl3 sdl3_ttf vulkan-loader molten-vk vulkan-validationlayers
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: extensions/package-lock.json
       - name: Extension bundles
         run: |
           # esbuild is a development dependency, so the bundles need it installed.
@@ -96,9 +161,31 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
+      - name: Restore the Zig toolchain
+        id: zig
+        uses: actions/cache@v4
+        with:
+          path: .deps/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: Install Zig
+        if: steps.zig.outputs.cache-hit != 'true'
         run: python tools/install_zig.py
+      - name: Restore the SDL prefix and glslang
+        id: sdk
+        uses: actions/cache@v4
+        with:
+          path: |
+            .deps/win
+            .deps/tools
+          key: winsdk-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}-glslang-16.6.0
+      - name: Restore the Zig package cache
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\zig
+          key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zigpkg-${{ runner.os }}-${{ runner.arch }}-
       - name: SDL, glslang, and PATH
+        if: steps.sdk.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
           # docs/BUILD.md: matching SDL3 and SDL3_ttf development libraries in
@@ -106,9 +193,12 @@ jobs:
           $prefix = "$env:GITHUB_WORKSPACE/.deps/win"
           $tools = "$env:GITHUB_WORKSPACE/.deps/tools"
           New-Item -ItemType Directory -Force -Path "$prefix/include", "$prefix/lib", "$tools" | Out-Null
+          # The versions come from dependencies.json, so a pin bump moves the
+          # archives and the cache key together.
+          $pins = Get-Content "$env:GITHUB_WORKSPACE/dependencies.json" | ConvertFrom-Json
           $packages = @(
-            @{ name = "SDL3"; url = "https://github.com/libsdl-org/SDL/releases/download/release-3.4.4/SDL3-devel-3.4.4-VC.zip" },
-            @{ name = "SDL3_ttf"; url = "https://github.com/libsdl-org/SDL_ttf/releases/download/release-3.2.2/SDL3_ttf-devel-3.2.2-VC.zip" }
+            @{ name = "SDL3";     url = "https://github.com/libsdl-org/SDL/releases/download/$($pins.SDL.tag)/SDL3-devel-$($pins.SDL.tag -replace '^release-','')-VC.zip" },
+            @{ name = "SDL3_ttf"; url = "https://github.com/libsdl-org/SDL_ttf/releases/download/$($pins.SDL_ttf.tag)/SDL3_ttf-devel-$($pins.SDL_ttf.tag -replace '^release-','')-VC.zip" }
           )
           foreach ($package in $packages) {
             $archive = "$env:TEMP/$($package.name).zip"
@@ -119,9 +209,12 @@ jobs:
           }
           Invoke-WebRequest -Uri "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip" -OutFile "$env:TEMP/glslang.zip"
           Expand-Archive -Path "$env:TEMP/glslang.zip" -DestinationPath "$tools/glslang" -Force
+      - name: Runtime and tools on PATH
+        shell: pwsh
+        run: |
           "$env:GITHUB_WORKSPACE/.deps/zig" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          "$prefix/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          "$tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$env:GITHUB_WORKSPACE/.deps/win/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$env:GITHUB_WORKSPACE/.deps/tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Core, native ACP, and compile gates
         shell: pwsh
         # Each option is quoted: PowerShell splits an unquoted `-Dname=value`

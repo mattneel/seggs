@@ -125,14 +125,24 @@ def compare(a: tuple[int, int, bytes], b: tuple[int, int, bytes]) -> None:
     differing = 0
     worst = 0
     total = aw * ah
+    left, top, right, bottom = aw, ah, -1, -1
+    eighths = [0] * 8
     for i in range(0, len(ap), 3):
         delta = max(abs(ap[i] - bp[i]), abs(ap[i + 1] - bp[i + 1]), abs(ap[i + 2] - bp[i + 2]))
         if delta > TOLERANCE:
             differing += 1
+            pixel = i // 3
+            x, y = pixel % aw, pixel // aw
+            left, top = min(left, x), min(top, y)
+            right, bottom = max(right, x), max(bottom, y)
+            eighths[min(7, x * 8 // aw)] += 1
         if delta > worst:
             worst = delta
     fraction = differing / total if total else 0.0
     print(f"compare: max channel delta {worst}, {differing}/{total} pixels differ ({fraction:.4%})")
+    if differing:
+        # Where they differ says which panel changed, which a count cannot.
+        print(f"compare: differences span ({left},{top}) to ({right},{bottom}); by eighth across: {eighths}")
     require(
         fraction <= MAX_DIFF_FRACTION,
         f"captures disagree: {fraction:.4%} of pixels differ, limit {MAX_DIFF_FRACTION:.2%}",

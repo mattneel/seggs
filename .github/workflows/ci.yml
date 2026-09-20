@@ -9,7 +9,7 @@ jobs:
   core:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install exact Zig release
         run: |
           python3 tools/install_zig.py
@@ -32,7 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install system dependencies
         run: |
           sudo apt-get update
@@ -56,6 +56,12 @@ jobs:
         env:
           SDL_VIDEODRIVER: x11
         run: zig build screenshot
+      - name: Keep the captures when they disagree
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screenshots
+          path: /tmp/seggs-shot-*.ppm
       - name: Vulkan window smoke
         env:
           SDL_VIDEODRIVER: x11

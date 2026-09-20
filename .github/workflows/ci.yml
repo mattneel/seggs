@@ -215,6 +215,19 @@ jobs:
           "$env:GITHUB_WORKSPACE/.deps/zig" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$env:GITHUB_WORKSPACE/.deps/win/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$env:GITHUB_WORKSPACE/.deps/tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Shader compiler
+        shell: pwsh
+        run: |
+          # The build runs exactly this; running it here separates a broken tool
+          # from a broken invocation in the build graph.
+          $out = "$env:GITHUB_WORKSPACE/.deps/tools/shaders"
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          & .deps/tools/glslang/bin/glslang.exe -V --target-env vulkan1.0 -S frag shaders/ui.frag.glsl -o "$out/ui.frag.spv"
+          "frag exit: $LASTEXITCODE"
+          & .deps/tools/glslang/bin/glslang.exe -V --target-env vulkan1.0 -S vert shaders/ui.vert.glsl -o "$out/ui.vert.spv"
+          "vert exit: $LASTEXITCODE"
+          Get-ChildItem $out | Select-Object Name, Length | Format-Table
+          if ($LASTEXITCODE -ne 0) { exit 1 }
       - name: Core, native ACP, and compile gates
         shell: pwsh
         # Each option is quoted: PowerShell splits an unquoted `-Dname=value`

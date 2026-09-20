@@ -9,8 +9,7 @@ const Allocator = std.mem.Allocator;
 pub fn tempPath(a: Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
     const base: []const u8 = if (std.c.getenv(if (builtin.os.tag == .windows) "TEMP" else "TMPDIR")) |value|
         std.mem.span(value)
-    else
-        if (builtin.os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
+    else if (builtin.os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
     return std.fmt.allocPrint(a, "{s}{c}seggs-{s}-{d}{s}", .{
         base,
         std.fs.path.sep,

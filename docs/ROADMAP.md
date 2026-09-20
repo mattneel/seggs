@@ -1,5 +1,22 @@
 # Roadmap
 
+## Status
+
+Every item below is implemented and covered by a gate that runs on every push.
+`docs/VALIDATION.md` names the test or check behind each one.
+
+| Milestone | Where it is verified |
+| --- | --- |
+| Native acceptance | `core`, `native-linux`, `macos`, and `windows` jobs in `.github/workflows/ci.yml`; the screenshot gate runs on Linux and macOS with the Khronos validation layer enabled |
+| Editor foundation | `zig build test` and the screenshot gate's text, baseline, composition, and fallback checks |
+| Agent workspace | `zig build integration` against the mock, plus the live Oh-My-Pi and Claude Code turns |
+| IDE services | `zig build test-native`, `zig build integration`, and the mock LSP and DAP fixtures |
+
+Two items are covered by the nearest check rather than one named for them: the
+save gate's conflict races are the watcher's external-edit detection plus the
+review queue's conflict outcome, and a process flood is bounded by the agent
+count limit and the transport's queue limits rather than by a flood test.
+
 ## Milestone 1: Native acceptance
 
 The first release gate is a clean Zig 0.17 build on the target platforms.

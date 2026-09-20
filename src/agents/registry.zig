@@ -10,6 +10,10 @@ pub const Agent = struct {
 pub const Config = struct {
     fullscreen: bool = true,
     agents: []const Agent = &builtins,
+    /// Opt-in transcript persistence. Off by default for privacy.
+    persist_transcripts: bool = false,
+    /// Optional language server command. No server runs when this is empty.
+    lsp: []const []const u8 = &.{},
 };
 
 pub const builtins = [_]Agent{

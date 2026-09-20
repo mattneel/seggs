@@ -1,6 +1,9 @@
 .zig-cache/
 zig-out/
 .deps/
+zig-pkg/
+extensions/node_modules/
+extensions/dist/
 .env
 .env.*
 !.env.example
@@ -9,3 +12,7 @@ config/local.json
 __pycache__/
 *.pyc
 .DS_Store
+# Extension diagnostics written for authors and agents.
+.seggs/
+# Built book output.
+book/

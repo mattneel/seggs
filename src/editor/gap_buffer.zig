@@ -87,8 +87,24 @@ test "gap moves in both directions and grows" {
     const bytes = try b.copy(a);
     defer a.free(bytes);
     try std.testing.expectEqualStrings("0bc!", bytes);
-    const large = [_]u8{'x'} ** 1024;
+    const large: [1024]u8 = @splat('x');
     try b.insert(2, &large);
     try std.testing.expectEqual(@as(usize, 1028), b.len());
     try std.testing.expectEqual(@as(u8, 'c'), b.byteAt(1026));
+}
+
+fn growthOps(a: Allocator) !void {
+    var b = try GapBuffer.init(a, "abc");
+    defer b.deinit();
+    const big: [300]u8 = @splat('x');
+    try b.insert(0, &big);
+    try b.insert(b.len(), "!");
+    const bytes = try b.copy(a);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(usize, 304), b.len());
+    try std.testing.expectEqual(@as(u8, '!'), bytes[303]);
+}
+
+test "every allocation failure is reported without leak or corruption" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, growthOps, .{});
 }

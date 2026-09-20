@@ -3,12 +3,31 @@ const c = @import("native");
 const rpc = @import("protocol.zig");
 const Transport = @import("transport.zig").Transport;
 const Agent = @import("../agents/registry.zig").Agent;
+const files = @import("../platform/files.zig");
 const Allocator = std.mem.Allocator;
+
+/// A client-owned terminal. The agent holds only an id; `terminal/release` or
+/// client shutdown reaps the process. Output is bounded so a chatty command
+/// cannot grow memory without limit.
+const Terminal = struct {
+    process: *c.SDL_Process,
+    output: *c.SDL_IOStream,
+    buffer: std.ArrayList(u8) = .empty,
+    truncated: bool = false,
+    exit_code: ?c_int = null,
+    reaped: bool = false,
+    limit: usize = 1 * 1024 * 1024,
+};
 
 pub const Client = struct {
     pub const State = enum { offline, initialize, new_session, ready, busy, cancelling, failed };
-    const Request = struct { id: u64, kind: enum { initialize, new_session, prompt }, deadline: u64 };
+    const Request = struct { id: u64, kind: enum { initialize, new_session, prompt, set_config }, deadline: u64 };
     pub const Permission = struct { parsed: std.json.Parsed(rpc.Value) };
+    const ConfigOption = struct {
+        id: []u8,
+        value: []u8,
+        options: std.ArrayList([]u8) = .empty,
+    };
     allocator: Allocator,
     preset: Agent,
     cwd: []const u8,
@@ -19,9 +38,12 @@ pub const Client = struct {
     pending: ?Request = null,
     permission: ?Permission = null,
     transcript: std.ArrayList(u8) = .empty,
+    config: std.ArrayList(ConfigOption) = .empty,
     last_error: ?[]u8 = null,
     completed_turns: usize = 0,
     tool_events: usize = 0,
+    terminals: std.StringArrayHashMapUnmanaged(*Terminal) = .empty,
+    terminal_counter: usize = 0,
 
     pub fn init(a: Allocator, preset: Agent, cwd: []const u8) Client {
         return .{ .allocator = a, .preset = preset, .cwd = preset.cwd orelse cwd };
@@ -30,6 +52,8 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         self.stop();
         self.transcript.deinit(self.allocator);
+        self.clearConfig();
+        self.config.deinit(self.allocator);
         if (self.last_error) |message| self.allocator.free(message);
     }
 
@@ -38,9 +62,9 @@ pub const Client = struct {
         const limit = 512 * 1024;
         if (bytes.len >= limit) {
             self.transcript.clearRetainingCapacity();
-            var start = bytes.len - limit;
-            while (start < bytes.len and bytes[start] & 0xc0 == 0x80) : (start += 1) {}
-            try self.transcript.appendSlice(self.allocator, bytes[start..]);
+            var trim_at = bytes.len - limit;
+            while (trim_at < bytes.len and bytes[trim_at] & 0xc0 == 0x80) : (trim_at += 1) {}
+            try self.transcript.appendSlice(self.allocator, bytes[trim_at..]);
             return;
         }
         if (self.transcript.items.len + bytes.len > limit) {
@@ -71,17 +95,18 @@ pub const Client = struct {
             .protocolVersion = rpc.version,
             .clientInfo = .{ .name = "seggs", .title = "Seggs", .version = "0.1.0" },
             .clientCapabilities = .{
-                .fs = .{ .readTextFile = false, .writeTextFile = false },
-                .terminal = false,
+                .fs = .{ .readTextFile = true, .writeTextFile = true },
+                .terminal = true,
             },
         }));
         self.pending = .{ .id = id, .kind = .initialize, .deadline = c.SDL_GetTicks() + 30_000 };
-        try self.append("\n[ACP] Initialize. No filesystem or terminal capability advertised.\n");
+        try self.append("\n[ACP] Initialize. Filesystem and isolated terminal capabilities advertised.\n");
     }
 
     pub fn stop(self: *Client) void {
         if (self.transport) |transport| transport.destroy();
         self.transport = null;
+        self.closeTerminals();
         if (self.permission) |*permission| permission.parsed.deinit();
         self.permission = null;
         if (self.session_id) |id| self.allocator.free(id);
@@ -127,6 +152,7 @@ pub const Client = struct {
 
     /// Process a bounded number of messages per frame for fairness across agents.
     pub fn pump(self: *Client) void {
+        self.pumpTerminals();
         const transport = self.transport orelse return;
         var budget: usize = 64;
         while (budget > 0) : (budget -= 1) {
@@ -145,6 +171,84 @@ pub const Client = struct {
         if (self.pending) |pending| {
             if (pending.deadline != 0 and c.SDL_GetTicks() > pending.deadline) self.fail("ACP request timeout. Restart the agent after authentication.");
         }
+    }
+
+    /// Drain terminal pipes and reap exited processes. Only the app thread
+    /// touches this state, so no lock crosses the transport boundary.
+    fn pumpTerminals(self: *Client) void {
+        for (self.terminals.values()) |terminal| {
+            if (terminal.reaped) continue;
+            var chunk: [4096]u8 = undefined;
+            while (true) {
+                const count = c.SDL_ReadIO(terminal.output, &chunk, chunk.len);
+                if (count <= 0) break;
+                const used: usize = @intCast(count);
+                const room = terminal.limit -| terminal.buffer.items.len;
+                if (room < used) terminal.truncated = true;
+                if (room > 0) terminal.buffer.appendSlice(self.allocator, chunk[0..@min(used, room)]) catch break;
+            }
+            var status: c_int = 0;
+            if (c.SDL_WaitProcess(terminal.process, false, &status)) {
+                terminal.exit_code = status;
+                terminal.reaped = true;
+            }
+        }
+    }
+
+    fn spawnTerminal(self: *Client, argv: []const []const u8, cwd: []const u8) !*Terminal {
+        if (argv.len == 0) return error.EmptyCommand;
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const temp = arena.allocator();
+        const args = try temp.alloc(?[*:0]const u8, argv.len + 1);
+        for (argv, 0..) |arg, i| args[i] = (try temp.dupeSentinel(u8, arg, 0)).ptr;
+        args[argv.len] = null;
+        const cwd_z = try temp.dupeSentinel(u8, cwd, 0);
+        const props = c.SDL_CreateProperties();
+        if (props == 0) return error.SdlProperties;
+        defer c.SDL_DestroyProperties(props);
+        // Stdin is closed and stderr is inherited, so terminal output can never
+        // mix into the ACP stdout stream.
+        if (!c.SDL_SetPointerProperty(props, c.SDL_PROP_PROCESS_CREATE_ARGS_POINTER, @ptrCast(args.ptr)) or
+            !c.SDL_SetStringProperty(props, c.SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, cwd_z.ptr) or
+            !c.SDL_SetNumberProperty(props, c.SDL_PROP_PROCESS_CREATE_STDIN_NUMBER, c.SDL_PROCESS_STDIO_NULL) or
+            !c.SDL_SetNumberProperty(props, c.SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, c.SDL_PROCESS_STDIO_APP) or
+            !c.SDL_SetNumberProperty(props, c.SDL_PROP_PROCESS_CREATE_STDERR_NUMBER, c.SDL_PROCESS_STDIO_INHERITED)) return error.SdlProperties;
+        const process = c.SDL_CreateProcessWithProperties(props) orelse return error.TerminalSpawn;
+        errdefer {
+            _ = c.SDL_KillProcess(process, true);
+            _ = c.SDL_WaitProcess(process, true, null);
+            c.SDL_DestroyProcess(process);
+        }
+        const output = c.SDL_GetProcessOutput(process) orelse return error.TerminalPipe;
+        const terminal = try self.allocator.create(Terminal);
+        terminal.* = .{ .process = process, .output = output };
+        return terminal;
+    }
+
+    /// Kill if needed, reap, and free one terminal. Ownership ends here.
+    fn reapTerminal(self: *Client, terminal: *Terminal) void {
+        if (!terminal.reaped) {
+            _ = c.SDL_KillProcess(terminal.process, true);
+            var status: c_int = 0;
+            _ = c.SDL_WaitProcess(terminal.process, true, &status);
+        }
+        c.SDL_DestroyProcess(terminal.process);
+        terminal.buffer.deinit(self.allocator);
+        self.allocator.destroy(terminal);
+    }
+
+    fn closeTerminal(self: *Client, id: []const u8) void {
+        const entry = self.terminals.fetchSwapRemove(id) orelse return;
+        self.allocator.free(entry.key);
+        self.reapTerminal(entry.value);
+    }
+
+    fn closeTerminals(self: *Client) void {
+        for (self.terminals.keys()) |key| self.allocator.free(key);
+        for (self.terminals.values()) |terminal| self.reapTerminal(terminal);
+        self.terminals.deinit(self.allocator);
+        self.terminals = .empty;
     }
 
     fn handle(self: *Client, line: []const u8) !void {
@@ -184,6 +288,8 @@ pub const Client = struct {
                         const session = rpc.str(result, "sessionId");
                         if (session.len == 0 or session.len > 4096) return error.InvalidSession;
                         self.session_id = try self.allocator.dupe(u8, session);
+                        self.clearConfig();
+                        try self.parseConfigOptions(result);
                         self.state = .ready;
                         try self.append("[ACP] Session ready.\n");
                     },
@@ -194,6 +300,12 @@ pub const Client = struct {
                         try self.append("\n[Stop: ");
                         try self.append(rpc.str(result, "stopReason"));
                         try self.append("]\n");
+                    },
+                    .set_config => {
+                        self.clearConfig();
+                        try self.parseConfigOptions(result);
+                        self.state = .ready;
+                        try self.append("[Config updated]\n");
                     },
                 }
             },
@@ -250,6 +362,149 @@ pub const Client = struct {
                         try self.append(encoded);
                     }
                     try self.append("\nAlt+Y: allow once. Alt+N: reject. Inspect the tool request before approval.\n");
+                } else if (std.mem.eql(u8, method, "fs/read_text_file")) {
+                    if (!self.matchesSession(params)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid session"));
+                        return;
+                    }
+                    const path = rpc.str(params, "path");
+                    if (path.len == 0) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Missing path"));
+                        return;
+                    }
+                    const content = files.read(self.allocator, path, 8 * 1024 * 1024) catch |err| {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32603, @errorName(err)));
+                        return;
+                    };
+                    defer self.allocator.free(content);
+                    if (!std.unicode.utf8ValidateSlice(content)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32603, "File is not UTF-8 text"));
+                        return;
+                    }
+                    try self.sendOwned(try rpc.result(self.allocator, id, .{ .content = content }));
+                } else if (std.mem.eql(u8, method, "fs/write_text_file")) {
+                    if (!self.matchesSession(params)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid session"));
+                        return;
+                    }
+                    const path = rpc.str(params, "path");
+                    if (path.len == 0) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Missing path"));
+                        return;
+                    }
+                    const content_value = rpc.field(params, "content") orelse {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Missing content"));
+                        return;
+                    };
+                    const content = rpc.string(content_value) orelse {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid content"));
+                        return;
+                    };
+                    files.replace(self.allocator, path, content) catch |err| {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32603, @errorName(err)));
+                        return;
+                    };
+                    try self.sendOwned(try rpc.result(self.allocator, id, .{}));
+                } else if (std.mem.eql(u8, method, "terminal/create")) {
+                    if (!self.matchesSession(params)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid session"));
+                        return;
+                    }
+                    const command = rpc.str(params, "command");
+                    if (command.len == 0) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Missing command"));
+                        return;
+                    }
+                    var argv: std.ArrayList([]const u8) = .empty;
+                    defer argv.deinit(self.allocator);
+                    try argv.append(self.allocator, command);
+                    if (rpc.field(params, "args")) |args_value| {
+                        if (args_value == .array) {
+                            for (args_value.array.items) |item| {
+                                if (rpc.string(item)) |argument| try argv.append(self.allocator, argument);
+                            }
+                        }
+                    }
+                    const requested_cwd = rpc.str(params, "cwd");
+                    const terminal = self.spawnTerminal(argv.items, if (requested_cwd.len > 0) requested_cwd else self.cwd) catch |err| {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32603, @errorName(err)));
+                        return;
+                    };
+                    self.terminal_counter += 1;
+                    var key_buffer: [32]u8 = undefined;
+                    const key = try std.fmt.bufPrint(&key_buffer, "term-{d}", .{self.terminal_counter});
+                    const owned_key = self.allocator.dupe(u8, key) catch |err| {
+                        self.reapTerminal(terminal);
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32603, @errorName(err)));
+                        return;
+                    };
+                    self.terminals.put(self.allocator, owned_key, terminal) catch |err| {
+                        self.allocator.free(owned_key);
+                        self.reapTerminal(terminal);
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32603, @errorName(err)));
+                        return;
+                    };
+                    try self.sendOwned(try rpc.result(self.allocator, id, .{ .terminalId = key }));
+                } else if (std.mem.eql(u8, method, "terminal/output")) {
+                    if (!self.matchesSession(params)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid session"));
+                        return;
+                    }
+                    const terminal = self.terminals.get(rpc.str(params, "terminalId")) orelse {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Unknown terminal"));
+                        return;
+                    };
+                    if (terminal.exit_code) |code| {
+                        try self.sendOwned(try rpc.result(self.allocator, id, .{
+                            .output = terminal.buffer.items,
+                            .truncated = terminal.truncated,
+                            .exitStatus = .{ .exitCode = code },
+                        }));
+                    } else {
+                        try self.sendOwned(try rpc.result(self.allocator, id, .{
+                            .output = terminal.buffer.items,
+                            .truncated = terminal.truncated,
+                        }));
+                    }
+                } else if (std.mem.eql(u8, method, "terminal/wait_for_exit")) {
+                    if (!self.matchesSession(params)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid session"));
+                        return;
+                    }
+                    const terminal = self.terminals.get(rpc.str(params, "terminalId")) orelse {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Unknown terminal"));
+                        return;
+                    };
+                    // Bounded wait: the client stays single-threaded, so a
+                    // command that never exits must not stall the app forever.
+                    const deadline = c.SDL_GetTicks() + 5_000;
+                    while (!terminal.reaped and c.SDL_GetTicks() < deadline) {
+                        self.pumpTerminals();
+                        c.SDL_Delay(1);
+                    }
+                    if (terminal.exit_code) |code| {
+                        try self.sendOwned(try rpc.result(self.allocator, id, .{ .exitCode = code }));
+                    } else {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32603, "Terminal still running"));
+                    }
+                } else if (std.mem.eql(u8, method, "terminal/kill")) {
+                    if (!self.matchesSession(params)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid session"));
+                        return;
+                    }
+                    const terminal = self.terminals.get(rpc.str(params, "terminalId")) orelse {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Unknown terminal"));
+                        return;
+                    };
+                    _ = c.SDL_KillProcess(terminal.process, true);
+                    try self.sendOwned(try rpc.result(self.allocator, id, .{}));
+                } else if (std.mem.eql(u8, method, "terminal/release")) {
+                    if (!self.matchesSession(params)) {
+                        try self.sendOwned(try rpc.failure(self.allocator, id, -32602, "Invalid session"));
+                        return;
+                    }
+                    self.closeTerminal(rpc.str(params, "terminalId"));
+                    try self.sendOwned(try rpc.result(self.allocator, id, .{}));
                 } else {
                     try self.sendOwned(try rpc.failure(self.allocator, id, -32601, "Client method not supported"));
                 }
@@ -292,5 +547,88 @@ pub const Client = struct {
         self.permission.?.parsed.deinit();
         self.permission = null;
         try self.append(if (allow and selected != null) "[Permission] Allowed once.\n" else "[Permission] Rejected or cancelled.\n");
+    }
+
+    fn freeOption(self: *Client, option: *ConfigOption) void {
+        self.allocator.free(option.id);
+        self.allocator.free(option.value);
+        for (option.options.items) |value| self.allocator.free(value);
+        option.options.deinit(self.allocator);
+    }
+
+    fn clearConfig(self: *Client) void {
+        for (self.config.items) |*option| self.freeOption(option);
+        self.config.clearRetainingCapacity();
+    }
+
+    fn parseConfigOption(self: *Client, item: rpc.Value) !?ConfigOption {
+        const id = rpc.str(item, "id");
+        const current = rpc.field(item, "currentValue") orelse return null;
+        if (id.len == 0 or current != .string) return null;
+        var option: ConfigOption = .{
+            .id = try self.allocator.dupe(u8, id),
+            .value = try self.allocator.dupe(u8, current.string),
+        };
+        errdefer self.freeOption(&option);
+        if (rpc.field(item, "options")) |opts| {
+            if (opts == .array) {
+                for (opts.array.items) |value_item| {
+                    const value_str = rpc.str(value_item, "value");
+                    if (value_str.len == 0) continue;
+                    try option.options.append(self.allocator, try self.allocator.dupe(u8, value_str));
+                }
+            }
+        }
+        return option;
+    }
+
+    fn parseConfigOptions(self: *Client, result: rpc.Value) !void {
+        const list = rpc.field(result, "configOptions") orelse return;
+        if (list != .array) return;
+        for (list.array.items) |item| {
+            var option = try self.parseConfigOption(item) orelse continue;
+            errdefer self.freeOption(&option);
+            try self.config.append(self.allocator, option);
+        }
+    }
+
+    pub fn configValue(self: *const Client, config_id: []const u8) ?[]const u8 {
+        for (self.config.items) |option| {
+            if (std.mem.eql(u8, option.id, config_id)) return option.value;
+        }
+        return null;
+    }
+
+    pub fn setConfigOption(self: *Client, config_id: []const u8, value: []const u8) !void {
+        if (self.state != .ready) return error.AgentNotReady;
+        const id = self.next_id;
+        self.next_id += 1;
+        try self.sendOwned(try rpc.request(self.allocator, id, "session/set_config_option", .{
+            .sessionId = self.session_id.?,
+            .configId = config_id,
+            .value = value,
+        }));
+        self.pending = .{ .id = id, .kind = .set_config, .deadline = c.SDL_GetTicks() + 30_000 };
+    }
+
+    /// Cycle a select config option to its next value, if it has any.
+    pub fn cycleConfigOption(self: *Client, config_id: []const u8) !void {
+        if (self.state != .ready) return error.AgentNotReady;
+        for (self.config.items) |option| {
+            if (!std.mem.eql(u8, option.id, config_id)) continue;
+            if (option.options.items.len < 2) return;
+            for (option.options.items, 0..) |value, i| {
+                if (std.mem.eql(u8, value, option.value)) {
+                    const next = option.options.items[(i + 1) % option.options.items.len];
+                    return self.setConfigOption(config_id, next);
+                }
+            }
+        }
+    }
+
+    /// Write the lane transcript to a file. Persistence is opt-in: nothing is
+    /// written unless the caller invokes this explicitly.
+    pub fn exportTranscript(self: *Client, path: []const u8) !void {
+        try files.replace(self.allocator, path, self.transcript.items);
     }
 };

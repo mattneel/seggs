@@ -2,17 +2,34 @@ const std = @import("std");
 const c = @import("native");
 const Workspace = @import("editor/workspace.zig").Workspace;
 const Document = @import("editor/document.zig").Document;
-const Scanner = @import("editor/highlight.zig").Scanner;
+const highlight = @import("editor/highlight.zig");
+const prompt = @import("editor/prompt.zig");
 const Client = @import("acp/client.zig").Client;
+const lsp = @import("services/lsp.zig");
 const Config = @import("agents/registry.zig").Config;
 const Renderer = @import("gpu/renderer.zig").Renderer;
 const layout = @import("ui/layout.zig");
 const theme = @import("ui/theme.zig");
+
+/// Shown in place of a panel when no extension registered one, so a session
+/// without extensions still explains itself.
+const default_help = "No agent starts automatically.\n\nF5 starts this agent.\nCtrl+L focuses the prompt.\nCtrl+Enter sends to this agent.\nCtrl+Shift+Enter sends to ready agents.";
+
+/// A panel and the box it occupied, recorded while drawing.
+const PanelRect = struct { name: []const u8, bounds: Rect };
+
+/// A named node an extension described, and the panel it belongs to. One list
+/// per frame answers clicks, hover, and focus order, so none of them need a
+/// second walk of the tree.
+const PanelNode = struct { panel: []const u8, id: []const u8, bounds: Rect, focusable: bool };
 const text = @import("core/text.zig");
+const Preedit = @import("core/preedit.zig").Preedit;
+const Host = @import("ext/host.zig").Host;
+const ext_ui = @import("ext/ui.zig");
 const Rect = layout.Rect;
 
 pub const App = struct {
-    const Focus = enum { editor, prompt };
+    const Focus = enum { editor, prompt, panels };
     const Overlay = enum { none, files, commands, quit };
     const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn" };
     allocator: std.mem.Allocator,
@@ -25,6 +42,33 @@ pub const App = struct {
     query: std.ArrayList(u8) = .empty,
     query_selected: usize = 0,
     prompt_text: std.ArrayList(u8) = .empty,
+    preedit: Preedit = .{},
+    /// Extension host, when one is attached. Panels come from it.
+    host: ?*Host = null,
+    /// Interface an extension described, rebuilt each frame it is drawn.
+    panel_tree: ext_ui.Tree,
+    /// Where each registered panel was drawn, so a click can be routed back to
+    /// it. The names borrow the host's keys, which outlive the frame.
+    panel_rects: std.ArrayListUnmanaged(PanelRect) = .empty,
+    /// Named nodes of the panels drawn this frame, in document order. The ids are
+    /// owned here because the tree they came from is parsed per panel and freed
+    /// as soon as the next one is read.
+    panel_nodes: std.ArrayListUnmanaged(PanelNode) = .empty,
+    /// Which of those take part in Tab order, as indices into `panel_nodes`.
+    focus_order: std.ArrayListUnmanaged(usize) = .empty,
+    /// Position in `focus_order` while the panels own the keyboard.
+    panel_focus: usize = 0,
+    /// Node the pointer is over, owned for the same reason the ids are.
+    hover_id: std.ArrayListUnmanaged(u8) = .empty,
+    /// Frames drawn since startup. The caret blinks on it rather than on the
+    /// clock, so the same frame of two runs renders the same pixels and a
+    /// screenshot comparison is meaningful.
+    frame_count: u64 = 0,
+    /// Last status an extension wrote, so the same message is applied once. It
+    /// must not be compared against the current message, or an extension's stale
+    /// one would keep overwriting what the editor says afterwards.
+    host_status: [256]u8 = undefined,
+    host_status_len: usize = 0,
     cached: []u8,
     cached_revision: ?u64 = null,
     first_line: usize = 0,
@@ -39,9 +83,12 @@ pub const App = struct {
     running: bool = true,
     message: [256]u8 = undefined,
     message_len: usize = 0,
-    geometry: layout.Layout = layout.Layout.calculate(1440, 900, true),
+    geometry: layout.Layout = layout.Layout.calculateDefault(1440, 900, true),
     char_width: f32 = 10,
     line_height: f32 = 22,
+    last_watch: u64 = 0,
+    lsp_command: []const []const u8,
+    lsp_client: ?lsp.Client = null,
 
     pub fn init(a: std.mem.Allocator, window: *c.SDL_Window, config: Config, root: []const u8) !App {
         var workspace = try Workspace.init(a, root);
@@ -49,19 +96,27 @@ pub const App = struct {
         const clients = try a.alloc(Client, config.agents.len);
         errdefer a.free(clients);
         for (config.agents, clients) |preset, *client| client.* = Client.init(a, preset, root);
-        const cached = try workspace.document.snapshot(a);
-        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen };
+        const cached = try workspace.activeDocument().snapshot(a);
+        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a) };
         self.status("F5 starts the selected agent. Ctrl+P opens files.", .{});
         return self;
     }
 
     pub fn deinit(self: *App) void {
+        if (self.lsp_client) |*client| client.deinit();
         for (self.clients) |*client| client.deinit();
         self.allocator.free(self.clients);
         self.workspace.deinit();
         self.allocator.free(self.cached);
         self.query.deinit(self.allocator);
         self.prompt_text.deinit(self.allocator);
+        self.preedit.deinit(self.allocator);
+        self.panel_tree.deinit();
+        self.panel_rects.deinit(self.allocator);
+        for (self.panel_nodes.items) |node| self.allocator.free(node.id);
+        self.panel_nodes.deinit(self.allocator);
+        self.focus_order.deinit(self.allocator);
+        self.hover_id.deinit(self.allocator);
     }
 
     pub fn status(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -83,15 +138,118 @@ pub const App = struct {
         self.focus = .editor;
         self.follow_cursor = true;
         self.status("Opened {s}", .{std.fs.path.basename(path)});
+        self.refreshLsp(path) catch |err| {
+            std.log.err("lsp: {s}", .{@errorName(err)});
+            self.status("language server: {s}", .{@errorName(err)});
+        };
+    }
+
+    /// Restart the language server for `path` and publish its diagnostics.
+    /// A missing or slow server is reported in the status bar, not fatal.
+    fn refreshLsp(self: *App, path: []const u8) !void {
+        if (self.lsp_client) |*client| client.deinit();
+        self.lsp_client = null;
+        if (self.lsp_command.len == 0) return;
+        const bytes = try self.workspace.activeDocument().snapshot(self.allocator);
+        defer self.allocator.free(bytes);
+        var client = try lsp.Client.start(self.allocator, self.lsp_command, self.workspace.root);
+        client.timeout_ms = 2_000;
+        errdefer client.deinit();
+        try client.open(path, bytes);
+        self.lsp_client = client;
+        std.log.info("lsp: {d} diagnostic(s) in {s}", .{ client.diagnostics.items.len, std.fs.path.basename(path) });
+        if (client.diagnostics.items.len > 0) {
+            self.status("{d} diagnostic(s): {s}", .{ client.diagnostics.items.len, client.diagnostics.items[0].message });
+        }
+    }
+
+    /// Byte offset for a zero-based line and column, or null when out of range.
+    fn offsetAt(self: *App, line: u32, character: u32) ?usize {
+        const doc = self.workspace.activeDocument();
+        if (line >= doc.lineCount()) return null;
+        var pos = doc.lineStartAt(line);
+        var column: u32 = 0;
+        while (column < character and pos < self.cached.len) : (pos = doc.next(pos)) {
+            const byte = self.cached[pos];
+            if (byte == '\n') break;
+            column += if (byte == '\t') 4 else 1;
+        }
+        return pos;
+    }
+
+    fn hasDiagnostic(self: *App, line: usize) bool {
+        const client = if (self.lsp_client) |*client_ptr| client_ptr else return false;
+        for (client.diagnostics.items) |diagnostic| {
+            if (diagnostic.line == line) return true;
+        }
+        return false;
+    }
+
+    /// F12 jumps to the definition. Shift+F12 reports references instead.
+    fn navigate(self: *App, references: bool) !void {
+        const client = if (self.lsp_client) |*client_ptr| client_ptr else {
+            self.status("No language server configured.", .{});
+            return;
+        };
+        const path = self.workspace.activePath() orelse return;
+        const loc = self.cursorLocation();
+        if (references) {
+            const list = try client.references(path, @intCast(loc.line), @intCast(loc.column));
+            defer lsp.freeLocations(self.allocator, list);
+            if (list.len == 0) {
+                self.status("No references.", .{});
+                return;
+            }
+            self.status("{d} reference(s); first on line {d}", .{ list.len, list[0].line + 1 });
+            return;
+        }
+        const target = (try client.definition(path, @intCast(loc.line), @intCast(loc.column))) orelse {
+            self.status("No definition.", .{});
+            return;
+        };
+        defer target.deinit(self.allocator);
+        if (!std.mem.eql(u8, target.path, path)) {
+            self.status("Definition is in {s}", .{std.fs.path.basename(target.path)});
+            return;
+        }
+        if (self.offsetAt(target.line, target.character)) |offset| {
+            self.workspace.activeDocument().cursor = offset;
+            self.selection_anchor = null;
+            self.follow_cursor = true;
+        }
+        self.status("Definition on line {d}", .{target.line + 1});
+    }
+
+    fn showHover(self: *App) !void {
+        const client = if (self.lsp_client) |*client_ptr| client_ptr else {
+            self.status("No language server configured.", .{});
+            return;
+        };
+        const path = self.workspace.activePath() orelse return;
+        const loc = self.cursorLocation();
+        const hover_text = (try client.hover(path, @intCast(loc.line), @intCast(loc.column))) orelse {
+            self.status("No hover information.", .{});
+            return;
+        };
+        defer self.allocator.free(hover_text);
+        self.status("{s}", .{hover_text});
     }
 
     pub fn update(self: *App) !void {
+        self.drainActions();
         for (self.clients) |*client| client.pump();
-        if (self.cached_revision == null or self.cached_revision.? != self.workspace.document.revision) {
-            const bytes = try self.workspace.document.snapshot(self.allocator);
+        const now = c.SDL_GetTicks();
+        if (now -| self.last_watch > 1000) {
+            self.last_watch = now;
+            if (self.workspace.externalChanged(self.workspace.activeIndex())) {
+                self.status("File changed on disk. Ctrl+R reloads.", .{});
+            }
+        }
+        if (self.cached_revision == null or self.cached_revision.? != self.workspace.activeDocument().revision) {
+            const bytes = try self.workspace.activeDocument().snapshot(self.allocator);
             self.allocator.free(self.cached);
             self.cached = bytes;
-            self.cached_revision = self.workspace.document.revision;
+            self.cached_revision = self.workspace.activeDocument().revision;
         }
     }
 
@@ -99,9 +257,9 @@ pub const App = struct {
         if (self.workspace.dirty()) self.overlay = .quit else self.running = false;
     }
 
-    fn selectedRange(self: *const App) ?struct { start: usize, end: usize } {
+    fn selectedRange(self: *App) ?struct { start: usize, end: usize } {
         const anchor = self.selection_anchor orelse return null;
-        const cursor = self.workspace.document.cursor;
+        const cursor = self.workspace.activeDocument().cursor;
         if (anchor == cursor) return null;
         return .{ .start = @min(anchor, cursor), .end = @max(anchor, cursor) };
     }
@@ -112,8 +270,8 @@ pub const App = struct {
             try self.prompt_text.appendSlice(self.allocator, bytes);
         } else {
             if (self.selectedRange()) |range| {
-                try self.workspace.document.replace(range.start, range.end, bytes);
-            } else try self.workspace.document.insert(bytes);
+                try self.workspace.activeDocument().replace(range.start, range.end, bytes);
+            } else try self.workspace.activeDocument().insert(bytes);
             self.selection_anchor = null;
             self.follow_cursor = true;
         }
@@ -121,12 +279,14 @@ pub const App = struct {
 
     fn submit(self: *App, broadcast: bool) !void {
         if (self.prompt_text.items.len == 0) return;
+        const message = try self.promptWithContext();
+        defer self.allocator.free(message);
         var sent: usize = 0;
         if (broadcast) {
             for (self.clients) |*client| {
                 if (client.state == .ready) {
                     // Failure in one lane does not suppress delivery to another lane.
-                    client.prompt(self.prompt_text.items) catch |err| {
+                    client.prompt(message) catch |err| {
                         self.status("{s}: {s}", .{ client.preset.name, @errorName(err) });
                         continue;
                     };
@@ -135,12 +295,39 @@ pub const App = struct {
             }
             if (sent == 0) return error.NoReadyAgents;
         } else {
-            try self.clients[self.active].prompt(self.prompt_text.items);
+            try self.clients[self.active].prompt(message);
             sent = 1;
         }
         self.prompt_text.clearRetainingCapacity();
         self.transcript_scroll = 0;
         self.status("Prompt sent to {d} agent(s).", .{sent});
+    }
+
+    /// Build the outgoing prompt: the current selection plus the language
+    /// server's diagnostics for the active file.
+    fn promptWithContext(self: *App) ![]u8 {
+        var selection: ?[]u8 = null;
+        if (self.selectedRange()) |range| {
+            const bytes = try self.workspace.activeDocument().snapshot(self.allocator);
+            defer self.allocator.free(bytes);
+            selection = try self.allocator.dupe(u8, bytes[range.start..range.end]);
+        }
+        defer if (selection) |sel| self.allocator.free(sel);
+        const diagnostics = try self.diagnosticContext();
+        defer self.allocator.free(diagnostics);
+        return prompt.attach(self.allocator, .{
+            .path = self.workspace.activePath(),
+            .selection = selection,
+            .diagnostics = diagnostics,
+        }, self.prompt_text.items);
+    }
+
+    /// Diagnostics for the active file, shaped for the prompt attachment.
+    fn diagnosticContext(self: *App) ![]prompt.Diagnostic {
+        const sources: []const lsp.Diagnostic = if (self.lsp_client) |*client_ptr| client_ptr.diagnostics.items else &.{};
+        const list = try self.allocator.alloc(prompt.Diagnostic, sources.len);
+        for (sources, list) |source, *target| target.* = .{ .line = source.line, .message = source.message };
+        return list;
     }
 
     fn startAgent(self: *App) !void {
@@ -157,7 +344,17 @@ pub const App = struct {
     pub fn event(self: *App, ev: c.SDL_Event) !void {
         switch (ev.type) {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => self.requestQuit(),
+            c.SDL_EVENT_TEXT_EDITING => {
+                // In-progress IME composition. The committed text arrives later
+                // as a text-input event, so this only tracks the preview.
+                if (self.overlay != .none or self.focus != .editor) {
+                    self.preedit.clear();
+                } else {
+                    try self.preedit.update(self.allocator, std.mem.span(ev.edit.text), ev.edit.start, ev.edit.length);
+                }
+            },
             c.SDL_EVENT_TEXT_INPUT => {
+                self.preedit.clear();
                 const bytes = std.mem.span(ev.text.text);
                 if (self.overlay == .files or self.overlay == .commands) {
                     if (self.query.items.len + bytes.len <= 256) try self.query.appendSlice(self.allocator, bytes);
@@ -168,10 +365,10 @@ pub const App = struct {
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => if (ev.button.button == c.SDL_BUTTON_LEFT) try self.mouseDown(ev.button.x, ev.button.y),
             c.SDL_EVENT_MOUSE_BUTTON_UP => {
                 self.drag = false;
-                if (self.selection_anchor == self.workspace.document.cursor) self.selection_anchor = null;
+                if (self.selection_anchor == self.workspace.activeDocument().cursor) self.selection_anchor = null;
             },
-            c.SDL_EVENT_MOUSE_MOTION => if (self.drag) {
-                self.workspace.document.cursor = self.positionAt(ev.motion.x, ev.motion.y);
+            c.SDL_EVENT_MOUSE_MOTION => if (!self.drag) self.hoverPanel(ev.motion.x, ev.motion.y) else {
+                self.workspace.activeDocument().cursor = self.positionAt(ev.motion.x, ev.motion.y);
                 self.follow_cursor = true;
             },
             c.SDL_EVENT_MOUSE_WHEEL => {
@@ -221,6 +418,7 @@ pub const App = struct {
             return;
         }
         if (keycode == c.SDLK_F11) return self.toggleFullscreen();
+        if (keycode == c.SDLK_F12) return self.navigate(shift);
         if (keycode == c.SDLK_F5) return self.startAgent();
         if (keycode == c.SDLK_F6) {
             self.clients[self.active].stop();
@@ -247,6 +445,7 @@ pub const App = struct {
                     self.status("Saved. External changes were checked before replacement.", .{});
                 },
                 c.SDLK_B => self.sidebar = !self.sidebar,
+                c.SDLK_I => try self.showHover(),
                 c.SDLK_L => self.focus = .prompt,
                 c.SDLK_P => {
                     self.overlay = if (shift) .commands else .files;
@@ -260,25 +459,37 @@ pub const App = struct {
                     } else if (self.focus == .editor) {
                         try self.copySelection();
                         if (self.selectedRange()) |range| {
-                            try self.workspace.document.replace(range.start, range.end, "");
+                            try self.workspace.activeDocument().replace(range.start, range.end, "");
                             self.selection_anchor = null;
                         }
                     }
                 },
                 c.SDLK_Z => if (self.focus == .editor) {
-                    if (shift) try self.workspace.document.redo() else try self.workspace.document.undo();
+                    if (shift) try self.workspace.activeDocument().redo() else try self.workspace.activeDocument().undo();
                     self.selection_anchor = null;
                     self.follow_cursor = true;
                 },
                 c.SDLK_Y => if (self.focus == .editor) {
-                    try self.workspace.document.redo();
+                    try self.workspace.activeDocument().redo();
                     self.selection_anchor = null;
                     self.follow_cursor = true;
                 },
                 c.SDLK_A => if (self.focus == .editor) {
                     self.selection_anchor = 0;
-                    self.workspace.document.cursor = self.workspace.document.buffer.len();
+                    self.workspace.activeDocument().cursor = self.workspace.activeDocument().buffer.len();
                     self.follow_cursor = true;
+                },
+                c.SDLK_TAB => self.switchBuffer(!shift),
+                c.SDLK_R => {
+                    if (self.workspace.reload()) |_| {
+                        self.cached_revision = null;
+                        self.first_line = 0;
+                        self.first_column = 0;
+                        self.selection_anchor = null;
+                        self.status("Reloaded from disk.", .{});
+                    } else |err| {
+                        self.status("Reload failed: {s}", .{@errorName(err)});
+                    }
                 },
                 c.SDLK_C => try self.copySelection(),
                 c.SDLK_V => {
@@ -292,6 +503,10 @@ pub const App = struct {
             }
             return;
         }
+        if (self.focus == .panels) {
+            self.panelKey(keycode, shift);
+            return;
+        }
         if (keycode == c.SDLK_ESCAPE) {
             self.focus = .editor;
             self.selection_anchor = null;
@@ -301,16 +516,16 @@ pub const App = struct {
             if (self.focus == .prompt) {
                 self.prompt_text.items.len = text.previous(self.prompt_text.items, self.prompt_text.items.len);
             } else if (self.selectedRange()) |range| {
-                try self.workspace.document.replace(range.start, range.end, "");
+                try self.workspace.activeDocument().replace(range.start, range.end, "");
                 self.selection_anchor = null;
-            } else try self.workspace.document.backspace();
+            } else try self.workspace.activeDocument().backspace();
             self.follow_cursor = true;
             return;
         }
         if (keycode == c.SDLK_RETURN) return self.insert("\n");
         if (keycode == c.SDLK_TAB) return self.insert("    ");
         if (self.focus == .prompt) return;
-        const doc = &self.workspace.document;
+        const doc = self.workspace.activeDocument();
         const before = doc.cursor;
         const movement = keycode == c.SDLK_LEFT or keycode == c.SDLK_RIGHT or keycode == c.SDLK_UP or keycode == c.SDLK_DOWN or keycode == c.SDLK_HOME or keycode == c.SDLK_END;
         if (movement and shift and self.selection_anchor == null) self.selection_anchor = before;
@@ -333,26 +548,368 @@ pub const App = struct {
         if (movement) self.follow_cursor = true;
     }
 
+    /// Publish the state extensions read through `seggs.snapshot`. It is built
+    /// on the frame arena, so nothing accumulates: the host parses it as soon as
+    /// it is set and never holds the text.
+    fn publishSnapshot(self: *App, frame: std.mem.Allocator) !void {
+        const host = self.host orelse return;
+        const Lane = struct { id: []const u8, name: []const u8, state: []const u8, running: bool };
+        const Files = struct {
+            root: []const u8,
+            entries: []const []const u8,
+            selected: []const u8,
+            scroll: usize,
+        };
+        const Buffers = struct { names: []const []const u8, active: usize };
+        const lanes = try frame.alloc(Lane, self.clients.len);
+        for (self.clients, lanes) |*client, *lane| {
+            lane.* = .{
+                .id = client.preset.id,
+                .name = client.preset.name,
+                .state = @tagName(client.state),
+                .running = client.transport != null,
+            };
+        }
+        const doc = self.workspace.activeDocument();
+        const location = self.cursorLocation();
+        const entries = try frame.alloc([]const u8, self.workspace.explorer.entries.items.len);
+        for (self.workspace.explorer.entries.items, entries) |path, *relative| relative.* = self.relativePath(path);
+        const names = try frame.alloc([]const u8, self.workspace.buffers.items.len);
+        for (0..names.len) |index| names[index] = self.workspace.bufferName(index);
+        const json = try std.json.Stringify.valueAlloc(frame, .{
+            .agents = lanes,
+            .active = self.active,
+            .status = self.message[0..self.message_len],
+            .sidebar = self.sidebar,
+            .focus = @tagName(self.focus),
+            .files = Files{
+                .root = std.fs.path.basename(self.workspace.root),
+                .entries = entries,
+                .selected = self.relativePath(self.workspace.activePath() orelse ""),
+                .scroll = self.explorer_first,
+            },
+            .buffers = Buffers{ .names = names, .active = self.workspace.activeIndex() },
+            .editor = .{
+                .file = self.workspace.activePath() orelse "",
+                .line = location.line + 1,
+                .column = location.column + 1,
+                .bytes = doc.buffer.len(),
+                .dirty = self.workspace.dirty(),
+            },
+        }, .{});
+        host.setSnapshot(json);
+    }
+
+    /// Apply what extensions asked for. Requests are queued by a handler and
+    /// applied here, between frames, so a handler never mutates the interface
+    /// while a frame is being drawn.
+    fn drainActions(self: *App) void {
+        const host = self.host orelse return;
+        while (host.nextAction()) |action| {
+            defer self.allocator.free(action.id);
+            switch (action.op) {
+                // Editor actions name a path or a buffer, not a client.
+                .open => {
+                    // The panel reports the path as it shows it, relative to the
+                    // workspace root.
+                    for (self.workspace.explorer.entries.items) |path| {
+                        if (!std.mem.eql(u8, self.relativePath(path), action.id)) continue;
+                        self.openFile(path) catch |err| self.status("Open failed: {s}", .{@errorName(err)});
+                        break;
+                    }
+                },
+                .switch_buffer => {
+                    for (0..self.workspace.buffers.items.len) |target| {
+                        if (!std.mem.eql(u8, self.workspace.bufferName(target), action.id)) continue;
+                        self.workspace.switchTo(target);
+                        self.cached_revision = null;
+                        self.first_line = 0;
+                        self.first_column = 0;
+                        self.selection_anchor = null;
+                        break;
+                    }
+                },
+                // Actions the shell itself carries out.
+                .sidebar, .prompt, .quick_open => {
+                    std.log.info("app action: {s}", .{@tagName(action.op)});
+                    switch (action.op) {
+                        .sidebar => self.sidebar = !self.sidebar,
+                        .prompt => self.focus = .prompt,
+                        else => {
+                            self.overlay = .files;
+                            self.query.clearRetainingCapacity();
+                            self.query_selected = 0;
+                        },
+                    }
+                },
+                .activate, .start, .stop => {
+                    const index = self.clientIndex(action.id) orelse continue;
+                    std.log.info("agent action: {s} {s}", .{ @tagName(action.op), action.id });
+                    switch (action.op) {
+                        .activate => {
+                            self.active = index;
+                            self.transcript_scroll = 0;
+                        },
+                        .start => {
+                            self.active = index;
+                            self.startAgent() catch |err| self.status("Start failed: {s}", .{@errorName(err)});
+                        },
+                        .stop => self.clients[index].stop(),
+                        else => unreachable,
+                    }
+                },
+            }
+        }
+    }
+
+    /// Path as the explorer shows it: relative to the workspace root.
+    fn relativePath(self: *const App, path: []const u8) []const u8 {
+        return if (path.len > self.workspace.root.len + 1) path[self.workspace.root.len + 1 ..] else path;
+    }
+
+    fn clientIndex(self: *const App, id: []const u8) ?usize {
+        for (self.clients, 0..) |*client, index| {
+            if (std.mem.eql(u8, client.preset.id, id)) return index;
+        }
+        return null;
+    }
+
+    /// Show what an extension last wrote through `seggs.status`. Without this an
+    /// extension could only be heard while it was loading.
+    fn syncHostStatus(self: *App) void {
+        const host = self.host orelse return;
+        const message = host.status();
+        if (message.len == 0) return;
+        if (std.mem.eql(u8, message, self.host_status[0..self.host_status_len])) return;
+        const length = @min(message.len, self.host_status.len);
+        @memcpy(self.host_status[0..length], message[0..length]);
+        self.host_status_len = length;
+        self.status("{s}", .{message});
+    }
+
+    /// Let extensions supply panels. The host outlives the app in `run`.
+    pub fn attachHost(self: *App, host: *Host) void {
+        self.host = host;
+    }
+
+    /// Draw the panel an extension registered for a named region.
+    ///
+    /// The interface offers rectangles and the extension fills them: the `lanes`
+    /// region is the agent list and `transcript` is the space below it. A panel
+    /// is asked for its description on every frame it is drawn, so a panel that
+    /// shows live state stays correct without an invalidation protocol, and a
+    /// panel that throws simply contributes nothing.
+    fn drawPanel(self: *App, r: *Renderer, region: []const u8, bounds: Rect) !bool {
+        const host = self.host orelse return false;
+        const description = (host.panelDescription(region, bounds.w, bounds.h) catch |err| {
+            std.log.err("panel {s}: {s}", .{ region, @errorName(err) });
+            return false;
+        }) orelse return false;
+        defer self.allocator.free(description);
+        var parsed = std.json.parseFromSlice(std.json.Value, self.allocator, description, .{}) catch |err| {
+            std.log.err("panel {s}: {s}", .{ region, @errorName(err) });
+            return false;
+        };
+        defer parsed.deinit();
+        self.panel_tree.parse(parsed.value) catch |err| {
+            std.log.err("panel {s}: {s}", .{ region, @errorName(err) });
+            return false;
+        };
+        self.panel_tree.build(self.char_width, self.line_height) catch |err| {
+            std.log.err("panel {s}: {s}", .{ region, @errorName(err) });
+            return false;
+        };
+        self.panel_tree.layout(bounds.w, bounds.h);
+        // A panel is confined to the region it fills: a long path in a narrow
+        // column must not spill into the document beside it.
+        const previous_clip = r.clip;
+        r.clip = bounds;
+        defer r.clip = previous_clip;
+        try self.panel_tree.render(r, bounds.x, bounds.y);
+        var targets: std.ArrayListUnmanaged(ext_ui.Tree.Target) = .empty;
+        defer targets.deinit(self.allocator);
+        try self.panel_tree.collectTargets(&targets, self.allocator, bounds.x, bounds.y);
+        for (targets.items) |target| {
+            const id = try self.allocator.dupe(u8, target.id);
+            errdefer self.allocator.free(id);
+            if (target.focusable) try self.focus_order.append(self.allocator, self.panel_nodes.items.len);
+            try self.panel_nodes.append(self.allocator, .{
+                .panel = region,
+                .id = id,
+                .bounds = .{ .x = target.bounds.x, .y = target.bounds.y, .w = target.bounds.w, .h = target.bounds.h },
+                .focusable = target.focusable,
+            });
+        }
+        try self.panel_rects.append(self.allocator, .{ .name = region, .bounds = bounds });
+        if (self.focus == .panels) try self.drawFocusRing(r);
+        return true;
+    }
+
+    /// Forget the panels of the previous frame. Drawing refills both lists.
+    fn beginPanels(self: *App) void {
+        self.panel_rects.clearRetainingCapacity();
+        for (self.panel_nodes.items) |node| self.allocator.free(node.id);
+        self.panel_nodes.clearRetainingCapacity();
+        self.focus_order.clearRetainingCapacity();
+    }
+
+    /// Outline the node the keyboard is on, so focus is visible rather than
+    /// only internal state.
+    fn drawFocusRing(self: *App, r: *Renderer) !void {
+        const target = self.focusedTarget() orelse return;
+        const box = target.bounds;
+        const thickness: f32 = 2;
+        try r.rect(.{ .x = box.x, .y = box.y, .w = box.w, .h = thickness }, theme.accent);
+        try r.rect(.{ .x = box.x, .y = box.y + box.h - thickness, .w = box.w, .h = thickness }, theme.accent);
+        try r.rect(.{ .x = box.x, .y = box.y, .w = thickness, .h = box.h }, theme.accent);
+        try r.rect(.{ .x = box.x + box.w - thickness, .y = box.y, .w = thickness, .h = box.h }, theme.accent);
+    }
+
+    /// Route a click to the panel that was drawn under it. The description is
+    /// re-read rather than cached, so hit testing needs no second copy of the
+    /// layout: a click is rare enough to pay for one parse.
+    fn clickPanel(self: *App, x: f32, y: f32) bool {
+        const host = self.host orelse return false;
+        const node = self.nodeAtPoint(x, y) orelse return false;
+        self.setPanelFocus(x, y);
+        host.dispatch("click", .{ .panel = node.panel, .id = node.id, .x = x, .y = y });
+        return true;
+    }
+
+    /// Give the keyboard to the panel that was clicked, focusing the node under
+    /// the pointer when one is focusable.
+    fn setPanelFocus(self: *App, x: f32, y: f32) void {
+        self.focus = .panels;
+        const node = self.nodeAtPoint(x, y) orelse return;
+        if (!node.focusable) return;
+        for (self.focus_order.items, 0..) |node_index, position| {
+            if (&self.panel_nodes.items[node_index] == &node) {
+                self.panel_focus = position;
+                return;
+            }
+        }
+    }
+
+    fn focusedTarget(self: *const App) ?PanelNode {
+        if (self.focus_order.items.len == 0) return null;
+        const index = self.focus_order.items[self.panel_focus % self.focus_order.items.len];
+        return self.panel_nodes.items[index];
+    }
+
+    /// Topmost named node under a point. Nodes are collected in document order,
+    /// so a later one is drawn over an earlier one and wins.
+    fn nodeAtPoint(self: *const App, x: f32, y: f32) ?PanelNode {
+        var index = self.panel_nodes.items.len;
+        while (index > 0) {
+            index -= 1;
+            const node = self.panel_nodes.items[index];
+            if (node.bounds.contains(x, y)) return node;
+        }
+        return null;
+    }
+
+    /// Tell an extension when the pointer moves onto or off one of its nodes.
+    /// Only a change is reported, so a handler does not run for every motion.
+    fn hoverPanel(self: *App, x: f32, y: f32) void {
+        const host = self.host orelse return;
+        const node = self.nodeAtPoint(x, y);
+        const id = if (node) |found| found.id else "";
+        if (std.mem.eql(u8, id, self.hover_id.items)) return;
+        self.hover_id.clearRetainingCapacity();
+        self.hover_id.appendSlice(self.allocator, id) catch return;
+        if (node) |found| {
+            host.dispatch("hover", .{ .panel = found.panel, .id = found.id, .x = x, .y = y });
+            std.log.debug("hover {s} {s}", .{ found.panel, found.id });
+        }
+    }
+
+    /// Send a key to the focused panel node. Tab and Escape belong to the
+    /// interface, because they have to work whether or not an extension is
+    /// listening for keys.
+    fn panelKey(self: *App, keycode: c.SDL_Keycode, shift: bool) void {
+        const host = self.host orelse return;
+        switch (keycode) {
+            c.SDLK_ESCAPE => {
+                self.focus = .editor;
+                return;
+            },
+            c.SDLK_TAB => {
+                const count = self.focus_order.items.len;
+                if (count > 0) {
+                    self.panel_focus = if (shift) (self.panel_focus + count - 1) % count else (self.panel_focus + 1) % count;
+                }
+                return;
+            },
+            else => {},
+        }
+        const target = self.focusedTarget() orelse return;
+        if (keycode == c.SDLK_RETURN or keycode == c.SDLK_SPACE) {
+            host.dispatch("activate", .{ .panel = target.panel, .id = target.id });
+            return;
+        }
+        host.dispatch("key", .{ .panel = target.panel, .id = target.id, .key = std.mem.span(c.SDL_GetKeyName(keycode)) });
+    }
+
+    /// Current status bar message, for reporting and tests.
+    pub fn message_(self: *const App) []const u8 {
+        return self.message[0..self.message_len];
+    }
+
+    /// Center of the first focusable node of a named panel. The panel owns its
+    /// layout, so this asks the focus order rather than guessing coordinates.
+    pub fn panelFocusPoint(self: *const App, name: []const u8) ?struct { x: f32, y: f32 } {
+        for (self.focus_order.items) |index| {
+            const node = self.panel_nodes.items[index];
+            if (!std.mem.eql(u8, node.panel, name)) continue;
+            return .{ .x = node.bounds.x + node.bounds.w / 2, .y = node.bounds.y + node.bounds.h / 2 };
+        }
+        return null;
+    }
+
+    /// Move the pointer, for the hover exercise.
+    pub fn hoverPoint(self: *const App, name: []const u8) ?struct { x: f32, y: f32 } {
+        for (self.panel_nodes.items) |node| {
+            if (!std.mem.eql(u8, node.panel, name)) continue;
+            return .{ .x = node.bounds.x + node.bounds.w / 2, .y = node.bounds.y + node.bounds.h / 2 };
+        }
+        return null;
+    }
+
+    /// A point in the first drawn panel, for the click exercise.
+    pub fn firstPanelPoint(self: *const App) ?struct { x: f32, y: f32 } {
+        const panel = if (self.panel_rects.items.len > 0) self.panel_rects.items[0] else return null;
+        return .{ .x = panel.bounds.x + 60, .y = panel.bounds.y + 12 };
+    }
+
+    /// A point in the first row of a named region's panel, for the click
+    /// exercise. A list starts at its top-left, so this lands on the first row
+    /// rather than in the gap between rows.
+    pub fn panelPoint(self: *const App, name: []const u8) ?struct { x: f32, y: f32 } {
+        for (self.panel_rects.items) |panel| {
+            if (std.mem.eql(u8, panel.name, name)) {
+                return .{ .x = panel.bounds.x + 60, .y = panel.bounds.y + 12 };
+            }
+        }
+        return null;
+    }
+
     fn copySelection(self: *App) !void {
         if (self.focus != .editor) return;
         // Use a fresh snapshot because the cached frame can precede this event.
-        const bytes = try self.workspace.document.snapshot(self.allocator);
+        const bytes = try self.workspace.activeDocument().snapshot(self.allocator);
         defer self.allocator.free(bytes);
         const range = self.selectedRange() orelse return;
-        const z = try self.allocator.dupeZ(u8, bytes[range.start..range.end]);
+        const z = try self.allocator.dupeSentinel(u8, bytes[range.start..range.end], 0);
         defer self.allocator.free(z);
         if (!c.SDL_SetClipboardText(z.ptr)) return error.Clipboard;
     }
 
     fn mouseDown(self: *App, x: f32, y: f32) !void {
         if (self.overlay != .none) return;
+        if (self.clickPanel(x, y)) return;
         const g = self.geometry;
         if (g.activity.contains(x, y)) {
             if (y < 105) self.sidebar = !self.sidebar else self.focus = .prompt;
-        } else if (g.explorer.contains(x, y) and y >= g.explorer.y + 68) {
-            const row: usize = @intFromFloat((y - g.explorer.y - 68) / 24);
-            const index = self.explorer_first + row;
-            if (index < self.workspace.explorer.entries.items.len) try self.openFile(self.workspace.explorer.entries.items[index]);
         } else if (g.agents.contains(x, y)) {
             const lanes_y = g.agents.y + 44;
             const lanes_end = lanes_y + @as(f32, @floatFromInt(self.clients.len)) * 38;
@@ -370,8 +927,8 @@ pub const App = struct {
             self.focus = .prompt;
         } else if (self.editorRect().contains(x, y)) {
             self.focus = .editor;
-            self.workspace.document.cursor = self.positionAt(x, y);
-            self.selection_anchor = self.workspace.document.cursor;
+            self.workspace.activeDocument().cursor = self.positionAt(x, y);
+            self.selection_anchor = self.workspace.activeDocument().cursor;
             self.drag = true;
             self.follow_cursor = false;
         }
@@ -391,12 +948,8 @@ pub const App = struct {
         const r = self.editorRect();
         const line = self.first_line + @as(usize, @intFromFloat(@max(0, (y - r.y - 4) / self.line_height)));
         const column = self.first_column + @as(usize, @intFromFloat(@max(0, (x - r.x - 60) / self.char_width + 0.5)));
-        const doc = &self.workspace.document;
-        var pos: usize = 0;
-        var row: usize = 0;
-        while (pos < doc.buffer.len() and row < line) : (pos += 1) {
-            if (doc.buffer.byteAt(pos) == '\n') row += 1;
-        }
+        const doc = self.workspace.activeDocument();
+        var pos: usize = if (line >= doc.lineCount()) doc.buffer.len() else doc.lineStartAt(line);
         var col: usize = 0;
         while (pos < doc.buffer.len() and doc.buffer.byteAt(pos) != '\n' and col < column) : (pos = doc.next(pos)) {
             col += if (doc.buffer.byteAt(pos) == '\t') @as(usize, 4) else 1;
@@ -461,77 +1014,61 @@ pub const App = struct {
     }
 
     pub fn draw(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
+        self.frame_count += 1;
+        self.syncHostStatus();
+        // Every region is drawn once per frame, so the lists they fill start
+        // empty here rather than part way through.
+        self.beginPanels();
+        try self.publishSnapshot(frame);
         self.char_width = r.atlas.advance;
         self.line_height = r.atlas.line_height;
-        self.geometry = layout.Layout.calculate(r.width, r.height, self.sidebar);
+        self.geometry = layout.Layout.calculate(r.width, r.height, self.sidebar, .{ .line_height = self.line_height, .char_width = self.char_width });
         const g = self.geometry;
         try r.rect(.{ .x = 0, .y = 0, .w = r.width, .h = r.height }, theme.background);
         try r.rect(g.title, theme.panel);
         try r.text(16, 11, "SEGGS", theme.accent);
         try r.text(116, 11, "/ agent-native workspace", theme.muted);
         try r.text(@max(400, r.width - 174), 11, "SDL3 GPU / ACP", theme.accent);
-        try r.rect(g.activity, theme.panel);
-        try r.rect(.{ .x = 0, .y = 54, .w = 3, .h = 36 }, theme.accent);
-        try r.text(15, 61, "E", theme.text);
-        try r.text(15, 114, "A", theme.muted);
-        try r.text(15, 166, ">", theme.muted);
-        if (g.explorer.w > 0) try self.drawExplorer(r);
+        _ = try self.drawPanel(r, "activity", g.activity);
+        if (g.explorer.w > 0) _ = try self.drawPanel(r, "explorer", g.explorer);
         try self.drawEditor(r);
         try self.drawAgents(r, frame);
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
         try r.rect(g.status, theme.selected);
-        r.clip = g.status;
-        try r.text(12, g.status.y + 4, self.message[0..self.message_len], theme.text);
+        _ = try self.drawPanel(r, "status", g.status);
         if (self.overlay != .none) try self.drawOverlay(r);
     }
 
-    fn drawExplorer(self: *App, r: *Renderer) !void {
-        const bounds = self.geometry.explorer;
-        r.clip = bounds;
-        try r.rect(bounds, theme.panel);
-        try r.text(bounds.x + 12, bounds.y + 13, "EXPLORER", theme.muted);
-        try r.text(bounds.x + 12, bounds.y + 42, std.fs.path.basename(self.workspace.root), theme.accent);
-        var y = bounds.y + 68;
-        var index = self.explorer_first;
-        while (index < self.workspace.explorer.entries.items.len and y < bounds.y + bounds.h - 28) : (index += 1) {
-            const path = self.workspace.explorer.entries.items[index];
-            const relative = if (path.len > self.workspace.root.len + 1) path[self.workspace.root.len + 1 ..] else path;
-            const selected = if (self.workspace.path) |current| std.mem.eql(u8, current, path) else false;
-            if (selected) try r.rect(.{ .x = bounds.x + 4, .y = y - 2, .w = bounds.w - 8, .h = 24 }, theme.raised);
-            try r.text(bounds.x + 12, y, relative, if (selected) theme.text else theme.muted);
-            y += 24;
-        }
-        try r.text(bounds.x + 12, bounds.y + bounds.h - 24, "Ctrl+P  quick open", theme.muted);
-    }
-
-    fn cursorLocation(self: *const App) struct { line: usize, column: usize } {
-        var line: usize = 0;
+    fn cursorLocation(self: *App) struct { line: usize, column: usize } {
+        const doc = self.workspace.activeDocument();
+        const line = doc.lineOf(doc.cursor);
+        var pos = doc.lineStartAt(line);
         var col: usize = 0;
-        var pos: usize = 0;
-        const doc = &self.workspace.document;
         while (pos < doc.cursor) : (pos = doc.next(pos)) {
             const byte = doc.buffer.byteAt(pos);
-            if (byte == '\n') {
-                line += 1;
-                col = 0;
-            } else col += if (byte == '\t') @as(usize, 4) else 1;
+            col += if (byte == '\t') @as(usize, 4) else 1;
         }
         return .{ .line = line, .column = col };
+    }
+
+    fn switchBuffer(self: *App, forward: bool) void {
+        self.workspace.cycle(forward);
+        self.cached_revision = null;
+        self.first_line = 0;
+        self.first_column = 0;
+        self.selection_anchor = null;
     }
 
     fn drawEditor(self: *App, r: *Renderer) !void {
         const bounds = self.geometry.editor;
         r.clip = bounds;
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 36 }, theme.panel);
-        var tab_buf: [512]u8 = undefined;
-        const name = if (self.workspace.path) |path| std.fs.path.basename(path) else "Welcome.zig";
-        const tab = try std.fmt.bufPrint(&tab_buf, "{s}{s}", .{ name, if (self.workspace.dirty()) " *" else "" });
-        try r.text(bounds.x + 18, bounds.y + 9, tab, theme.text);
-        try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = @min(bounds.w, 210), .h = 2 }, theme.accent);
+        // Tabs and the line below them are panels an extension fills; the editor
+        // itself keeps drawing the text, because that is the document rather
+        // than chrome around it.
+        _ = try self.drawPanel(r, "tabs", .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 36 });
+        _ = try self.drawPanel(r, "header", .{ .x = bounds.x, .y = bounds.y + 36, .w = bounds.w, .h = 30 });
         const loc = self.cursorLocation();
-        var info_buf: [128]u8 = undefined;
-        const info = try std.fmt.bufPrint(&info_buf, "UTF-8  /  Ln {d}, Col {d}  /  {d} bytes", .{ loc.line + 1, loc.column + 1, self.cached.len });
-        try r.text(bounds.x + 18, bounds.y + 43, info, theme.muted);
         const viewport = self.editorRect();
         r.clip = viewport;
         const rows: usize = @intFromFloat(@max(1, (viewport.h - 8) / self.line_height));
@@ -544,6 +1081,8 @@ pub const App = struct {
             self.follow_cursor = false;
         }
         const selection = self.selectedRange();
+        const lang = if (self.workspace.activePath()) |path| highlight.Language.detect(path) else .zig;
+        var scan: highlight.Scanner = .{ .language = lang };
         var lines = std.mem.splitScalar(u8, self.cached, '\n');
         var line_no: usize = 0;
         var offset: usize = 0;
@@ -552,49 +1091,56 @@ pub const App = struct {
                 line_no += 1;
                 offset += line.len + 1;
             }
-            if (line_no < self.first_line) continue;
+            if (line_no < self.first_line) {
+                scan.scanLine(line);
+                continue;
+            }
             if (line_no >= self.first_line + rows + 1) break;
             const y = viewport.y + 4 + @as(f32, @floatFromInt(line_no - self.first_line)) * self.line_height;
             if (line_no == loc.line) try r.rect(.{ .x = viewport.x, .y = y, .w = viewport.w, .h = self.line_height }, theme.panel);
+            if (self.hasDiagnostic(line_no)) try r.rect(.{ .x = viewport.x, .y = y, .w = 3, .h = self.line_height }, theme.red);
             var number_buf: [24]u8 = undefined;
             const number = try std.fmt.bufPrint(&number_buf, "{d}", .{line_no + 1});
             try r.text(viewport.x + 46 - @as(f32, @floatFromInt(number.len)) * self.char_width, y, number, theme.muted);
             r.clip = .{ .x = viewport.x + 56, .y = viewport.y, .w = @max(0, viewport.w - 56), .h = viewport.h };
-            var scan: Scanner = .{};
             var pos: usize = 0;
             var column: usize = 0;
             while (pos < line.len) {
-                const byte = line[pos];
+                const cp = text.decode(line, pos);
                 const color = scan.color(line, pos);
-                const cells: usize = if (byte == '\t') 4 else 1;
+                const cells: usize = if (cp == '\t') 4 else 1;
                 if (column + cells >= self.first_column) {
                     const x = viewport.x + 60 + (@as(f32, @floatFromInt(column)) - @as(f32, @floatFromInt(self.first_column))) * self.char_width;
-                    if (x >= viewport.x + viewport.w) break;
-                    if (selection) |range| {
-                        if (offset + pos >= range.start and offset + pos < range.end) try r.rect(.{ .x = x, .y = y, .w = self.char_width * @as(f32, @floatFromInt(cells)), .h = self.line_height }, theme.selected);
+                    if (x < viewport.x + viewport.w) {
+                        if (selection) |range| {
+                            if (offset + pos >= range.start and offset + pos < range.end) try r.rect(.{ .x = x, .y = y, .w = self.char_width * @as(f32, @floatFromInt(cells)), .h = self.line_height }, theme.selected);
+                        }
+                        if (cp != '\t' and cp != '\r') _ = try r.glyphAt(x, y + r.atlas.ascent, cp, color);
                     }
-                    if (byte != '\t' and byte != '\r') try r.glyph(x, y, byte, color);
                 }
                 pos = text.next(line, pos);
                 column += cells;
             }
+            scan.endLine();
             r.clip = viewport;
         }
-        if (self.focus == .editor and (c.SDL_GetTicks() / 500) % 2 == 0 and loc.line >= self.first_line and loc.line < self.first_line + rows and loc.column >= self.first_column) {
+        // Half a second at the sixty frames a second the loop targets.
+        if (self.focus == .editor and (self.frame_count / 30) % 2 == 0 and loc.line >= self.first_line and loc.line < self.first_line + rows and loc.column >= self.first_column) {
             try r.rect(.{ .x = viewport.x + 60 + @as(f32, @floatFromInt(loc.column - self.first_column)) * self.char_width, .y = viewport.y + 4 + @as(f32, @floatFromInt(loc.line - self.first_line)) * self.line_height, .w = 2, .h = self.line_height }, theme.accent);
         }
-    }
-
-    fn stateLabel(state: Client.State) []const u8 {
-        return switch (state) {
-            .offline => "OFF",
-            .initialize => "INIT",
-            .new_session => "NEW",
-            .ready => "READY",
-            .busy => "BUSY",
-            .cancelling => "CANCEL",
-            .failed => "ERROR",
-        };
+        // In-progress IME composition, drawn at the cursor with an underline.
+        if (self.preedit.text.items.len > 0 and loc.line >= self.first_line and loc.line < self.first_line + rows) {
+            const x = viewport.x + 60 + (@as(f32, @floatFromInt(loc.column)) - @as(f32, @floatFromInt(self.first_column))) * self.char_width;
+            const y = viewport.y + 4 + @as(f32, @floatFromInt(loc.line - self.first_line)) * self.line_height;
+            // The segment the input method has selected sits behind the text,
+            // so the composition shows which part a further keypress replaces.
+            const composing = self.preedit.selectionCells();
+            if (composing.len > 0) {
+                try r.rect(.{ .x = x + self.char_width * @as(f32, @floatFromInt(composing.start)), .y = y, .w = self.char_width * @as(f32, @floatFromInt(composing.len)), .h = self.line_height }, theme.selected);
+            }
+            try r.text(x, y, self.preedit.text.items, theme.amber);
+            try r.rect(.{ .x = x, .y = y + self.line_height - 3, .w = self.char_width * @as(f32, @floatFromInt(self.preedit.cellCount())), .h = 2 }, theme.amber);
+        }
     }
 
     fn drawAgents(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
@@ -603,25 +1149,21 @@ pub const App = struct {
         try r.rect(bounds, theme.panel);
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = 1, .h = bounds.h }, theme.border);
         try r.text(bounds.x + 14, bounds.y + 13, "AGENTS / independent sessions", theme.text);
-        for (self.clients, 0..) |client, i| {
-            const row: Rect = .{ .x = bounds.x + 8, .y = bounds.y + 44 + @as(f32, @floatFromInt(i)) * 38, .w = bounds.w - 16, .h = 34 };
-            try r.rect(row, if (i == self.active) theme.raised else theme.panel);
-            const tint = if (client.permission != null) theme.amber else switch (client.state) { .ready => theme.accent, .busy, .cancelling => theme.purple, .failed => theme.red, else => theme.muted };
-            try r.rect(.{ .x = row.x + 8, .y = row.y + 13, .w = 7, .h = 7 }, tint);
-            var lane_buf: [160]u8 = undefined;
-            const lane = try std.fmt.bufPrint(&lane_buf, "{d} {s}", .{ i + 1, client.preset.name });
-            r.clip = .{ .x = row.x + 22, .y = row.y, .w = @max(0, row.w - 165), .h = row.h };
-            try r.text(row.x + 22, row.y + 8, lane, theme.text);
-            r.clip = bounds;
-            try r.text(row.x + row.w - 148, row.y + 8, if (client.permission != null) "ASK" else stateLabel(client.state), tint);
-            try r.text(row.x + row.w - 59, row.y + 8, if (client.transport == null) "START" else "STOP", theme.accent);
-        }
+        // The lanes are drawn by whichever extension registered a panel for the
+        // `lanes` region; the interface only offers the rectangle.
+        const lanes: Rect = .{ .x = bounds.x + 8, .y = bounds.y + 44, .w = bounds.w - 16, .h = @as(f32, @floatFromInt(self.clients.len)) * 38 };
+        _ = try self.drawPanel(r, "lanes", lanes);
         const transcript_y = bounds.y + 52 + @as(f32, @floatFromInt(self.clients.len)) * 38;
         const transcript_bottom = if (self.clients[self.active].permission != null) self.permissionRect().y - 8 else bounds.y + bounds.h - 110;
         const transcript: Rect = .{ .x = bounds.x + 14, .y = transcript_y, .w = bounds.w - 28, .h = @max(0, transcript_bottom - transcript_y) };
         const client = &self.clients[self.active];
-        const bytes = if (client.transcript.items.len == 0) "No agent starts automatically.\n\nF5 starts this agent.\nCtrl+L focuses the prompt.\nCtrl+Enter sends to this agent.\nCtrl+Shift+Enter sends to ready agents.\n\nThe local mock needs no account.\nUse separate worktrees for parallel edits." else client.transcript.items;
-        try wrappedTail(r, frame, transcript, bytes, self.transcript_scroll, theme.text);
+        if (client.transcript.items.len == 0 and try self.drawPanel(r, "transcript", transcript)) {
+            // A registered panel owns this space, so the interface does not
+            // carry a copy of what an extension would say.
+        } else {
+            const bytes = if (client.transcript.items.len == 0) default_help else client.transcript.items;
+            try wrappedTail(r, frame, transcript, bytes, self.transcript_scroll, theme.text);
+        }
         r.clip = bounds;
         if (client.permission != null) {
             const permission = self.permissionRect();

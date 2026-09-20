@@ -23,6 +23,20 @@ pub fn next(bytes: []const u8, at: usize) usize {
     return p;
 }
 
+/// Decode the UTF-8 codepoint at `at`, or U+FFFD on invalid/truncated input.
+pub fn decode(bytes: []const u8, at: usize) u21 {
+    if (at >= bytes.len) return 0xFFFD;
+    const len = std.unicode.utf8ByteSequenceLength(bytes[at]) catch return 0xFFFD;
+    if (at + len > bytes.len) return 0xFFFD;
+    return switch (len) {
+        1 => bytes[at],
+        2 => std.unicode.utf8Decode2(bytes[at..][0..2].*) catch 0xFFFD,
+        3 => std.unicode.utf8Decode3(bytes[at..][0..3].*) catch 0xFFFD,
+        4 => std.unicode.utf8Decode4(bytes[at..][0..4].*) catch 0xFFFD,
+        else => 0xFFFD,
+    };
+}
+
 pub fn prefixBoundary(bytes: []const u8, limit: usize) usize {
     var n = @min(bytes.len, limit);
     while (n > 0 and !isBoundary(bytes, n)) : (n -= 1) {}

@@ -3,28 +3,34 @@ const c = @import("native");
 const Decoder = @import("framing.zig").Decoder;
 const Allocator = std.mem.Allocator;
 
-const Queue = struct {
+/// Bounded hand-off queue between the UI thread and one pipe worker.
+/// The item and byte bounds are the backpressure contract: a producer that
+/// outruns the worker fails with `QueueFull` instead of growing without limit.
+/// Both bounds and the partial-write path are covered by native tests.
+pub const Queue = struct {
     mutex: *c.SDL_Mutex,
     allocator: Allocator,
     items: std.ArrayList([]u8) = .empty,
     bytes: usize = 0,
+    pub const max_items = 128;
+    pub const max_bytes = 8 * 1024 * 1024;
 
-    fn init(a: Allocator) !Queue {
+    pub fn init(a: Allocator) !Queue {
         return .{ .allocator = a, .mutex = c.SDL_CreateMutex() orelse return error.SdlMutex };
     }
-    fn deinit(self: *Queue) void {
+    pub fn deinit(self: *Queue) void {
         for (self.items.items) |item| self.allocator.free(item);
         self.items.deinit(self.allocator);
         c.SDL_DestroyMutex(self.mutex);
     }
-    fn push(self: *Queue, owned: []u8) !void {
+    pub fn push(self: *Queue, owned: []u8) !void {
         c.SDL_LockMutex(self.mutex);
         defer c.SDL_UnlockMutex(self.mutex);
-        if (self.items.items.len >= 128 or self.bytes + owned.len > 8 * 1024 * 1024) return error.QueueFull;
+        if (self.items.items.len >= max_items or self.bytes + owned.len > max_bytes) return error.QueueFull;
         try self.items.append(self.allocator, owned);
         self.bytes += owned.len;
     }
-    fn pop(self: *Queue) ?[]u8 {
+    pub fn pop(self: *Queue) ?[]u8 {
         c.SDL_LockMutex(self.mutex);
         defer c.SDL_UnlockMutex(self.mutex);
         if (self.items.items.len == 0) return null;
@@ -33,6 +39,56 @@ const Queue = struct {
         return item;
     }
 };
+
+/// A byte sink for `writePacket`. The transport supplies an SDL stream sink; a
+/// test supplies one that accepts short counts to exercise partial writes.
+pub const Sink = struct {
+    context: *anyopaque,
+    write: *const fn (*anyopaque, []const u8) usize,
+    notReady: *const fn (*anyopaque) bool,
+
+    /// Accept as much as the sink takes right now. Zero means "retry later"
+    /// only when `isNotReady` reports true.
+    pub fn writeSome(self: Sink, bytes: []const u8) usize {
+        return self.write(self.context, bytes);
+    }
+
+    pub fn isNotReady(self: Sink) bool {
+        return self.notReady(self.context);
+    }
+
+    /// Sink over a nonblocking SDL stream, used by the pipe worker.
+    pub fn stream(io: *c.SDL_IOStream) Sink {
+        return .{ .context = @ptrCast(io), .write = streamWrite, .notReady = streamNotReady };
+    }
+
+    fn streamWrite(context: *anyopaque, bytes: []const u8) usize {
+        const io: *c.SDL_IOStream = @ptrCast(@alignCast(context));
+        const written = c.SDL_WriteIO(io, bytes.ptr, bytes.len);
+        return if (written > 0) @intCast(written) else 0;
+    }
+
+    fn streamNotReady(context: *anyopaque) bool {
+        const io: *c.SDL_IOStream = @ptrCast(@alignCast(context));
+        return c.SDL_GetIOStatus(io) == c.SDL_IO_STATUS_NOT_READY;
+    }
+};
+
+/// Push a packet through `sink`, tolerating short writes. `offset` advances by
+/// whatever the sink accepted. Returns true once the packet is fully written;
+/// false means the sink is not ready and the same offset should be retried.
+/// A zero write that is not a not-ready condition is an I/O failure.
+pub fn writePacket(packet: []const u8, offset: *usize, sink: Sink) !bool {
+    while (offset.* < packet.len) {
+        const written = sink.writeSome(packet[offset.*..]);
+        if (written == 0) {
+            if (sink.isNotReady()) return false;
+            return error.TransportWrite;
+        }
+        offset.* += written;
+    }
+    return true;
+}
 
 /// One worker owns both nonblocking pipes for one process.
 /// No JSON, editor, or GPU state crosses the thread boundary.
@@ -46,7 +102,7 @@ pub const Transport = struct {
     outgoing: Queue,
     worker: ?*c.SDL_Thread = null,
     stop_flag: std.atomic.Value(bool) = .init(false),
-    exit_code: std.atomic.Value(u8) = .init(@intFromEnum(Exit.none)),
+    exit_code: std.atomic.Value(u8) = .init(@backingInt(Exit.none)),
 
     pub fn start(a: Allocator, argv: []const []const u8, cwd: []const u8) !*Transport {
         if (argv.len == 0) return error.EmptyCommand;
@@ -54,9 +110,9 @@ pub const Transport = struct {
         defer arena.deinit();
         const temp = arena.allocator();
         const args = try temp.alloc(?[*:0]const u8, argv.len + 1);
-        for (argv, 0..) |arg, i| args[i] = (try temp.dupeZ(u8, arg)).ptr;
+        for (argv, 0..) |arg, i| args[i] = (try temp.dupeSentinel(u8, arg, 0)).ptr;
         args[argv.len] = null;
-        const cwd_z = try temp.dupeZ(u8, cwd);
+        const cwd_z = try temp.dupeSentinel(u8, cwd, 0);
         const props = c.SDL_CreateProperties();
         if (props == 0) return error.SdlProperties;
         defer c.SDL_DestroyProperties(props);
@@ -100,7 +156,7 @@ pub const Transport = struct {
     }
 
     pub fn exitReason(self: *const Transport) Exit {
-        return @enumFromInt(self.exit_code.load(.acquire));
+        return @fromBackingInt(@intCast(self.exit_code.load(.acquire)));
     }
 
     pub fn destroy(self: *Transport) void {
@@ -126,7 +182,7 @@ pub const Transport = struct {
             error.QueueFull => Exit.backpressure,
             else => Exit.io_error,
         };
-        self.exit_code.store(@intFromEnum(reason), .release);
+        self.exit_code.store(@backingInt(reason), .release);
         return 0;
     }
 
@@ -137,6 +193,7 @@ pub const Transport = struct {
         defer if (pending) |packet| self.allocator.free(packet);
         var offset: usize = 0;
         var buffer: [16 * 1024]u8 = undefined;
+        const sink = Sink.stream(self.input);
         while (!self.stop_flag.load(.acquire)) {
             var progressed = false;
             if (pending == null) {
@@ -144,11 +201,10 @@ pub const Transport = struct {
                 offset = 0;
             }
             if (pending) |packet| {
-                const written = c.SDL_WriteIO(self.input, packet[offset..].ptr, packet.len - offset);
-                if (written == 0 and c.SDL_GetIOStatus(self.input) != c.SDL_IO_STATUS_NOT_READY) return .io_error;
-                progressed = written > 0;
-                offset += written;
-                if (offset == packet.len) {
+                const before = offset;
+                const done = try writePacket(packet, &offset, sink);
+                if (offset > before) progressed = true;
+                if (done) {
                     self.allocator.free(packet);
                     pending = null;
                 }

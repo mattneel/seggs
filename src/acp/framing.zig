@@ -59,3 +59,22 @@ test "oversize frame fails closed" {
     @memset(bytes, 'x');
     try std.testing.expectError(error.FrameTooLarge, d.feed(bytes));
 }
+
+fn decodeOps(a: std.mem.Allocator) !void {
+    var d = Decoder.init(a);
+    defer d.deinit();
+    try d.feed("{\"a\":\"x\\n");
+    try std.testing.expect((try d.next()) == null);
+    try d.feed("y\"}\r\n{}\n");
+    const first = (try d.next()) orelse return error.MissingFrame;
+    defer a.free(first);
+    try std.testing.expectEqualStrings("{\"a\":\"x\\ny\"}", first);
+    const second = (try d.next()) orelse return error.MissingFrame;
+    defer a.free(second);
+    try std.testing.expectEqualStrings("{}", second);
+    try std.testing.expect((try d.next()) == null);
+}
+
+test "every allocation failure in the decoder is reported without leak or corruption" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, decodeOps, .{});
+}

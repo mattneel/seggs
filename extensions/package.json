@@ -1,0 +1,14 @@
+{
+  "name": "seggs-extensions",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript extensions for Seggs, bundled with esbuild.",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "typescript": "^5.7.0"
+  }
+}

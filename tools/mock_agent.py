@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Local ACP v1 fixture. This agent never reads or writes workspace files."""
+"""Local ACP v1 fixture. The agent itself never touches workspace files: it
+asks the client to read, write, and run commands through the advertised
+filesystem and terminal capabilities."""
 from __future__ import annotations
 
 import argparse
@@ -22,6 +24,8 @@ class Turn:
     cancelled: threading.Event = field(default_factory=threading.Event)
     permission_ready: threading.Event = field(default_factory=threading.Event)
     permission_reply: dict[str, Any] | None = None
+    fs_ready: threading.Event = field(default_factory=threading.Event)
+    client_reply: dict[str, Any] | None = None
 
 
 class MockAgent:
@@ -35,6 +39,8 @@ class MockAgent:
         self.sessions: set[str] = set()
         self.turns: dict[str, Turn] = {}
         self.permissions: dict[str, Turn] = {}
+        self.fs_requests: dict[str, Turn] = {}
+        self.modes: dict[str, str] = {}
         self.threads: list[threading.Thread] = []
         self.initialized = False
         self.closed = threading.Event()
@@ -73,6 +79,12 @@ class MockAgent:
             if turn is not None:
                 turn.permission_reply = packet
                 turn.permission_ready.set()
+                return
+            with self.state_lock:
+                fs_turn = self.fs_requests.pop(str(request_id), None)
+            if fs_turn is not None:
+                fs_turn.client_reply = packet
+                fs_turn.fs_ready.set()
             return
         method = packet["method"]
         params = packet.get("params", {})
@@ -101,7 +113,20 @@ class MockAgent:
             self.serial += 1
             session = f"mock-{os.getpid()}-{self.serial}"
             self.sessions.add(session)
-            self.result(request_id, {"sessionId": session})
+            self.result(request_id, {"sessionId": session, "configOptions": [{"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": "default", "options": [{"value": "default", "name": "Default"}, {"value": "plan", "name": "Plan"}]}]})
+        elif method == "session/set_config_option":
+            session = params.get("sessionId")
+            if not isinstance(session, str) or session not in self.sessions:
+                self.error(request_id, -32602, "Invalid session")
+                return
+            config_id = params.get("configId")
+            value = params.get("value")
+            if not isinstance(config_id, str) or not isinstance(value, str):
+                self.error(request_id, -32602, "Invalid config")
+                return
+            with self.state_lock:
+                self.modes[session] = value
+            self.result(request_id, {"configOptions": [{"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": value, "options": [{"value": "default", "name": "Default"}, {"value": "plan", "name": "Plan"}]}]})
         elif method == "session/prompt":
             session = params.get("sessionId")
             prompt = params.get("prompt")
@@ -153,11 +178,68 @@ class MockAgent:
         self.update(turn.session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "mock-tool", "status": "completed" if allowed else "failed"})
         return "permission=allowed" if allowed else "permission=rejected"
 
+    def client_call(self, turn: Turn, prefix: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        """Send a client-bound request and wait for its reply."""
+        request_id = f"{prefix}:{turn.session_id}:{turn.request_id}"
+        turn.fs_ready.clear()
+        turn.client_reply = None
+        with self.state_lock:
+            self.fs_requests[request_id] = turn
+        self.send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params})
+        turn.fs_ready.wait(10)
+        with self.state_lock:
+            self.fs_requests.pop(request_id, None)
+        return turn.client_reply or {}
+
+    def fs_read(self, turn: Turn) -> str:
+        path = turn.text[7:].strip()
+        reply = self.client_call(turn, "fs", "fs/read_text_file", {"sessionId": turn.session_id, "path": path})
+        if "error" in reply:
+            return f"\nfs-error:{reply['error'].get('message', '')}"
+        content = reply.get("result", {}).get("content", "")
+        return "\nfs-read-ok" if "MockAgent" in content else "\nfs-read-empty"
+
+    def fs_write(self, turn: Turn) -> str:
+        spec = turn.text[8:].strip()
+        if "|" not in spec:
+            return "\nfs-write-invalid"
+        path, content = spec.split("|", 1)
+        reply = self.client_call(turn, "fsw", "fs/write_text_file", {"sessionId": turn.session_id, "path": path, "content": content})
+        return "\nfs-write-error" if "error" in reply else "\nfs-write-ok"
+
+    def terminal_run(self, turn: Turn) -> str:
+        """Exercise the client terminal capability end to end: create, wait for
+        exit, read the bounded output, then release ownership."""
+        created = self.client_call(turn, "term", "terminal/create", {
+            "sessionId": turn.session_id,
+            "command": "sh",
+            "args": ["-c", "echo seggs-terminal-ok"],
+        })
+        terminal_id = created.get("result", {}).get("terminalId")
+        if not terminal_id:
+            return "\nterminal-create-failed"
+        exit_reply = self.client_call(turn, "termexit", "terminal/wait_for_exit", {"sessionId": turn.session_id, "terminalId": terminal_id})
+        exit_code = exit_reply.get("result", {}).get("exitCode")
+        output_reply = self.client_call(turn, "termout", "terminal/output", {"sessionId": turn.session_id, "terminalId": terminal_id})
+        output = output_reply.get("result", {}).get("output", "")
+        self.client_call(turn, "termrel", "terminal/release", {"sessionId": turn.session_id, "terminalId": terminal_id})
+        if exit_code == 0 and "seggs-terminal-ok" in output:
+            return "\nterminal-ok"
+        return f"\nterminal-failed:exit={exit_code}:output={output!r}"
+
     def complete(self, turn: Turn) -> None:
         try:
             self.update(turn.session_id, {"sessionUpdate": "plan", "entries": [{"content": "Echo the prompt without workspace access", "priority": "medium", "status": "in_progress"}]})
             permission = self.permission(turn) if turn.text.startswith("permission") else ""
-            response = f"mock[{self.name}] {turn.text}\n{permission}"
+            if turn.text.startswith("fsread "):
+                fs_result = self.fs_read(turn)
+            elif turn.text.startswith("fswrite "):
+                fs_result = self.fs_write(turn)
+            elif turn.text.startswith("terminal"):
+                fs_result = self.terminal_run(turn)
+            else:
+                fs_result = ""
+            response = f"mock[{self.name}] {turn.text}\n{permission}{fs_result}"
             for offset in range(0, len(response), 7):
                 if turn.cancelled.is_set() or self.closed.is_set():
                     break
@@ -181,6 +263,8 @@ class MockAgent:
             for turn in self.turns.values():
                 turn.cancelled.set()
                 turn.permission_ready.set()
+            for turn in self.fs_requests.values():
+                turn.fs_ready.set()
         for thread in self.threads:
             thread.join(timeout=1)
 

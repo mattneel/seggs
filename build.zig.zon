@@ -1,0 +1,24 @@
+.{
+    .name = .seggs,
+    .version = "0.2.0",
+    .minimum_zig_version = "0.17.0-dev.1970+67f39b551",
+    .dependencies = .{
+        // Pinned to the commit that ports the bindings to Zig 0.17.
+        .quickjs_ng = .{
+            .url = "https://github.com/mattneel/zig-quickjs-ng/archive/16eca3e27ca7490fc739e5573390dc1e134f1cca.tar.gz",
+            .hash = "quickjs_ng-0.0.0-0cZnA_83BACKebvzo5TSE6i3xepcM7iH2QhxUtVfHuVn",
+        },
+        // Flexbox layout for the interface. Yoga ships C++ and a C API, so it
+        // is built from source here rather than through its own build script.
+        .yoga = .{
+            .url = "https://github.com/facebook/yoga/archive/042f5013152eb81c1552dec945b88f7b95ca350f.tar.gz",
+            .hash = "N-V-__8AAOYl0gAU76B1VRPFD9AWvy2VkOef2jN0B3sISTeO",
+        },
+        .zignal = .{
+            .url = "https://github.com/arrufat/zignal/archive/c85677f3f96594f39a879d85c9a628e96724321d.tar.gz",
+            .hash = "zignal-0.11.0-dev-OrZ3s-WENgBqOZbJiTZ5UaWAWHpa5TZbMMm3FEQXB8jR",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xda806a7032d6b024,
+}

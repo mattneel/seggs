@@ -1,12 +1,12 @@
 {
-  "zig": "0.16.0",
-  "SDL": {
-    "repository": "https://github.com/libsdl-org/SDL.git",
-    "tag": "release-3.4.4"
-  },
-  "SDL_ttf": {
-    "repository": "https://github.com/libsdl-org/SDL_ttf.git",
-    "tag": "release-3.2.2"
-  },
-  "notes": "SDL source tags are fixed baselines, not latest-version claims. FreeType, glslang, and drivers are system dependencies. Bootstrap records resolved commits."
+    "zig": "0.17.0-dev.1970+67f39b551",
+    "SDL": {
+        "repository": "https://github.com/libsdl-org/SDL.git",
+        "tag": "release-3.4.4"
+    },
+    "SDL_ttf": {
+        "repository": "https://github.com/libsdl-org/SDL_ttf.git",
+        "tag": "release-3.2.2"
+    },
+    "notes": "SDL source tags are fixed baselines, not latest-version claims. FreeType, glslang, and drivers are system dependencies. Bootstrap records resolved commits."
 }

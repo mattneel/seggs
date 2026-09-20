@@ -17,6 +17,7 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = (ROOT / ".zigversion").read_text().strip()
+CHECKSUMS = ROOT / "tools/zig-checksums.json"
 
 
 def fetch(url: str, destination: Path) -> None:
@@ -26,6 +27,23 @@ def fetch(url: str, destination: Path) -> None:
     request = urllib.request.Request(url, headers={"User-Agent": "Seggs-scaffold/0.1"})
     with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as output:
         shutil.copyfileobj(response, output)
+
+
+def pinned_entry(key: str) -> dict:
+    """Resolve a development build, which the release manifest does not list.
+
+    Zig publishes development builds under /builds/ with no manifest, so the
+    expected digest is committed in tools/zig-checksums.json instead of being
+    skipped: an unverified download is not an option.
+    """
+    digests = json.loads(CHECKSUMS.read_text()).get(VERSION, {})
+    digest = digests.get(key)
+    if digest is None:
+        raise ValueError(
+            f"No pinned checksum for Zig {VERSION} on {key}. Download the archive from "
+            f"https://ziglang.org/builds/, verify it, and add the sha256 to tools/zig-checksums.json."
+        )
+    return {"tarball": f"https://ziglang.org/builds/zig-{key}-{VERSION}.tar.xz", "shasum": digest}
 
 
 def install(destination: Path) -> None:
@@ -38,9 +56,12 @@ def install(destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="seggs-zig-", dir=destination.parent) as temp:
         directory = Path(temp)
-        manifest = directory / "index.json"
-        fetch("https://ziglang.org/download/index.json", manifest)
-        entry = json.loads(manifest.read_text())[VERSION][key]
+        if "-dev." in VERSION:
+            entry = pinned_entry(key)
+        else:
+            manifest = directory / "index.json"
+            fetch("https://ziglang.org/download/index.json", manifest)
+            entry = json.loads(manifest.read_text())[VERSION][key]
         archive = directory / Path(urllib.parse.urlparse(entry["tarball"]).path).name
         fetch(entry["tarball"], archive)
         with archive.open("rb") as file:

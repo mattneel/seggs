@@ -261,6 +261,14 @@ fn writeExtensionReport(a: std.mem.Allocator, root: []const u8, host: *Host) voi
 /// Prove the terminal end to end: the dock starts a real shell, the editor
 /// types a command into it, and the shell's answer comes back through the
 /// emulator onto the screen.
+/// A shell answers when it answers, so the screen is polled from the frame the
+/// command is typed until the answer is there: a fixed frame would make this
+/// pass or fail on how fast the machine running it is.
+const terminal_first_read = 120;
+const terminal_last_read = 480;
+
+var terminal_answered = false;
+
 fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
     switch (frame) {
         6 => app.toggleTerminal() catch {},
@@ -270,28 +278,28 @@ fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
     if (frame == 90) {
         // The styled lines are what the screen grab measures: printf expands
         // the escapes the shell is handed, so the emulator sees real SGR.
-        app.terminalInput("printf 'seggs-terminal\\nplain\\n\\033[1mbold\\033[0m\\n\\033[3mitalic\\033[0m\\n'\r") catch {};
+        // More lines than the screen holds, so the dock has history for the
+        // scrollbar to place the viewport in, then the styled lines.
+        app.terminalInput("for i in $(seq 1 30); do echo history-$i; done; printf 'seggs-terminal\\nplain\\n\\033[1mbold\\033[0m\\n\\033[3mitalic\\033[0m\\n'\r") catch {};
         return;
     }
-    if (frame != 240) return;
+    if (terminal_answered or frame < terminal_first_read) return;
     const screen = app.terminalScreen(a) catch null;
     const text = screen orelse {
         std.log.err("terminal: no screen to read", .{});
         return;
     };
     defer a.free(text);
-    // The shell echoes the command and then prints its answer, so the word has
-    // to appear twice: once typed, once produced.
-    var seen: usize = 0;
-    var index: usize = 0;
-    while (std.mem.indexOfPos(u8, text, index, "seggs-terminal")) |found| {
-        seen += 1;
-        index = found + 1;
-    }
-    if (seen >= 2) {
+    // The echoed command can wrap across rows and split any word in it, so the
+    // proof is a string only running the command can produce: the loop's last
+    // line, whose text the command line spells differently.
+    const answered = std.mem.indexOf(u8, text, "history-30") != null;
+    const printed = std.mem.indexOf(u8, text, "seggs-terminal") != null;
+    if (answered and printed) {
+        terminal_answered = true;
         std.log.info("PASS: the shell answered on the terminal screen", .{});
-    } else {
-        std.log.err("terminal screen carried {d} mentions, expected the echo and the answer", .{seen});
+    } else if (frame >= terminal_last_read) {
+        std.log.err("terminal screen never answered: answered={} printed={}", .{ answered, printed });
     }
 }
 

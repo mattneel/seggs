@@ -631,7 +631,7 @@ def check_terminal(binary: str) -> None:
     must appear there, which no single component could fake.
     """
     out = Path("/tmp/seggs-terminal.ppm")
-    command = display_command([binary, "--windowed", "--frames", "260", "--exercise-terminal", "--screenshot", str(out)], app_env())
+    command = display_command([binary, "--windowed", "--frames", "500", "--exercise-terminal", "--screenshot", str(out)], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     output = app_output(result)
     if TERMINAL_LINE.search(output) is None:

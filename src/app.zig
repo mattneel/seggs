@@ -1330,6 +1330,18 @@ pub const App = struct {
             const color = if ((self.frame_count / 30) % 2 == 0) foreground else background;
             try r.rect(.{ .x = x, .y = y, .w = self.char_width, .h = self.line_height }, color);
         }
+        // A bar only where there is history to place in it. The library
+        // reports the area; the width and the thumb are the editor's.
+        if (terminal.scrollbar() catch null) |bar| {
+            if (bar.total > bar.len and bar.len > 0) {
+                const track = Rect{ .x = bounds.x + bounds.w - 5, .y = bounds.y + 2, .w = 3, .h = bounds.h - 4 };
+                try r.rect(track, theme.raised);
+                const visible = @as(f32, @floatFromInt(bar.len)) / @as(f32, @floatFromInt(bar.total));
+                const thumb_height = @max(track.h * visible, 14);
+                const travelled = @as(f32, @floatFromInt(bar.offset)) / @as(f32, @floatFromInt(bar.total));
+                try r.rect(.{ .x = track.x, .y = track.y + (track.h - thumb_height) * travelled, .w = track.w, .h = thumb_height }, theme.muted);
+            }
+        }
         terminal.markDrawn();
     }
 

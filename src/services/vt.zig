@@ -350,6 +350,20 @@ pub const Terminal = struct {
         g.ghostty_terminal_scroll_viewport(self.handle, request);
     }
 
+    pub const Scrollbar = struct {
+        total: u64,
+        offset: u64,
+        len: u64,
+    };
+
+    /// Where the viewport sits in the scrollable area. A terminal with no
+    /// history reports a total equal to its height, which is a bar of nothing.
+    pub fn scrollbar(self: *Terminal) !Scrollbar {
+        var value = std.mem.zeroInit(g.GhosttyTerminalScrollbar, .{});
+        try check(g.ghostty_terminal_get(self.handle, g.GHOSTTY_TERMINAL_DATA_SCROLLBAR, @ptrCast(&value)));
+        return .{ .total = value.total, .offset = value.offset, .len = value.len };
+    }
+
     /// Whether the program asked for mouse reporting: a wheel over a terminal
     /// running one goes to that program instead of scrolling history.
     pub fn wantsMouse(self: *Terminal) bool {
@@ -609,4 +623,16 @@ test "the emulator reports colors a screen can be drawn with" {
     const back = colors.background;
     const front = colors.foreground;
     try std.testing.expect(back.r != front.r or back.g != front.g or back.b != front.b);
+}
+
+test "the scrollbar reports history once the screen overflows" {
+    var terminal = try Terminal.init(std.testing.allocator, 16, 3);
+    defer terminal.deinit();
+    terminal.write("one\r\ntwo\r\nthree\r\nfour\r\nfive\r\n");
+    try terminal.update();
+    const bar = try terminal.scrollbar();
+    try std.testing.expect(bar.len > 0);
+    // Five lines on a three-line screen: two rows are history the bar has to
+    // account for, which is what makes it worth drawing.
+    try std.testing.expect(bar.total > bar.len);
 }

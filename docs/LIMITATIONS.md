@@ -105,9 +105,9 @@ underline are drawn. A grapheme's first codepoint is drawn and its combining
 marks are not, because the atlas maps codepoints rather than shaped runs.
 
 Kitty graphics is parsed by the library and not drawn: the renderer would need
-image decoding and a texture path it does not have. There is no scrollbar, so a
-viewport scrolled into history shows no indication of where it is until it is
-scrolled back. Page Up and Page Down go to the program rather than to
+image decoding and a texture path it does not have. The scrollbar is drawn only when there is
+history behind the viewport, and it is the editor's shape rather than the
+program's: a terminal that sets an unusual scrollbar style gets the plain one. Page Up and Page Down go to the program rather than to
 scrollback, which is what applications expect.
 
 The terminal needs a PTY, so it exists where `forkpty` does: Windows has no

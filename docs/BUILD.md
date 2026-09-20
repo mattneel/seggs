@@ -93,6 +93,20 @@ For a nonstandard shader compiler path, set the build option.
 zig build -Dglslang=/absolute/path/to/glslangValidator
 ```
 
+## Terminal emulation
+
+The editor's terminal is libghostty-vt, the emulator core extracted from
+Ghostty, reached through its C API. It is built by `zig build -Demit-lib-vt`
+with the Zig release Ghostty's own `build.zig.zon` names (0.16.0 at the pinned
+commit), which is not the release this repository builds with. The C ABI is the
+boundary, so neither toolchain has to move: `tools/bootstrap.py` installs the
+pinned Zig into `.deps/zig-ghostty`, builds the library into the same prefix
+SDL uses, and the editor links it as `ghostty-vt` through a `translate-c`
+module like SDL and Yoga.
+
+`dependencies.json` pins the repository and commit. Bumping that pin changes
+which Zig the bootstrap downloads, because the version is part of the pin.
+
 ## Windows boundary
 
 The repository provides a Vulkan shader path for Windows.

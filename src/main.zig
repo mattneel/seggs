@@ -37,6 +37,7 @@ fn run(init: std.process.Init) !void {
     var exercise_window = false;
     var exercise_ime = false;
     var exercise_click = false;
+    var exercise_terminal = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -60,6 +61,8 @@ fn run(init: std.process.Init) !void {
             exercise_ime = true;
         } else if (std.mem.eql(u8, arg, "--exercise-click")) {
             exercise_click = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-terminal")) {
+            exercise_terminal = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -196,6 +199,7 @@ fn run(init: std.process.Init) !void {
         }
         if (exercise_ime) exerciseIme(&app, frames);
         if (exercise_click) exerciseClick(&app, frames);
+        if (exercise_terminal) exerciseTerminal(&app, frames, frame_arena.allocator());
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -254,6 +258,41 @@ fn writeExtensionReport(a: std.mem.Allocator, root: []const u8, host: *Host) voi
 
 /// Click the first panel an extension drew, so the round trip from an interface
 /// event to an extension handler is exercised rather than assumed.
+/// Prove the terminal end to end: the dock starts a real shell, the editor
+/// types a command into it, and the shell's answer comes back through the
+/// emulator onto the screen.
+fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
+    switch (frame) {
+        6 => app.toggleTerminal() catch {},
+        else => {},
+    }
+    if (frame < 90) return;
+    if (frame == 90) {
+        app.terminalInput("echo seggs-terminal\r") catch {};
+        return;
+    }
+    if (frame != 240) return;
+    const screen = app.terminalScreen(a) catch null;
+    const text = screen orelse {
+        std.log.err("terminal: no screen to read", .{});
+        return;
+    };
+    defer a.free(text);
+    // The shell echoes the command and then prints its answer, so the word has
+    // to appear twice: once typed, once produced.
+    var seen: usize = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, text, index, "seggs-terminal")) |found| {
+        seen += 1;
+        index = found + 1;
+    }
+    if (seen >= 2) {
+        std.log.info("PASS: the shell answered on the terminal screen", .{});
+    } else {
+        std.log.err("terminal screen carried {d} mentions, expected the echo and the answer", .{seen});
+    }
+}
+
 fn exerciseClick(app: *App, frame: usize) void {
     switch (frame) {
         6 => {

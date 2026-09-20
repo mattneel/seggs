@@ -601,7 +601,28 @@ def check_window_transitions(binary: str) -> None:
     )
 
 
+TERMINAL_LINE = re.compile(r"PASS: the shell answered on the terminal screen")
+
 DENSITY_SCALE = "2"
+
+
+def check_terminal(binary: str) -> None:
+    """A real shell in the dock, end to end.
+
+    The exercise opens the terminal, types a command through the same path the
+    keyboard takes, and reads the emulator's screen back: the shell's answer
+    must appear there, which no single component could fake.
+    """
+    command = display_command([binary, "--windowed", "--frames", "260", "--exercise-terminal"], app_env())
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+    if TERMINAL_LINE.search(output) is None:
+        print("terminal run output:")
+        for line in output.splitlines()[-10:]:
+            print(f"  {line}")
+    require(TERMINAL_LINE.search(output) is not None, "the terminal did not carry the shell's answer")
+    require(ATLAS_LINE.search(output) is not None, "the frame loop did not finish with the terminal open")
+    print("terminal: a real shell ran in the dock and its answer reached the screen")
 
 
 def check_density(binary: str) -> None:
@@ -650,6 +671,7 @@ def main() -> int:
         check_narrow(binary)
         check_window_transitions(binary)
         check_density(binary)
+        check_terminal(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1

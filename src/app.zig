@@ -9,6 +9,9 @@ const lsp = @import("services/lsp.zig");
 const Config = @import("agents/registry.zig").Config;
 const Renderer = @import("gpu/renderer.zig").Renderer;
 const layout = @import("ui/layout.zig");
+const vt = @import("services/vt.zig");
+const pty = @import("services/pty.zig");
+const ghostty = @import("ghostty");
 const theme = @import("ui/theme.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
@@ -29,7 +32,7 @@ const ext_ui = @import("ext/ui.zig");
 const Rect = layout.Rect;
 
 pub const App = struct {
-    const Focus = enum { editor, prompt, panels };
+    const Focus = enum { editor, prompt, panels, terminal };
     const Overlay = enum { none, files, commands, quit };
     const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn" };
     allocator: std.mem.Allocator,
@@ -84,6 +87,16 @@ pub const App = struct {
     message: [256]u8 = undefined,
     message_len: usize = 0,
     geometry: layout.Layout = layout.Layout.calculateDefault(1440, 900, true),
+    /// The shell dock: a program's bytes, interpreted by libghostty-vt into a
+    /// screen the renderer draws. The shell outlives a closed dock, which is
+    /// what a terminal in an editor is for.
+    terminal: ?vt.Terminal = null,
+    shell: ?pty.Pty = null,
+    terminal_open: bool = false,
+    terminal_read: std.ArrayList(u8) = .empty,
+    terminal_encode: [256]u8 = undefined,
+    /// The fraction of the body the terminal dock takes when it is open.
+    terminal_fraction: f32 = 0.28,
     char_width: f32 = 10,
     line_height: f32 = 22,
     last_watch: u64 = 0,
@@ -103,6 +116,11 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // The shell is killed and reaped before the emulator that read it
+        // goes away, and the buffer between them with them.
+        if (self.shell) |*shell| shell.deinit();
+        if (self.terminal) |*terminal| terminal.deinit();
+        self.terminal_read.deinit(self.allocator);
         if (self.lsp_client) |*client| client.deinit();
         for (self.clients) |*client| client.deinit();
         self.allocator.free(self.clients);
@@ -237,6 +255,7 @@ pub const App = struct {
 
     pub fn update(self: *App) !void {
         self.drainActions();
+        self.pumpTerminal();
         for (self.clients) |*client| client.pump();
         const now = c.SDL_GetTicks();
         if (now -| self.last_watch > 1000) {
@@ -359,6 +378,8 @@ pub const App = struct {
                 if (self.overlay == .files or self.overlay == .commands) {
                     if (self.query.items.len + bytes.len <= 256) try self.query.appendSlice(self.allocator, bytes);
                     self.query_selected = 0;
+                } else if (self.focus == .terminal) {
+                    try self.terminalText(bytes);
                 } else if (self.overlay == .none) try self.insert(bytes);
             },
             c.SDL_EVENT_KEY_DOWN => try self.key(ev.key),
@@ -375,7 +396,9 @@ pub const App = struct {
                 const delta: i32 = @intFromFloat(-ev.wheel.y * 3);
                 const x = ev.wheel.mouse_x;
                 const y = ev.wheel.mouse_y;
-                if (self.geometry.explorer.contains(x, y)) {
+                if (self.terminal_open and self.geometry.terminal.contains(x, y)) {
+                    self.scrollTerminal(delta, x, y);
+                } else if (self.geometry.explorer.contains(x, y)) {
                     self.explorer_first = adjust(self.explorer_first, delta, self.workspace.explorer.entries.items.len);
                 } else if (self.geometry.agents.contains(x, y)) {
                     self.transcript_scroll = adjust(self.transcript_scroll, -delta, 50_000);
@@ -439,6 +462,7 @@ pub const App = struct {
                 return;
             }
             switch (keycode) {
+                c.SDLK_GRAVE => try self.toggleTerminal(),
                 c.SDLK_Q => self.requestQuit(),
                 c.SDLK_S => {
                     try self.workspace.save();
@@ -505,6 +529,13 @@ pub const App = struct {
         }
         if (self.focus == .panels) {
             self.panelKey(keycode, shift);
+            return;
+        }
+        if (self.focus == .terminal) {
+            // A focused terminal owns the keyboard: the shell is the program
+            // that wants Ctrl+C and every other control key.
+            if (ctrl and keycode == c.SDLK_GRAVE) return self.toggleTerminal();
+            try self.terminalKey(keycode, ctrl, shift, alt);
             return;
         }
         if (keycode == c.SDLK_ESCAPE) {
@@ -1022,7 +1053,13 @@ pub const App = struct {
         try self.publishSnapshot(frame);
         self.char_width = r.atlas.advance;
         self.line_height = r.atlas.line_height;
-        self.geometry = layout.Layout.calculate(r.width, r.height, self.sidebar, .{ .line_height = self.line_height, .char_width = self.char_width });
+        self.geometry = layout.Layout.calculate(
+            r.width,
+            r.height,
+            self.sidebar,
+            .{ .line_height = self.line_height, .char_width = self.char_width },
+            if (self.terminal_open) self.terminal_fraction else 0,
+        );
         const g = self.geometry;
         try r.rect(.{ .x = 0, .y = 0, .w = r.width, .h = r.height }, theme.background);
         try r.rect(g.title, theme.panel);
@@ -1032,6 +1069,7 @@ pub const App = struct {
         _ = try self.drawPanel(r, "activity", g.activity);
         if (g.explorer.w > 0) _ = try self.drawPanel(r, "explorer", g.explorer);
         try self.drawEditor(r);
+        if (self.terminal_open) try self.drawTerminal(r);
         try self.drawAgents(r, frame);
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
         try r.rect(g.status, theme.selected);
@@ -1141,6 +1179,270 @@ pub const App = struct {
             try r.text(x, y, self.preedit.text.items, theme.amber);
             try r.rect(.{ .x = x, .y = y + self.line_height - 3, .w = self.char_width * @as(f32, @floatFromInt(self.preedit.cellCount())), .h = 2 }, theme.amber);
         }
+    }
+
+    // ---- terminal ----------------------------------------------------------
+
+    /// Open or close the shell dock. The shell starts on first use and keeps
+    /// running while the dock is closed, so closing it is not killing it.
+    pub fn toggleTerminal(self: *App) !void {
+        if (self.terminal_open) {
+            self.terminal_open = false;
+            if (self.focus == .terminal) self.focus = .editor;
+            self.status("Terminal dock closed. Ctrl+` brings it back.", .{});
+            return;
+        }
+        if (self.shell == null) {
+            const shell_path: []const u8 = if (std.c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
+            self.shell = pty.Pty.spawn(self.allocator, &.{shell_path}) catch |err| {
+                self.status("terminal: {s}", .{@errorName(err)});
+                return;
+            };
+            self.terminal = vt.Terminal.init(80, 24) catch |err| {
+                // The emulator could not start, so nothing would read the shell.
+                var orphan = self.shell.?;
+                orphan.deinit();
+                self.shell = null;
+                self.status("terminal: {s}", .{@errorName(err)});
+                return;
+            };
+            // The editor polls the shell; a blocking read would stall the frame.
+            if (self.shell) |*spawned| spawned.setNonBlocking() catch {};
+        }
+        self.terminal_open = true;
+        self.focus = .terminal;
+        self.status("Terminal dock open. Ctrl+` closes it.", .{});
+    }
+
+    /// Move bytes one way and the screen the other: the shell's output into the
+    /// emulator, and the size the dock gives the emulator back to the shell.
+    fn pumpTerminal(self: *App) void {
+        const shell = if (self.shell) |*shell| shell else return;
+        const terminal = if (self.terminal) |*terminal| terminal else return;
+        self.terminal_read.clearRetainingCapacity();
+        while (true) {
+            self.terminal_read.ensureUnusedCapacity(self.allocator, 4096) catch break;
+            const count = shell.readOutput(self.terminal_read.unusedCapacitySlice()) catch break;
+            if (count == 0) break;
+            self.terminal_read.items.len += count;
+        }
+        if (self.terminal_read.items.len != 0) terminal.write(self.terminal_read.items);
+        if (self.terminal_open) {
+            const bounds = self.geometry.terminal;
+            const cols: u16 = @intFromFloat(@max(2, @floor((bounds.w - 8) / self.char_width)));
+            const rows: u16 = @intFromFloat(@max(1, @floor((bounds.h - 8) / self.line_height)));
+            if (cols != terminal.cols() or rows != terminal.rows()) {
+                terminal.resize(cols, rows, @intFromFloat(@round(self.char_width)), @intFromFloat(@round(self.line_height))) catch {};
+            }
+        }
+        terminal.update() catch {};
+    }
+
+    /// Draw the grid the shell produced: each cell's background, then its
+    /// glyph, then the cursor where the program put it.
+    fn drawTerminal(self: *App, r: *Renderer) !void {
+        const terminal = if (self.terminal) |*terminal| terminal else return;
+        const bounds = self.geometry.terminal;
+        if (bounds.h <= 0 or bounds.w <= 0) return;
+        const colors = terminal.colors();
+        const background = rgbColor(colors.background);
+        const foreground = rgbColor(colors.foreground);
+        r.clip = bounds;
+        try r.rect(bounds, background);
+
+        const Painter = struct {
+            r: *Renderer,
+            origin_x: f32,
+            origin_y: f32,
+            char_width: f32,
+            line_height: f32,
+            ascent: f32,
+            foreground: theme.Color,
+            palette: [256]theme.Color,
+
+            fn color(painter: *@This(), value: ghostty.GhosttyStyleColor, fallback: theme.Color) theme.Color {
+                return switch (value.tag) {
+                    ghostty.GHOSTTY_STYLE_COLOR_RGB => rgbColor(value.value.rgb),
+                    ghostty.GHOSTTY_STYLE_COLOR_PALETTE => painter.palette[value.value.palette],
+                    else => fallback,
+                };
+            }
+
+            fn visit(painter: *@This(), row: u16, cells: []const vt.Terminal.Cell) anyerror!void {
+                const y = painter.origin_y + @as(f32, @floatFromInt(row)) * painter.line_height;
+                for (cells, 0..) |cell, column| {
+                    const x = painter.origin_x + @as(f32, @floatFromInt(column)) * painter.char_width;
+                    var cell_background = painter.color(cell.style.bg_color, painter.palette[0]);
+                    var cell_foreground = painter.color(cell.style.fg_color, painter.foreground);
+                    if (cell.style.inverse) {
+                        const swap = cell_background;
+                        cell_background = cell_foreground;
+                        cell_foreground = swap;
+                    }
+                    if (!std.mem.eql(f32, &cell_background, &painter.palette[0])) {
+                        try painter.r.rect(.{ .x = x, .y = y, .w = painter.char_width, .h = painter.line_height }, cell_background);
+                    }
+                    if (cell.style.underline != 0) {
+                        try painter.r.rect(.{ .x = x, .y = y + painter.line_height - 2, .w = painter.char_width, .h = 1 }, cell_foreground);
+                    }
+                    if (cell.codepoints.len == 0) continue;
+                    // A grapheme's later codepoints are combining marks; the
+                    // atlas maps codepoints, so the base is what it can draw.
+                    const codepoint = std.math.cast(u21, cell.codepoints[0]) orelse continue;
+                    _ = try painter.r.glyphAt(x, y + painter.ascent, codepoint, cell_foreground);
+                }
+            }
+        };
+
+        var painter: Painter = .{
+            .r = r,
+            .origin_x = bounds.x + 4,
+            .origin_y = bounds.y + 4,
+            .char_width = self.char_width,
+            .line_height = self.line_height,
+            .ascent = r.atlas.ascent,
+            .foreground = foreground,
+            .palette = paletteColors(colors.palette, background),
+        };
+        try terminal.visitRows(&painter, Painter.visit);
+
+        const cursor = terminal.cursor();
+        if (cursor.visible and self.focus == .terminal) {
+            const x = painter.origin_x + @as(f32, @floatFromInt(cursor.x)) * self.char_width;
+            const y = painter.origin_y + @as(f32, @floatFromInt(cursor.y)) * self.line_height;
+            const color = if ((self.frame_count / 30) % 2 == 0) foreground else background;
+            try r.rect(.{ .x = x, .y = y, .w = self.char_width, .h = self.line_height }, color);
+        }
+        terminal.markDrawn();
+    }
+
+    /// The shell wants the keys a terminal sends, not the editor's meanings.
+    /// Printable keys arrive as text, so this covers the rest.
+    fn terminalKey(self: *App, keycode: c.SDL_Keycode, ctrl: bool, shift: bool, alt: bool) !void {
+        const terminal = if (self.terminal) |*terminal| terminal else return;
+        const shell = if (self.shell) |*shell| shell else return;
+        const ghostty_key: ghostty.GhosttyKey = switch (keycode) {
+            c.SDLK_UP => ghostty.GHOSTTY_KEY_ARROW_UP,
+            c.SDLK_DOWN => ghostty.GHOSTTY_KEY_ARROW_DOWN,
+            c.SDLK_LEFT => ghostty.GHOSTTY_KEY_ARROW_LEFT,
+            c.SDLK_RIGHT => ghostty.GHOSTTY_KEY_ARROW_RIGHT,
+            c.SDLK_HOME => ghostty.GHOSTTY_KEY_HOME,
+            c.SDLK_END => ghostty.GHOSTTY_KEY_END,
+            c.SDLK_PAGEUP => ghostty.GHOSTTY_KEY_PAGE_UP,
+            c.SDLK_PAGEDOWN => ghostty.GHOSTTY_KEY_PAGE_DOWN,
+            c.SDLK_INSERT => ghostty.GHOSTTY_KEY_INSERT,
+            c.SDLK_DELETE => ghostty.GHOSTTY_KEY_DELETE,
+            c.SDLK_BACKSPACE => ghostty.GHOSTTY_KEY_BACKSPACE,
+            c.SDLK_RETURN => ghostty.GHOSTTY_KEY_ENTER,
+            c.SDLK_TAB => ghostty.GHOSTTY_KEY_TAB,
+            c.SDLK_ESCAPE => ghostty.GHOSTTY_KEY_ESCAPE,
+            c.SDLK_F1 => ghostty.GHOSTTY_KEY_F1,
+            c.SDLK_F2 => ghostty.GHOSTTY_KEY_F2,
+            c.SDLK_F3 => ghostty.GHOSTTY_KEY_F3,
+            c.SDLK_F4 => ghostty.GHOSTTY_KEY_F4,
+            c.SDLK_F5 => ghostty.GHOSTTY_KEY_F5,
+            c.SDLK_F6 => ghostty.GHOSTTY_KEY_F6,
+            c.SDLK_F7 => ghostty.GHOSTTY_KEY_F7,
+            c.SDLK_F8 => ghostty.GHOSTTY_KEY_F8,
+            c.SDLK_F9 => ghostty.GHOSTTY_KEY_F9,
+            c.SDLK_F10 => ghostty.GHOSTTY_KEY_F10,
+            c.SDLK_F11 => ghostty.GHOSTTY_KEY_F11,
+            c.SDLK_F12 => ghostty.GHOSTTY_KEY_F12,
+            else => return,
+        };
+        const bytes = terminal.encodeKey(
+            @intCast(ghostty_key),
+            .press,
+            .{ .shift = shift, .ctrl = ctrl, .alt = alt },
+            "",
+            null,
+            &self.terminal_encode,
+        ) catch return;
+        if (bytes.len == 0) return;
+        shell.writeInput(bytes) catch {};
+    }
+
+    /// Typed characters go to the shell as themselves: bracketed paste is for
+    /// pasting, and a program that asked for it would misread every keystroke.
+    fn terminalText(self: *App, bytes: []const u8) !void {
+        const shell = if (self.shell) |*shell| shell else return;
+        shell.writeInput(bytes) catch {};
+    }
+
+    /// Paste travels through the emulator so the shell sees what it asked for:
+    /// bracketed wrapping when it enabled it, and its control bytes stripped.
+    fn terminalPaste(self: *App, bytes: []const u8) !void {
+        const terminal = if (self.terminal) |*terminal| terminal else return;
+        const shell = if (self.shell) |*shell| shell else return;
+        const encoded = terminal.encodePaste(bytes, &self.terminal_encode) catch return;
+        if (encoded.len == 0) return;
+        shell.writeInput(encoded) catch {};
+    }
+
+    fn paletteColors(palette: [256]ghostty.GhosttyColorRgb, fallback: theme.Color) [256]theme.Color {
+        var colors: [256]theme.Color = @splat(fallback);
+        for (&colors, 0..) |*entry, index| entry.* = rgbColor(palette[index]);
+        return colors;
+    }
+
+    /// The visible screen as text, one line per row. A display is not needed to
+    /// see what a shell produced, so exercises and tests assert on this.
+    pub fn terminalScreen(self: *App, a: std.mem.Allocator) !?[]u8 {
+        const terminal = if (self.terminal) |*terminal| terminal else return null;
+        const Collector = struct {
+            allocator: std.mem.Allocator,
+            text: std.ArrayList(u8) = .empty,
+            fn visit(collector: *@This(), row: u16, cells: []const vt.Terminal.Cell) anyerror!void {
+                _ = row;
+                var encoded: [8]u8 = undefined;
+                for (cells) |cell| {
+                    if (cell.codepoints.len == 0) {
+                        try collector.text.append(collector.allocator, ' ');
+                        continue;
+                    }
+                    const length = std.unicode.utf8Encode(@intCast(cell.codepoints[0]), &encoded) catch 0;
+                    try collector.text.appendSlice(collector.allocator, encoded[0..length]);
+                }
+                try collector.text.append(collector.allocator, 0x0a);
+            }
+        };
+        var collector: Collector = .{ .allocator = a };
+        errdefer collector.text.deinit(a);
+        try terminal.visitRows(&collector, Collector.visit);
+        return try collector.text.toOwnedSlice(a);
+    }
+
+    /// A wheel over the terminal: the program running there gets it when it
+    /// asked for mouse reporting, and otherwise it moves through scrollback.
+    fn scrollTerminal(self: *App, lines: i32, x: f32, y: f32) void {
+        const terminal = if (self.terminal) |*terminal| terminal else return;
+        const bounds = self.geometry.terminal;
+        const cell_x: u16 = @intFromFloat(@max(0, @floor((x - bounds.x - 4) / self.char_width)));
+        const cell_y: u16 = @intFromFloat(@max(0, @floor((y - bounds.y - 4) / self.line_height)));
+        if (terminal.wantsMouse()) {
+            const button: vt.Terminal.MouseButton = if (lines < 0) .four else .five;
+            const encoded = terminal.encodeMouse(.press, button, cell_x, cell_y, .{}, &self.terminal_encode) catch return;
+            if (encoded.len != 0) {
+                if (self.shell) |*shell| shell.writeInput(encoded) catch {};
+            }
+            return;
+        }
+        terminal.scroll(@intCast(-lines));
+    }
+
+    /// Type into the terminal as if the keyboard had: the same path the keys
+    /// take, minus the events.
+    pub fn terminalInput(self: *App, bytes: []const u8) !void {
+        try self.terminalText(bytes);
+    }
+
+    fn rgbColor(value: ghostty.GhosttyColorRgb) theme.Color {
+        return .{
+            @as(f32, @floatFromInt(value.r)) / 255.0,
+            @as(f32, @floatFromInt(value.g)) / 255.0,
+            @as(f32, @floatFromInt(value.b)) / 255.0,
+            1,
+        };
     }
 
     fn drawAgents(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {

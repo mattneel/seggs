@@ -18,6 +18,9 @@ pub const Layout = struct {
     activity: Rect,
     explorer: Rect,
     editor: Rect,
+    /// The terminal dock below the editor. Empty when the dock is closed, and
+    /// the editor then keeps the whole body.
+    terminal: Rect,
     agents: Rect,
     status: Rect,
     /// Cell metrics the shell is sized from, so a different font size or display
@@ -33,21 +36,29 @@ pub const Layout = struct {
     /// The metrics the shell uses with its default font, for callers that only
     /// need a layout and tests that check the shape of one.
     pub fn calculateDefault(width: f32, height: f32, sidebar: bool) Layout {
-        return calculate(width, height, sidebar, .{ .line_height = 22, .char_width = 9.5 });
+        return calculate(width, height, sidebar, .{ .line_height = 22, .char_width = 9.5 }, 0);
     }
 
-    pub fn calculate(width: f32, height: f32, sidebar: bool, metrics: Metrics) Layout {
+    /// `dock` is the fraction of the body the terminal takes, zero when it is
+    /// closed. It splits the editor's column rather than the window, so the
+    /// file list and the agent column keep their heights.
+    pub fn calculate(width: f32, height: f32, sidebar: bool, metrics: Metrics, dock: f32) Layout {
         const title_h = @round(metrics.line_height * 2);
         const status_h = @round(metrics.line_height * 1.25);
         const body_h = @max(0, height - title_h - status_h);
         const rail = @round(metrics.char_width * 4.5);
         const left: f32 = if (sidebar and width >= explorer_breakpoint) @round(metrics.char_width * 22) else 0;
         const right = if (width < agents_breakpoint) 0 else @min(460, @max(280, width * 0.34));
+        const editor_w = @max(0, width - rail - left - right);
+        // A few rows is the least a terminal can be read in, and the editor
+        // keeps at least as much, so the dock never swallows the code.
+        const dock_h = if (dock <= 0) 0 else @min(body_h / 2, @max(metrics.line_height * 3, @round(body_h * dock)));
         return .{
             .title = .{ .x = 0, .y = 0, .w = width, .h = title_h },
             .activity = .{ .x = 0, .y = title_h, .w = rail, .h = body_h },
             .explorer = .{ .x = rail, .y = title_h, .w = left, .h = body_h },
-            .editor = .{ .x = rail + left, .y = title_h, .w = @max(0, width - rail - left - right), .h = body_h },
+            .editor = .{ .x = rail + left, .y = title_h, .w = editor_w, .h = body_h - dock_h },
+            .terminal = .{ .x = rail + left, .y = title_h + body_h - dock_h, .w = editor_w, .h = dock_h },
             .agents = .{ .x = width - right, .y = title_h, .w = right, .h = body_h },
             .status = .{ .x = 0, .y = height - status_h, .w = width, .h = status_h },
         };
@@ -62,21 +73,21 @@ test "panels tile the window" {
 }
 test "columns drop as the window narrows, and the editor keeps the space" {
     const metrics: Layout.Metrics = .{ .line_height = 22, .char_width = 9.5 };
-    const wide = Layout.calculate(1440, 900, true, metrics);
+    const wide = Layout.calculate(1440, 900, true, metrics, 0);
     try std.testing.expect(wide.explorer.w > 0 and wide.agents.w > 0);
     // Between the breakpoints the agent column fits but the file list does not.
-    const agents_only = Layout.calculate(1000, 700, true, metrics);
+    const agents_only = Layout.calculate(1000, 700, true, metrics, 0);
     try std.testing.expect(agents_only.agents.w > 0);
     try std.testing.expectEqual(@as(f32, 0), agents_only.explorer.w);
     // Under both, the editor takes everything beside the rail.
-    const narrow = Layout.calculate(860, 600, true, metrics);
+    const narrow = Layout.calculate(860, 600, true, metrics, 0);
     try std.testing.expectEqual(@as(f32, 0), narrow.explorer.w);
     try std.testing.expectEqual(@as(f32, 0), narrow.agents.w);
     try std.testing.expectEqual(@as(f32, 860), narrow.activity.w + narrow.editor.w);
     // Whatever the size, the columns fill the window exactly.
     for ([_]f32{ 640, 800, 900, 1040, 1200, 1440, 1920 }) |width| {
         for ([_]f32{ 420, 700, 900, 1200 }) |height| {
-            const l = Layout.calculate(width, height, true, metrics);
+            const l = Layout.calculate(width, height, true, metrics, 0);
             try std.testing.expectEqual(width, l.activity.w + l.explorer.w + l.editor.w + l.agents.w);
             try std.testing.expectEqual(height, l.title.h + l.editor.h + l.status.h);
         }
@@ -85,10 +96,32 @@ test "columns drop as the window narrows, and the editor keeps the space" {
 
 test "chrome follows the cell metrics" {
     // A larger font moves the bars and the rail with it.
-    const big = Layout.calculate(1440, 900, true, .{ .line_height = 44, .char_width = 19 });
-    const small = Layout.calculate(1440, 900, true, .{ .line_height = 22, .char_width = 9.5 });
+    const big = Layout.calculate(1440, 900, true, .{ .line_height = 44, .char_width = 19 }, 0);
+    const small = Layout.calculate(1440, 900, true, .{ .line_height = 22, .char_width = 9.5 }, 0);
     try std.testing.expect(big.title.h > small.title.h);
     try std.testing.expect(big.status.h > small.status.h);
     try std.testing.expect(big.activity.w > small.activity.w);
     try std.testing.expect(big.explorer.w > small.explorer.w);
+}
+
+test "the terminal dock splits the editor column and closes to nothing" {
+    const metrics: Layout.Metrics = .{ .line_height = 22, .char_width = 9.5 };
+    const closed = Layout.calculate(1440, 900, true, metrics, 0);
+    try std.testing.expectEqual(@as(f32, 0), closed.terminal.h);
+    try std.testing.expectEqual(closed.editor.h, Layout.calculate(1440, 900, true, metrics, 0).editor.h);
+
+    const open = Layout.calculate(1440, 900, true, metrics, 0.25);
+    try std.testing.expect(open.terminal.h > 0);
+    // The editor and the dock still fill the body, and the dock sits directly
+    // below the editor rather than floating in it.
+    try std.testing.expectEqual(open.editor.h + open.terminal.h, 900 - open.title.h - open.status.h);
+    try std.testing.expectEqual(open.editor.y + open.editor.h, open.terminal.y);
+    try std.testing.expectEqual(open.editor.w, open.terminal.w);
+    try std.testing.expectEqual(open.editor.x, open.terminal.x);
+    // Neighbours keep their full height whichever way the dock is set.
+    try std.testing.expectEqual(closed.explorer.h, open.explorer.h);
+    try std.testing.expectEqual(closed.agents.h, open.agents.h);
+    // The dock never takes more than half the body, however large the fraction.
+    const greedy = Layout.calculate(1440, 900, true, metrics, 0.9);
+    try std.testing.expect(greedy.terminal.h <= (900 - greedy.title.h - greedy.status.h) / 2 + 1);
 }

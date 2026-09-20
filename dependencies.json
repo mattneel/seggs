@@ -8,5 +8,11 @@
         "repository": "https://github.com/libsdl-org/SDL_ttf.git",
         "tag": "release-3.2.2"
     },
-    "notes": "SDL source tags are fixed baselines, not latest-version claims. FreeType, glslang, and drivers are system dependencies. Bootstrap records resolved commits."
+    "notes": "Zig, SDL, and SDL_ttf pins are fixed baselines, not latest-version claims. FreeType, glslang, and drivers are system dependencies. Bootstrap records resolved commits.",
+    "ghostty": {
+        "repository": "https://github.com/ghostty-org/ghostty.git",
+        "commit": "f64f4aca2c29b554d111b36c3d946a9bddd159ff",
+        "zig": "0.16.0",
+        "notes": "libghostty-vt is built by the pinned Zig, not by the toolchain in .zigversion, and reaches the editor through the C ABI."
+    }
 }

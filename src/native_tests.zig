@@ -9,6 +9,7 @@ const gitsvc = @import("services/git.zig");
 const lsp = @import("services/lsp.zig");
 const dap = @import("services/dap.zig");
 const pty = @import("services/pty.zig");
+const vt = @import("services/vt.zig");
 const transport = @import("acp/transport.zig");
 const shaper = @import("gpu/shaper.zig");
 const yoga = @import("yoga");
@@ -634,6 +635,12 @@ test "yoga measures a leaf through a callback and nests a column inside it" {
 }
 
 const quickjs = @import("quickjs");
+
+test "the terminal service's own tests are collected" {
+    // Declarations are analysed lazily, so a file's tests only exist once
+    // something in the test root refers to it.
+    _ = vt.Terminal;
+}
 const ext = @import("ext/host.zig");
 
 test "the host loads a bundle whose source comes from a file" {
@@ -656,6 +663,23 @@ test "the host loads a bundle whose source comes from a file" {
     try std.testing.expect(host.firstProblem() == null);
     // The bundle ran, not merely parsed: the second call is what the host holds.
     try std.testing.expectEqualStrings("arrow", host.status());
+}
+
+test "a terminal read returns nothing rather than blocking when idle" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var shell = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "sleep 5" });
+    defer shell.deinit();
+    try shell.setNonBlocking();
+    var buffer: [256]u8 = undefined;
+    const started = c.SDL_GetTicks();
+    // Reading twice must return at once: the shell has said nothing yet, and
+    // the editor cannot afford to wait for it mid-frame.
+    for (0..2) |_| {
+        const count = try shell.readOutput(&buffer);
+        try std.testing.expectEqual(@as(usize, 0), count);
+    }
+    try std.testing.expect(c.SDL_GetTicks() - started < 1000);
 }
 
 test "the explorer omits directories the project generates" {

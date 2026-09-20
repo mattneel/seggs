@@ -29,26 +29,26 @@ def fetch(url: str, destination: Path) -> None:
         shutil.copyfileobj(response, output)
 
 
-def pinned_entry(key: str) -> dict:
+def pinned_entry(key: str, version: str) -> dict:
     """Resolve a development build, which the release manifest does not list.
 
     Zig publishes development builds under /builds/ with no manifest, so the
     expected digest is committed in tools/zig-checksums.json instead of being
     skipped: an unverified download is not an option.
     """
-    digests = json.loads(CHECKSUMS.read_text()).get(VERSION, {})
+    digests = json.loads(CHECKSUMS.read_text()).get(version, {})
     digest = digests.get(key)
     if digest is None:
         raise ValueError(
-            f"No pinned checksum for Zig {VERSION} on {key}. Download the archive from "
+            f"No pinned checksum for Zig {version} on {key}. Download the archive from "
             f"https://ziglang.org/builds/, verify it, and add the sha256 to tools/zig-checksums.json."
         )
     # Windows builds are published as ZIP archives; every other host as tar.xz.
     extension = "zip" if key.endswith("-windows") else "tar.xz"
-    return {"tarball": f"https://ziglang.org/builds/zig-{key}-{VERSION}.{extension}", "shasum": digest}
+    return {"tarball": f"https://ziglang.org/builds/zig-{key}-{version}.{extension}", "shasum": digest}
 
 
-def install(destination: Path) -> None:
+def install(destination: Path, version: str) -> None:
     destination = destination.resolve()
     if destination.exists():
         raise FileExistsError(f"Destination exists: {destination}. Remove it explicitly before replacement.")
@@ -58,12 +58,13 @@ def install(destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="seggs-zig-", dir=destination.parent) as temp:
         directory = Path(temp)
-        if "-dev." in VERSION:
-            entry = pinned_entry(key)
+        if "-dev." in version:
+            entry = pinned_entry(key, version)
         else:
+            # Released versions carry their digests in Zig's own manifest.
             manifest = directory / "index.json"
             fetch("https://ziglang.org/download/index.json", manifest)
-            entry = json.loads(manifest.read_text())[VERSION][key]
+            entry = json.loads(manifest.read_text())[version][key]
         archive = directory / Path(urllib.parse.urlparse(entry["tarball"]).path).name
         fetch(entry["tarball"], archive)
         with archive.open("rb") as file:
@@ -89,7 +90,7 @@ def install(destination: Path) -> None:
             raise ValueError("Unexpected Zig archive layout")
         shutil.move(str(roots[0]), destination)
         (destination / "SEGGS-MANIFEST.json").write_text(json.dumps({"version": VERSION, "target": key, **entry}, indent=2) + "\n")
-    print(f"Installed Zig {VERSION}: {destination}")
+    print(f"Installed Zig {version}: {destination}")
     if os.name == "nt":
         print(f'$env:Path = "{destination};$env:Path"')
     else:
@@ -99,8 +100,9 @@ def install(destination: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, default=ROOT / ".deps/zig")
+    parser.add_argument("--version", default=VERSION, help="Zig release or development build to install")
     args = parser.parse_args()
-    install(args.destination)
+    install(args.destination, args.version)
 
 
 if __name__ == "__main__":

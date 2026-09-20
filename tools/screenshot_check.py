@@ -185,7 +185,12 @@ def atlas_coverage(binary: str, fixture: str) -> tuple[int, int]:
     command = [binary, "--file", str(path), "--windowed", "--frames", "2"]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, check=True, env=app_env(), capture_output=True, text=True)
+    result = subprocess.run(command, env=app_env(), capture_output=True, text=True)
+    if result.returncode != 0 or ATLAS_LINE.search(result.stderr) is None:
+        # The run's own output is the only thing that explains a missing line.
+        print("coverage run exit " + str(result.returncode))
+        print("\n".join(result.stderr.splitlines()[-12:]))
+    require(result.returncode == 0, f"the app exited {result.returncode} for {path.name}")
     match = ATLAS_LINE.search(result.stderr)
     require(match is not None, "the app did not report atlas coverage")
     return int(match.group(1)), int(match.group(2))

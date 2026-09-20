@@ -61,23 +61,35 @@ def main() -> int:
     if (prefix / "include/ghostty").exists():
         shutil.rmtree(prefix / "include/ghostty")
     (prefix / "include").mkdir(parents=True, exist_ok=True)
-    # The archive is named for the platform: a Unix static library or the MSVC
-    # import-style name, and Zig links whichever it finds.
-    built = None
-    for name in ("libghostty-vt.a", "ghostty-vt.lib", "libghostty-vt.lib"):
-        candidate = source / "zig-out/lib" / name
-        if candidate.exists():
-            built = (candidate, name)
-            break
-    if built is None:
-        listing = ", ".join(sorted(p.name for p in (source / "zig-out/lib").glob("*"))) or "nothing"
+    # Every artifact the build produced, not just the first: a platform that
+    # emits a shared library also emits the import library next to it, and a
+    # binary that finds one without the other fails at startup rather than at
+    # link time.
+    # The archive is what the editor links; a Windows build also emits the DLL
+    # that the linked binary loads at startup, and that one has to be installed
+    # next to it or the process dies before it prints anything. The Unix shared
+    # library is for embedding, which this repository does not do.
+    source_lib = source / "zig-out/lib"
+    built = [
+        p for p in sorted(source_lib.glob("*"))
+        if p.name.startswith(("libghostty-vt", "ghostty-vt")) and p.suffix in (".a", ".lib", ".dll")
+    ]
+    if not built:
+        listing = ", ".join(sorted(p.name for p in source_lib.glob("*"))) or "nothing"
         raise RuntimeError(f"libghostty-vt was not produced; zig-out/lib holds {listing}")
     # The headers travel with the library: the editor translates its own
     # bindings from them.
-    shutil.copy2(built[0], prefix / "lib" / built[1])
+    for artifact in built:
+        # A shared library goes where the loader looks for it, which on Windows
+        # is beside the executable or on the path, not in lib.
+        if artifact.suffix == ".dll":
+            (prefix / "bin").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(artifact, prefix / "bin" / artifact.name)
+        shutil.copy2(artifact, prefix / "lib" / artifact.name)
+    installed = ", ".join(a.name for a in built)
     shutil.copytree(source / "zig-out/include/ghostty", prefix / "include/ghostty")
     stamp.write_text(pin["commit"] + "\n")
-    print(f"libghostty-vt {pin['commit'][:12]} built with Zig {pin['zig']} into {prefix}")
+    print(f"libghostty-vt {pin['commit'][:12]} built with Zig {pin['zig']} into {prefix}: {installed}")
     return 0
 
 

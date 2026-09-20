@@ -232,7 +232,12 @@ jobs:
         shell: pwsh
         run: |
           "$env:GITHUB_WORKSPACE/.deps/zig" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # CMake installs a Windows DLL into bin, not lib: a test binary links
+          # the import library and loads the DLL, so both directories belong on
+          # the path.
           "$env:GITHUB_WORKSPACE/.deps/win/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$env:GITHUB_WORKSPACE/.deps/win/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$env:GITHUB_WORKSPACE/.deps/install/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$env:GITHUB_WORKSPACE/.deps/tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Build the terminal library
         run: python tools/bootstrap_ghostty.py

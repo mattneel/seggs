@@ -559,3 +559,54 @@ test "the viewport scrolls into history and back" {
     defer std.testing.allocator.free(restored);
     try std.testing.expect(std.mem.indexOf(u8, restored, "echo") != null);
 }
+
+test "SGR attributes reach the render state" {
+    var terminal = try Terminal.init(std.testing.allocator, 20, 4);
+    defer terminal.deinit();
+    // The screen a shell leaves behind: plain, bold, italic, and underlined on
+    // consecutive rows.
+    terminal.write("a\r\nb\x1b[1mB\x1b[0m\r\nc\x1b[3mC\x1b[0m\r\nd\x1b[4mD\x1b[0m");
+    try terminal.update();
+
+    const Seen = struct {
+        bold: bool = false,
+        plain_stayed_plain: bool = true,
+        italic: bool = false,
+        underline: bool = false,
+
+        fn visit(self: *@This(), row: u16, cells: []const Terminal.Cell) anyerror!void {
+            _ = row;
+            for (cells) |cell| {
+                if (cell.codepoints.len == 0) continue;
+                switch (cell.codepoints[0]) {
+                    'B' => self.bold = cell.style.bold,
+                    'b' => self.plain_stayed_plain = !cell.style.bold,
+                    'C' => self.italic = cell.style.italic,
+                    'D' => self.underline = cell.style.underline != 0,
+                    else => {},
+                }
+            }
+        }
+    };
+    var seen: Seen = .{};
+    try terminal.visitRows(&seen, Seen.visit);
+    // The style arrives through a sized struct. Leave the size unset and the
+    // call fails, every attribute reads false, and nothing looks wrong until
+    // a renderer draws a whole screen with no markup in it.
+    try std.testing.expect(seen.bold);
+    try std.testing.expect(seen.plain_stayed_plain);
+    try std.testing.expect(seen.italic);
+    try std.testing.expect(seen.underline);
+}
+
+test "the emulator reports colors a screen can be drawn with" {
+    var terminal = try Terminal.init(std.testing.allocator, 4, 2);
+    defer terminal.deinit();
+    const colors = try terminal.colors();
+    // The same trap as the style: a sized struct left unsized makes the call
+    // fail and every color come back black, which reads as a theme rather
+    // than as a bug.
+    const back = colors.background;
+    const front = colors.foreground;
+    try std.testing.expect(back.r != front.r or back.g != front.g or back.b != front.b);
+}

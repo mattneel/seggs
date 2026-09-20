@@ -104,10 +104,14 @@ pub fn build(b: *std.Build) void {
         );
     } else blk: {
         const vs = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.0", "-S", "vert" });
+        // glslang reports a file it cannot write on stdout, which a failing
+        // step otherwise discards: capture it so the failure says why.
+        _ = vs.captureStdOut(.{});
         vs.addFileArg(b.path("shaders/ui.vert.glsl"));
         vs.addArg("-o");
         _ = generated.addCopyFile(vs.addOutputFileArg("ui.vert.spv"), "ui.vert.spv");
         const fs = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.0", "-S", "frag" });
+        _ = fs.captureStdOut(.{});
         fs.addFileArg(b.path("shaders/ui.frag.glsl"));
         fs.addArg("-o");
         _ = generated.addCopyFile(fs.addOutputFileArg("ui.frag.spv"), "ui.frag.spv");

@@ -2,8 +2,8 @@
 
 ## Required boundaries
 
-1. Use Zig 0.16.0.
-2. Keep SDL declarations behind the `native` module.
+1. Use Zig 0.17.0 (the development build pinned in `build.zig.zon`).
+2. Keep SDL declarations behind the `native` module, and Yoga behind `yoga`.
 3. Keep GPU calls on the application thread.
 4. Keep editor and JSON state out of transport workers.
 5. Preserve bounded queues and explicit buffer ownership.
@@ -24,6 +24,14 @@ Reject unsupported client requests explicitly.
 ## Change validation
 
 Run the core tests.
+
+```sh
+zig build test
+```
+
+Interface described by an extension is data, not code: it crosses the host as a
+description the UI layer parses and lays out with Yoga. Never let a description
+name a Yoga call or a renderer call directly.
 
 ```sh
 zig build test

@@ -68,7 +68,7 @@ npm install -g @agentclientprotocol/claude-agent-acp
 Complete the adapter's documented authentication setup outside Seggs.
 
 The referenced package requires Node.js 22 or later.
-Real account access and live provider turns remain untested in this scaffold delivery.
+The Oh-My-Pi and Claude Code live turns are verified; the Codex adapter remains untested.
 
 ## Explicit configuration
 
@@ -104,7 +104,7 @@ git worktree add ../project-claude -b seggs/claude
 
 Set each agent's `cwd` to its worktree's absolute path.
 
-The [worktree example](../config/parallel-worktrees.example.json) contains placeholders for those paths.
+The worktree example at `config/parallel-worktrees.example.json` contains placeholders for those paths.
 The explorer still shows the UI workspace, not the selected agent's separate worktree.
 Seggs does not merge branches or arbitrate conflicts.
 

@@ -2,7 +2,7 @@
 
 ## Target baseline
 
-The app targets Zig 0.16.0 exactly.
+The app targets Zig 0.17.0, pinned by `.zigversion` and `minimum_zig_version`.
 The source bootstrap selects SDL 3.4.4 and SDL_ttf 3.2.2.
 These releases form a fixed baseline, not a claim about the latest releases.
 The [source references](SOURCES.md) identify the upstream projects.
@@ -99,7 +99,7 @@ The repository provides a Vulkan shader path for Windows.
 The bootstrap does not build a Windows SDK.
 Windows support remains experimental and unverified.
 
-1. Install Zig 0.16.0 and Python 3.12 or later.
+1. Install Zig 0.17.0 and Python 3.12 or later.
 2. Prepare matching SDL3 and SDL3_ttf development libraries in one SDK prefix.
 3. Add the SDK's DLL directory to PATH.
 4. Add glslangValidator to PATH.
@@ -123,10 +123,45 @@ The temporary-file save path also needs Windows path-encoding validation.
 | `zig build run` | Compile and run from the repository root |
 | `zig build test` | Execute pure Zig core tests |
 | `zig build integration` | Execute three native ACP transports against Python mock processes |
+| `zig build integration-omp` | Run a live Oh-My-Pi ACP turn (requires `omp` on PATH and its credentials) |
+| `zig build integration-claude` | Run a live Claude Code ACP turn (requires `claude-agent-acp` on PATH and its credentials) |
+| `zig build test-native` | Execute native filesystem tests against SDL |
 | `zig build check` | Compile the native app without execution |
-| `zig build verify` | Execute core and transport tests, then compile the UI |
+| `zig build verify` | Execute core, transport, and filesystem tests, then compile the UI |
+| `zig build screenshot` | Render two offscreen frames and compare the readbacks (needs a display and a Vulkan driver) |
 | `python3 -m unittest discover -s tests -v` | Execute fixture tests without Zig or SDL |
 | `python3 tools/check_repo.py` | Check repository structure and source contracts |
+
+## Dependencies
+
+`build.zig.zon` pins the toolchain, [zignal](https://github.com/arrufat/zignal)
+(pure-Zig TrueType parsing for glyph selection), and
+[quickjs-ng](https://github.com/mattneel/zig-quickjs-ng) (the extension host).
+Both are pinned to a commit archive with a checksum, so a clean checkout builds
+without any local setup.
+
+Development builds of Zig have no release manifest, so `tools/zig-checksums.json`
+records the expected sha256 for the pinned toolchain. Adding a platform means
+downloading that archive, verifying it, and recording the digest there.
+
+## Extensions
+
+Extensions are TypeScript, bundled with esbuild. The build is optional: when
+`extensions/dist` is absent the app runs and reports no extensions loaded.
+
+```sh
+cd extensions
+npm install
+npm run build
+```
+
+esbuild writes one IIFE script per source into `extensions/dist/`, which the
+app loads at startup by resolving that directory under the workspace root.
+`npm run typecheck` checks the sources against `extensions/types/seggs.d.ts`.
+
+The QuickJS-NG bindings use `splitType`, which needs LLVM codegen, so the
+executable is built with `use_llvm = true`. esbuild is a development
+dependency; the shipped binary never invokes it.
 
 ## Display smoke test
 
@@ -145,6 +180,15 @@ SDL_VIDEODRIVER=x11 xvfb-run -a zig build run -- --windowed --frames 8
 The test needs a Vulkan implementation that works under that display setup.
 The `--frames` option exits without the ordinary unsaved-change prompt.
 No agent starts during this test.
+
+Without a hardware GPU, force the Mesa software driver (lavapipe):
+
+```sh
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json SDL_VIDEODRIVER=x11 \
+  xvfb-run -a zig build run -- --windowed --frames 8
+```
+
+The ICD path is distribution-specific; locate it with `find /usr/share/vulkan/icd.d -name '*lvp*.json'`.
 
 ## Distribution boundary
 

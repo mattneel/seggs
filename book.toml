@@ -1,0 +1,12 @@
+# The book reads the same files the repository does: docs/ is both the source of
+# the book and the place the Markdown lives, so links between chapters work when
+# read on a repository host and when built.
+[book]
+title = "Seggs"
+description = "A GPU editor and concurrent ACP client, extended in SeggsC"
+authors = ["Seggs contributors"]
+language = "en"
+src = "docs"
+
+[output.html]
+no-section-label = true

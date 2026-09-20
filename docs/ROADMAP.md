@@ -2,7 +2,7 @@
 
 ## Milestone 1: Native acceptance
 
-The first release gate is a clean Zig 0.16 build on the target platforms.
+The first release gate is a clean Zig 0.17 build on the target platforms.
 The GPU gate covers resize, minimize, fullscreen transitions, and high-density displays.
 The ACP gate covers native pipe behavior and real adapter authentication.
 The save gate covers permissions, symlinks, conflict races, and crash behavior.

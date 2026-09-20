@@ -6,7 +6,7 @@ The repository does not bundle third-party source or font files.
 
 | Reference | Design use |
 | --- | --- |
-| [Zig 0.16.0 release notes](https://ziglang.org/download/0.16.0/release-notes.html) | `std.process.Init`, the allocator, unmanaged containers, and build-time C translation |
+| [Zig 0.17.0 devlog](https://ziglang.org/devlog/2026/) | The reworked build system (maker/configurer split, package management in the build runner) and the new `@bitCast` semantics |
 | [Official Zig download manifest](https://ziglang.org/download/index.json) | Exact release archive and SHA-256 lookup |
 | [SDL 3.4.4 source](https://github.com/libsdl-org/SDL/tree/release-3.4.4) | Fixed native library baseline |
 | [SDL_ttf 3.2.2 source](https://github.com/libsdl-org/SDL_ttf/tree/release-3.2.2) | Fixed glyph rasterization baseline |
@@ -27,3 +27,4 @@ The repository does not bundle third-party source or font files.
 
 The install commands intentionally leave provider adapter versions external.
 A downstream release needs tested adapter version pins and compatibility results.
+| [zignal](https://github.com/arrufat/zignal) | TrueType parsing, glyph indices, kerning, and text layout for `src/gpu/shaper.zig` |

@@ -1,0 +1,44 @@
+# Seggs
+
+Seggs is a GPU editor and a concurrent ACP client: one window that edits files,
+runs up to eight agent harnesses beside them, and can be extended while it runs.
+
+The editor is Zig over SDL3's GPU API, with one pipeline, one glyph atlas, and
+one draw call per frame. Interface is described as data by extensions written in
+[SeggsC](EXTENSIONS.md), a TypeScript-shaped DSL, and laid out with Yoga. Agents
+reach the editor over newline-delimited JSON-RPC on stdio, and the editor answers
+with the files and terminals they ask for.
+
+## What it does
+
+- Edits UTF-8 files with a gap buffer, multiple documents, undo, selection, and
+  grapheme-aware movement.
+- Runs independent agent sessions with their own transcripts, a review queue for
+  proposed edits, and permission requests that are explicit and one-shot.
+- Serves agent requests through a capability broker: editor-backed file reads and
+  writes, and client-owned terminals with bounded output.
+- Speaks to a language server for diagnostics and navigation, a debug adapter for
+  breakpoints, and Git for status and diffs.
+- Draws its own interface, which extensions replace region by region without a
+  restart.
+
+## Where to start
+
+| If you want to | Read |
+| --- | --- |
+| Build and run it | [Build](BUILD.md) |
+| Understand the design | [Architecture](ARCHITECTURE.md) |
+| Write an extension | [SeggsC](EXTENSIONS.md) |
+| Point an agent at it | [Agent setup](AGENTS.md) |
+| Check what is verified | [Validation](VALIDATION.md) |
+| Know what it does not do | [Limitations](LIMITATIONS.md) |
+| See what is next | [Roadmap](ROADMAP.md) |
+
+## Build the book
+
+```sh
+mdbook serve
+```
+
+The chapters are the repository's own Markdown under `docs/`, so a page edited
+for the book is the page the repository links to.

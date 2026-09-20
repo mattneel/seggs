@@ -22,6 +22,7 @@ pub fn build(b: *std.Build) void {
     const python = b.option([]const u8, "python", "Python executable for the ACP mock") orelse "python3";
     const glslang = b.option([]const u8, "glslang", "Path to glslangValidator") orelse "glslangValidator";
     const shader_dir = b.option([]const u8, "shader-dir", "Directory of precompiled SPIR-V shaders, instead of running glslang");
+    const ghostty_prefix = b.option([]const u8, "ghostty-prefix", "libghostty-vt installation prefix") orelse prefix;
 
     // This target needs only Zig. SDL discovery and shader compilation stay lazy.
     const unit = b.addTest(.{ .root_module = b.createModule(.{
@@ -47,6 +48,20 @@ pub fn build(b: *std.Build) void {
         native.linkSystemLibrary("util", .{ .use_pkg_config = .no });
         native.addRPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
     }
+
+    // libghostty-vt parses terminal data and holds terminal state. Its public
+    // API is C, and the library is built by the Zig release Ghostty pins, so it
+    // crosses translate-c here rather than joining this project's Zig graph.
+    const ghostty_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/platform/ghostty.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ghostty_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ ghostty_prefix, "include" }) });
+    const ghostty = ghostty_c.createModule();
+    ghostty.link_libc = true;
+    ghostty.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ ghostty_prefix, "lib" }) });
+    ghostty.linkSystemLibrary("ghostty-vt", .{ .use_pkg_config = .no });
 
     // Yoga lays out interface described by extensions. Its public API is C, so
     // it crosses a translate-c boundary like SDL. The source list is pinned with
@@ -140,6 +155,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     app.addImport("native", native);
+    app.addImport("ghostty", ghostty);
     app.addImport("shaders", shaders);
     app.addImport("quickjs", qjs.module("quickjs"));
     app.addImport("zignal", zignal.module("zignal"));
@@ -164,6 +180,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     smoke_module.addImport("native", native);
+    smoke_module.addImport("ghostty", ghostty);
     const smoke = b.addExecutable(.{ .name = "seggs-acp-smoke", .root_module = smoke_module });
     const smoke_run = b.addRunArtifact(smoke);
     smoke_run.setCwd(b.path("."));
@@ -188,6 +205,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     native_test.root_module.addImport("native", native);
+    native_test.root_module.addImport("ghostty", ghostty);
     native_test.root_module.addImport("zignal", zignal.module("zignal"));
     native_test.root_module.addImport("yoga", yoga_module);
     // The extension engine is exercised here too: a callback registered from

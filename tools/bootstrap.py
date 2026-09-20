@@ -41,28 +41,12 @@ def checkout(name: str, url: str, tag: str) -> tuple[Path, str]:
 
 
 def build_ghostty(prefix: Path) -> dict:
-    """Build libghostty-vt with the Zig release its own pin names.
-
-    The library is C-ABI, so the editor links it with the project toolchain
-    while the library itself is built by the release Ghostty requires. The
-    alternative -- building it from this project's build -- would need the
-    dependency ported to a Zig the dependency does not support yet.
-    """
+    """Build libghostty-vt through its own script, which the platform jobs that
+    do not use this bootstrap call directly."""
     pin = PINS["ghostty"]
-    toolchain = ROOT / ".deps/zig-ghostty"
-    if not (toolchain / "zig").exists():
-        run([sys.executable, str(ROOT / "tools/install_zig.py"),
-             "--destination", str(toolchain), "--version", pin["zig"]])
-    source, commit = checkout("ghostty", pin["repository"], pin["commit"])
-    environment = {**os.environ, "PATH": f"{toolchain}{os.pathsep}{os.environ['PATH']}"}
-    run([str(toolchain / "zig"), "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast"],
-        cwd=source, env=environment)
-    (prefix / "lib").mkdir(parents=True, exist_ok=True)
-    (prefix / "include").mkdir(parents=True, exist_ok=True)
-    shutil.copy2(source / "zig-out/lib/libghostty-vt.a", prefix / "lib/libghostty-vt.a")
-    if (prefix / "include/ghostty").exists():
-        shutil.rmtree(prefix / "include/ghostty")
-    shutil.copytree(source / "zig-out/include/ghostty", prefix / "include/ghostty")
+    run([sys.executable, str(ROOT / "tools/bootstrap_ghostty.py"), "--prefix", str(prefix)])
+    source = ROOT / ".deps/src/ghostty"
+    commit = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
     return {"repository": pin["repository"], "commit": commit, "zig": pin["zig"]}
 
 

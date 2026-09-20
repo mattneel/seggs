@@ -70,6 +70,7 @@ jobs:
             .deps/src
             .deps/build
             .deps/install
+            .deps/zig-ghostty
           key: sdl-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: Install Zig and SDL baseline
         run: |
@@ -135,12 +136,22 @@ jobs:
           path: ~/.cache/zig
           key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: zigpkg-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore the terminal library
+        uses: actions/cache@v5
+        with:
+          path: |
+            .deps/install
+            .deps/src/ghostty
+            .deps/zig-ghostty
+          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: Install Zig and SDL
         run: |
           # The toolchain installer refuses to replace what a cache restored.
           if [ ! -d .deps/zig ]; then python3 tools/install_zig.py; fi
           echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
           brew install sdl3 sdl3_ttf vulkan-loader molten-vk vulkan-validationlayers
+      - name: Build the terminal library
+        run: python3 tools/bootstrap_ghostty.py
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -184,6 +195,14 @@ jobs:
           path: ~\AppData\Local\zig
           key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: zigpkg-${{ runner.os }}-${{ runner.arch }}-
+      - name: Restore the terminal library
+        uses: actions/cache@v5
+        with:
+          path: |
+            .deps/install
+            .deps/src/ghostty
+            .deps/zig-ghostty
+          key: ghostty-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: SDL, glslang, and PATH
         if: steps.sdk.outputs.cache-hit != 'true'
         shell: pwsh
@@ -215,6 +234,8 @@ jobs:
           "$env:GITHUB_WORKSPACE/.deps/zig" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$env:GITHUB_WORKSPACE/.deps/win/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$env:GITHUB_WORKSPACE/.deps/tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Build the terminal library
+        run: python tools/bootstrap_ghostty.py
       - name: Shader compiler
         shell: pwsh
         run: |

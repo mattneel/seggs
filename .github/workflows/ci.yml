@@ -81,6 +81,11 @@ jobs:
           python3 tools/install_zig.py
           echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
           brew install sdl3 sdl3_ttf vulkan-loader molten-vk vulkan-validationlayers
+      - name: Extension bundles
+        run: |
+          # esbuild is a development dependency, so the bundles need it installed.
+          npm ci --prefix extensions --no-audit --no-fund
+          node extensions/build.mjs
       - name: Core, native ACP, and compile gates
         run: zig build verify -Dsdl-prefix="$(brew --prefix)"
       - name: Vulkan over Metal

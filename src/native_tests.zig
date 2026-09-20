@@ -627,6 +627,31 @@ test "yoga measures a leaf through a callback and nests a column inside it" {
     try std.testing.expectEqual(@as(f32, 40), yoga.YGNodeLayoutGetTop(body));
 }
 
+const quickjs = @import("quickjs");
+const ext = @import("ext/host.zig");
+
+test "the host loads a bundle whose source comes from a file" {
+    // A bundle that arrived through the file system used to misparse here: the
+    // engine's lexer reads past the last byte of the source it is given, so the
+    // meaning depended on what the allocator had left behind the read buffer.
+    const a = std.testing.allocator;
+    const dir = try newDir(a);
+    defer a.free(dir);
+    const dirz = try z(a, dir);
+    defer a.free(dirz);
+    try std.testing.expect(c.SDL_CreateDirectory(dirz.ptr));
+    defer _ = removeTree(a, dir);
+    const bundle = try std.fs.path.join(a, &.{ dir, "bundle.js" });
+    defer a.free(bundle);
+    try files.replace(a, bundle, "(function () { seggs.status(\"plain\"); })();\n(() => { seggs.status(\"arrow\"); })();\n");
+    var host = ext.Host.init(a);
+    defer host.deinit();
+    try std.testing.expectEqual(@as(usize, 1), host.loadExtensions(dir));
+    try std.testing.expect(host.firstProblem() == null);
+    // The bundle ran, not merely parsed: the second call is what the host holds.
+    try std.testing.expectEqualStrings("arrow", host.status());
+}
+
 test "the explorer omits directories the project generates" {
     const a = std.testing.allocator;
     const dir = try newDir(a);

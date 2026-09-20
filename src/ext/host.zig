@@ -173,8 +173,18 @@ pub const Host = struct {
     }
 
     fn loadOne(self: *Host, path: []const u8) !*Extension {
-        const source = try files.read(self.allocator, path, 1 << 20);
+        const raw = try files.read(self.allocator, path, 1 << 20);
+        defer self.allocator.free(raw);
+        // The engine's lexer reads past the last byte it was given, so the
+        // bundle is copied into a zeroed buffer with slack: without it the
+        // meaning of a bundle depends on whatever the allocator left behind the
+        // source, and a bundle that is correct fails to parse. The allocation
+        // is aligned as well, since the lexer scans in machine words.
+        const source = try self.allocator.alignedAlloc(u8, .of(u64), raw.len + 8);
         defer self.allocator.free(source);
+        @memset(source, 0);
+        @memcpy(source[0..raw.len], raw);
+        const bundle = source[0..raw.len];
         const name = try self.allocator.dupe(u8, std.fs.path.basename(path));
         errdefer self.allocator.free(name);
         const rt = try quickjs.Runtime.init();
@@ -197,7 +207,7 @@ pub const Host = struct {
         try installApi(extension);
         const filename = try self.allocator.dupeSentinel(u8, path, 0);
         defer self.allocator.free(filename);
-        const result = ctx.eval(source, filename, .{});
+        const result = ctx.eval(bundle, filename, .{});
         defer result.deinit(ctx);
         if (result.isException()) {
             // Reading the exception clears it, and its message is what an author

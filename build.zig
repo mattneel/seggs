@@ -175,6 +175,10 @@ pub fn build(b: *std.Build) void {
     native_test.root_module.addImport("native", native);
     native_test.root_module.addImport("zignal", zignal.module("zignal"));
     native_test.root_module.addImport("yoga", yoga_module);
+    // The extension engine is exercised here too: a callback registered from
+    // Zig is what every bundle calls into.
+    native_test.root_module.addImport("quickjs", qjs.module("quickjs"));
+    native_test.root_module.linkLibrary(qjs.artifact("quickjs-ng"));
     native_test.root_module.link_libcpp = true;
     native_test.root_module.linkLibrary(yoga_lib);
     const native_test_step = b.step("test-native", "Run native filesystem tests against SDL");

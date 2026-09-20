@@ -166,7 +166,10 @@ pub const Explorer = struct {
     }
 
     fn visit(self: *Explorer, directory: []const u8, name: []const u8) !void {
-        for ([_][]const u8{ ".git", ".zig-cache", "zig-out", "node_modules", ".deps", ".venv", "__pycache__" }) |skip| {
+        // Directories this project generates, which are not source and would
+        // otherwise make the file list depend on what has been built. `.seggs`
+        // holds the extension report the editor writes for authors and agents.
+        for ([_][]const u8{ ".git", ".zig-cache", "zig-out", "node_modules", ".deps", ".venv", "__pycache__", ".seggs", "zig-pkg", "book" }) |skip| {
             if (std.mem.eql(u8, name, skip)) return;
         }
         if (self.entries.items.len >= 1024) {

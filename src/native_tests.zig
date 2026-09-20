@@ -627,6 +627,41 @@ test "yoga measures a leaf through a callback and nests a column inside it" {
     try std.testing.expectEqual(@as(f32, 40), yoga.YGNodeLayoutGetTop(body));
 }
 
+test "the explorer omits directories the project generates" {
+    const a = std.testing.allocator;
+    const dir = try newDir(a);
+    defer a.free(dir);
+    const dirz = try z(a, dir);
+    defer a.free(dirz);
+    try std.testing.expect(c.SDL_CreateDirectory(dirz.ptr));
+    defer _ = removeTree(a, dir);
+    // One source file, and the directories the editor and the build create.
+    for ([_][]const u8{ "keep.md", ".seggs", "zig-out", "book" }) |name| {
+        const path = try std.fs.path.join(a, &.{ dir, name });
+        defer a.free(path);
+        const pathz = try z(a, path);
+        defer a.free(pathz);
+        if (std.mem.endsWith(u8, name, ".md")) {
+            try files.replace(a, path, "text");
+        } else {
+            try std.testing.expect(c.SDL_CreateDirectory(pathz.ptr));
+        }
+    }
+    var explorer = try files.Explorer.init(a, dir);
+    defer explorer.deinit();
+    for (explorer.entries.items) |entry| {
+        const relative = entry[dir.len + 1 ..];
+        try std.testing.expect(!std.mem.eql(u8, relative, ".seggs"));
+        try std.testing.expect(!std.mem.eql(u8, relative, "zig-out"));
+        try std.testing.expect(!std.mem.eql(u8, relative, "book"));
+    }
+    var saw_source = false;
+    for (explorer.entries.items) |entry| {
+        if (std.mem.eql(u8, entry[dir.len + 1 ..], "keep.md")) saw_source = true;
+    }
+    try std.testing.expect(saw_source);
+}
+
 test "pty spawns a shell and echoes output" {
     const a = std.testing.allocator;
     var p = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "echo seggs-pty" });

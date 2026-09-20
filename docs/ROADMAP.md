@@ -59,5 +59,6 @@ Debug adapters supply breakpoints and debug sessions.
 A PTY service supplies terminals with explicit process ownership.
 A Git service supplies worktree status and change review.
 
-These milestones describe future work.
-The scaffold does not present their interfaces as completed features.
+These milestones began as future work, and the status above is where each one
+is now verified. A capability still counts as missing until a gate exercises it,
+which is why the two items in the note are named rather than assumed.

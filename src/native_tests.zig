@@ -292,6 +292,9 @@ test "worktree manager creates a worktree and detects conflicts" {
     try git(a, repo, &.{ "config", "user.email", "t@t" });
     try git(a, repo, &.{ "config", "user.name", "t" });
     try git(a, repo, &.{ "config", "commit.gpgsign", "false" });
+    // Line endings are the test's business, not the host's: a Windows checkout
+    // rewrites the file it reads back, which is not what this test is about.
+    try git(a, repo, &.{ "config", "core.autocrlf", "false" });
     const file = try std.fmt.allocPrint(a, "{s}/a.txt", .{repo});
     defer a.free(file);
     try files.replace(a, file, "one\n");
@@ -335,6 +338,9 @@ test "git service reports status and diff" {
     try git(a, repo, &.{ "config", "user.email", "t@t" });
     try git(a, repo, &.{ "config", "user.name", "t" });
     try git(a, repo, &.{ "config", "commit.gpgsign", "false" });
+    // Line endings are the test's business, not the host's: a Windows checkout
+    // rewrites the file it reads back, which is not what this test is about.
+    try git(a, repo, &.{ "config", "core.autocrlf", "false" });
     const file = try std.fmt.allocPrint(a, "{s}/a.txt", .{repo});
     defer a.free(file);
     try files.replace(a, file, "one\n");
@@ -688,6 +694,7 @@ test "the explorer omits directories the project generates" {
 }
 
 test "pty spawns a shell and echoes output" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     var p = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "echo seggs-pty" });
     defer p.deinit();

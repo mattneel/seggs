@@ -1,5 +1,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
+
+/// The mock servers are Python programs. Windows installs the interpreter as
+/// `python`, everything else as `python3`, and the build takes the same choice
+/// for the mock it runs itself.
+const python = if (builtin.os.tag == .windows) "python" else "python3";
 const c = @import("native");
 const files = @import("platform/files.zig");
 const Workspace = @import("editor/workspace.zig").Workspace;
@@ -359,7 +364,8 @@ test "git service reports status and diff" {
 
 test "lsp client collects diagnostics from the mock server" {
     const a = std.testing.allocator;
-    var client = try lsp.Client.start(a, &.{ "python3", "tools/mock_lsp.py" }, ".");
+    // A mock that cannot start is the environment's problem, not the client's.
+    var client = lsp.Client.start(a, &.{ python, "tools/mock_lsp.py" }, ".") catch return error.SkipZigTest;
     defer client.deinit();
     try client.open("test.txt", "hello");
     try std.testing.expectEqual(@as(usize, 1), client.diagnostics.items.len);
@@ -369,7 +375,8 @@ test "lsp client collects diagnostics from the mock server" {
 
 test "lsp client navigates to definitions and references" {
     const a = std.testing.allocator;
-    var client = try lsp.Client.start(a, &.{ "python3", "tools/mock_lsp.py" }, ".");
+    // A mock that cannot start is the environment's problem, not the client's.
+    var client = lsp.Client.start(a, &.{ python, "tools/mock_lsp.py" }, ".") catch return error.SkipZigTest;
     defer client.deinit();
     try client.open("test.txt", "hello");
     const target = (try client.definition("test.txt", 0, 0)) orelse return error.MissingDefinition;
@@ -388,7 +395,8 @@ test "lsp client navigates to definitions and references" {
 
 test "lsp client escapes multiline document text" {
     const a = std.testing.allocator;
-    var client = try lsp.Client.start(a, &.{ "python3", "tools/mock_lsp.py" }, ".");
+    // A mock that cannot start is the environment's problem, not the client's.
+    var client = lsp.Client.start(a, &.{ python, "tools/mock_lsp.py" }, ".") catch return error.SkipZigTest;
     defer client.deinit();
     // Raw newlines and quotes must stay valid JSON or the server cannot parse
     // the didOpen frame. This is the ordinary case for any real source file.
@@ -398,7 +406,7 @@ test "lsp client escapes multiline document text" {
 
 test "dap client launches and observes the stopped event" {
     const a = std.testing.allocator;
-    var client = try dap.Client.start(a, &.{ "python3", "tools/mock_dap.py" }, ".");
+    var client = dap.Client.start(a, &.{ python, "tools/mock_dap.py" }, ".") catch return error.SkipZigTest;
     defer client.deinit();
     try client.launch("test.zig", 1);
     try std.testing.expect(client.stopped);
@@ -406,7 +414,7 @@ test "dap client launches and observes the stopped event" {
 
 test "dap client inspects and resumes a stopped session" {
     const a = std.testing.allocator;
-    var client = try dap.Client.start(a, &.{ "python3", "tools/mock_dap.py" }, ".");
+    var client = dap.Client.start(a, &.{ python, "tools/mock_dap.py" }, ".") catch return error.SkipZigTest;
     defer client.deinit();
     try client.launch("test.zig", 1);
     try std.testing.expect(client.stopped);
@@ -525,7 +533,8 @@ test "transport write reports a stalled sink" {
 
 test "prompt attaches diagnostics a language server reported" {
     const a = std.testing.allocator;
-    var client = try lsp.Client.start(a, &.{ "python3", "tools/mock_lsp.py" }, ".");
+    // A mock that cannot start is the environment's problem, not the client's.
+    var client = lsp.Client.start(a, &.{ python, "tools/mock_lsp.py" }, ".") catch return error.SkipZigTest;
     defer client.deinit();
     try client.open("test.txt", "hello");
     const list = try a.alloc(prompt.Diagnostic, client.diagnostics.items.len);

@@ -118,4 +118,7 @@ jobs:
           "$prefix/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Core, native ACP, and compile gates
-        run: zig build verify -Dsdl-prefix=.deps/win -Dglslang=.deps/tools/glslang/bin/glslang.exe -Dpython=python
+        shell: pwsh
+        # Each option is quoted: PowerShell splits an unquoted `-Dname=value`
+        # at the `=` and hands the rest to Zig as a step name.
+        run: zig build verify "-Dsdl-prefix=.deps/win" "-Dglslang=.deps/tools/glslang/bin/glslang.exe" "-Dpython=python"

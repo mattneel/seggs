@@ -366,20 +366,22 @@ fn exerciseClick(app: *App, frame: usize) void {
             if (!c.SDL_PushEvent(&ev)) std.log.warn("hover not delivered: {s}", .{c.SDL_GetError()});
         },
         15 => {
-            // And a lane row, whose handler asks the editor for an agent action
-            // rather than an editor one.
-            const point = app.panelFocusPoint("lanes") orelse {
-                std.log.warn("lanes: no lane was focusable", .{});
+            // And an inspector row. The inspector carries context rather than
+            // a roster, so the click toggles what the next prompt will send,
+            // and the status line is where that is observable.
+            const rect = app.inspectorRowPoint(0) orelse {
+                std.log.warn("inspector: no context row to click", .{});
                 return;
             };
             var ev = std.mem.zeroes(c.SDL_Event);
             ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
             ev.button.button = c.SDL_BUTTON_LEFT;
             ev.button.clicks = 1;
-            ev.button.x = point.x;
-            ev.button.y = point.y;
-            if (!c.SDL_PushEvent(&ev)) std.log.warn("lane click not delivered: {s}", .{c.SDL_GetError()});
+            ev.button.x = rect.x;
+            ev.button.y = rect.y;
+            if (!c.SDL_PushEvent(&ev)) std.log.warn("inspector click not delivered: {s}", .{c.SDL_GetError()});
         },
+        17 => std.log.info("inspector: selection={} status={s}", .{ app.inspectorContext(0), app.statusText() }),
         else => {},
     }
 }

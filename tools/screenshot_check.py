@@ -38,7 +38,8 @@ SCALE_LINE = re.compile(r"logical (\d+)x(\d+), pixels (\d+)x(\d+), scale (\d+\.\
 METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
-AGENT_ACTION = re.compile(r"agent action: (\S+) (\S+)")
+INSPECTOR_LINE = re.compile(r"inspector: selection=false")
+
 HOVER_LINE = re.compile(r"hover (\S+) (\S+)")
 APP_ACTION = re.compile(r"app action: (\S+)")
 EDITOR_OPEN = re.compile(r"open: status is now Opened (.+)")
@@ -498,15 +499,17 @@ def check_panel(binary: str) -> None:
     # one the editor applies to the document, one it applies to an agent.
     opened = EDITOR_OPEN.search(app_output(result))
     require(opened is not None, "an explorer row did not open a file")
-    action = AGENT_ACTION.search(app_output(result))
-    require(action is not None, "a lane click did not reach the editor as an agent action")
+    # The inspector carries context rather than a roster: a click on a context
+    # row switches what the next prompt will send, and says so.
+    inspector = INSPECTOR_LINE.search(app_output(result))
+    require(inspector is not None, "an inspector row click did not change what the next prompt carries")
     # And a pointer moving over a row, which panels use to respond before a
     # click. It is dispatched only when the node under the pointer changes.
     hover = HOVER_LINE.search(app_output(result))
     require(hover is not None, "moving the pointer over a panel reached no handler")
     print(
         f"panel: {loaded.group(1)} extension(s) loaded, click reached panel {click.group(1)}, "
-        f"explorer row opened {opened.group(1)}, lane asked to {action.group(1)} {action.group(2)}, "
+        f"explorer row opened {opened.group(1)}, inspector row clicked, "
         f"hover reported on {hover.group(1)}"
     )
 

@@ -47,8 +47,11 @@ pub const Layout = struct {
         const status_h = @round(metrics.line_height * 1.25);
         const body_h = @max(0, height - title_h - status_h);
         const rail = @round(metrics.char_width * 4.5);
-        const left: f32 = if (sidebar and width >= explorer_breakpoint) @round(metrics.char_width * 22) else 0;
-        const right = if (width < agents_breakpoint) 0 else @min(460, @max(280, width * 0.34));
+        // The navigator and the inspector are docks, not proportions: a column
+        // of filenames and a column of labels read the same at any window size,
+        // and the editor takes what is left.
+        const left: f32 = if (sidebar and width >= explorer_breakpoint) @round(@max(220, @min(260, width * 0.20))) else 0;
+        const right = if (width < agents_breakpoint) 0 else @round(@max(300, @min(360, width * 0.26)));
         const editor_w = @max(0, width - rail - left - right);
         // A few rows is the least a terminal can be read in, and the editor
         // keeps at least as much, so the dock never swallows the code.
@@ -101,7 +104,19 @@ test "chrome follows the cell metrics" {
     try std.testing.expect(big.title.h > small.title.h);
     try std.testing.expect(big.status.h > small.status.h);
     try std.testing.expect(big.activity.w > small.activity.w);
-    try std.testing.expect(big.explorer.w > small.explorer.w);
+}
+
+test "the docks stay readable and the editor takes the rest" {
+    // A navigator and an inspector are columns, not proportions: widening the
+    // window past their bounds hands the room to the editor.
+    const metrics: Layout.Metrics = .{ .line_height = 22, .char_width = 9.5 };
+    const wide = Layout.calculate(1920, 900, true, metrics, 0);
+    const wider = Layout.calculate(2560, 900, true, metrics, 0);
+    try std.testing.expect(wide.explorer.w >= 220 and wide.explorer.w <= 260);
+    try std.testing.expect(wide.agents.w >= 300 and wide.agents.w <= 360);
+    try std.testing.expectEqual(wide.explorer.w, wider.explorer.w);
+    try std.testing.expectEqual(wide.agents.w, wider.agents.w);
+    try std.testing.expect(wider.editor.w > wide.editor.w);
 }
 
 test "the terminal dock splits the editor column and closes to nothing" {

@@ -59,6 +59,14 @@ pub const App = struct {
     panel_nodes: std.ArrayListUnmanaged(PanelNode) = .empty,
     /// Which of those take part in Tab order, as indices into `panel_nodes`.
     focus_order: std.ArrayListUnmanaged(usize) = .empty,
+    /// What the inspector will carry with the next prompt: a selection, the
+    /// file it came from, and what the terminal last printed. Nothing travels
+    /// that the developer did not switch on.
+    inspector_context: [3]bool = .{ true, false, false },
+
+    /// Scratch for the inspector's own labels, so drawing does not allocate.
+    inspector_scratch: [3][64]u8 = undefined,
+
     /// Position in `focus_order` while the panels own the keyboard.
     panel_focus: usize = 0,
     /// Node the pointer is over, owned for the same reason the ids are.
@@ -135,6 +143,11 @@ pub const App = struct {
         self.panel_nodes.deinit(self.allocator);
         self.focus_order.deinit(self.allocator);
         self.hover_id.deinit(self.allocator);
+    }
+
+    /// The status bar's current message, for callers outside the interface.
+    pub fn statusText(self: *const App) []const u8 {
+        return self.message[0..self.message_len];
     }
 
     pub fn status(self: *App, comptime fmt: []const u8, args: anytype) void {
@@ -325,19 +338,41 @@ pub const App = struct {
     /// Build the outgoing prompt: the current selection plus the language
     /// server's diagnostics for the active file.
     fn promptWithContext(self: *App) ![]u8 {
+        const document = self.workspace.activeDocument();
+        var label: [48]u8 = undefined;
+        var range_label: ?[]const u8 = null;
         var selection: ?[]u8 = null;
-        if (self.selectedRange()) |range| {
-            const bytes = try self.workspace.activeDocument().snapshot(self.allocator);
-            defer self.allocator.free(bytes);
-            selection = try self.allocator.dupe(u8, bytes[range.start..range.end]);
+        if (self.inspector_context[0]) {
+            if (self.selectedRange()) |span| {
+                const bytes = try document.snapshot(self.allocator);
+                defer self.allocator.free(bytes);
+                selection = try self.allocator.dupe(u8, bytes[span.start..span.end]);
+                range_label = std.fmt.bufPrint(&label, "{d}-{d}", .{
+                    document.lineOf(span.start) + 1, document.lineOf(span.end) + 1,
+                }) catch null;
+            }
         }
         defer if (selection) |sel| self.allocator.free(sel);
+
+        // A whole buffer is a large attachment, so it travels only when it was
+        // switched on, and the inspector says how large.
+        var file: ?[]u8 = null;
+        if (self.inspector_context[1]) file = try document.snapshot(self.allocator);
+        defer if (file) |body| self.allocator.free(body);
+
+        var output: ?[]u8 = null;
+        if (self.inspector_context[2]) output = self.terminalScreen(self.allocator) catch null;
+        defer if (output) |body| self.allocator.free(body);
+
         const diagnostics = try self.diagnosticContext();
         defer self.allocator.free(diagnostics);
         return prompt.attach(self.allocator, .{
             .path = self.workspace.activePath(),
+            .range = range_label,
             .selection = selection,
+            .file = file,
             .diagnostics = diagnostics,
+            .output = output,
         }, self.prompt_text.items);
     }
 
@@ -949,6 +984,7 @@ pub const App = struct {
         if (g.activity.contains(x, y)) {
             if (y < 105) self.sidebar = !self.sidebar else self.focus = .prompt;
         } else if (g.agents.contains(x, y)) {
+            try self.inspectorClick(x, y);
             const lanes_y = g.agents.y + 44;
             const lanes_end = lanes_y + @as(f32, @floatFromInt(self.clients.len)) * 38;
             if (y >= lanes_y and y < lanes_end) {
@@ -1077,7 +1113,7 @@ pub const App = struct {
         if (g.explorer.w > 0) _ = try self.drawPanel(r, "explorer", g.explorer);
         try self.drawEditor(r);
         if (self.terminal_open) try self.drawTerminal(r);
-        try self.drawAgents(r, frame);
+        try self.drawInspector(r, frame);
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
         try r.rect(g.status, theme.selected);
         _ = try self.drawPanel(r, "status", g.status);
@@ -1482,44 +1518,168 @@ pub const App = struct {
         };
     }
 
-    fn drawAgents(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
+    /// Rows the inspector offers: three kinds of context, then one destination
+    /// per harness. A click toggles the first and pipes through the second,
+    /// which is the whole interaction: select, switch on, pipe.
+    const InspectorRow = union(enum) {
+        context: usize,
+        destination: usize,
+    };
+
+    fn inspectorRowAt(self: *App, y: f32) ?InspectorRow {
+        const bounds = self.geometry.agents;
+        const context_y = bounds.y + 46;
+        for (0..3) |index| {
+            const row_y = context_y + @as(f32, @floatFromInt(index)) * 26;
+            if (y >= row_y and y < row_y + 26) return .{ .context = index };
+        }
+        const pipe_y = context_y + 3 * 26 + 34;
+        for (0..self.clients.len) |index| {
+            const row_y = pipe_y + @as(f32, @floatFromInt(index)) * 26;
+            if (y >= row_y and y < row_y + 26) return .{ .destination = index };
+        }
+        return null;
+    }
+
+    fn inspectorClick(self: *App, x: f32, y: f32) !void {
+        _ = x;
+        const row = self.inspectorRowAt(y) orelse return;
+        switch (row) {
+            .context => |index| {
+                self.inspector_context[index] = !self.inspector_context[index];
+                self.status("Context {s}.", .{if (self.inspector_context[index]) "attached" else "removed"});
+            },
+            .destination => |index| try self.pipeTo(index),
+        }
+    }
+
+    /// Whether the inspector will carry one of its context rows. The click path
+    /// and the prompt path both go through this, so a click that did not land
+    /// is visible from outside.
+    pub fn inspectorContext(self: *const App, index: usize) bool {
+        return if (index < self.inspector_context.len and self.inspector_context[index]) true else false;
+    }
+
+    /// The clickable point of a context row, for callers outside the interface
+    /// that need to exercise the inspector without a pointer device.
+    pub fn inspectorRowPoint(self: *const App, index: usize) ?struct { x: f32, y: f32 } {
+        if (index >= self.inspector_context.len) return null;
+        const bounds = self.geometry.agents;
+        if (bounds.w <= 0) return null;
+        const y = bounds.y + 46 + @as(f32, @floatFromInt(index)) * 26;
+        return .{ .x = bounds.x + 60, .y = y + 10 };
+    }
+
+    /// The signature action: send what the composer holds, with the context
+    /// the inspector shows, to one harness. Choosing the destination is the
+    /// whole gesture; the interface names it before anything is sent.
+    pub fn pipeTo(self: *App, index: usize) !void {
+        if (index >= self.clients.len) return error.NoSuchAgent;
+        self.active = index;
+        self.transcript_scroll = 0;
+        try self.submit(false);
+    }
+
+    fn drawInspector(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
         const bounds = self.geometry.agents;
         r.clip = bounds;
         try r.rect(bounds, theme.panel);
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = 1, .h = bounds.h }, theme.border);
-        try r.text(bounds.x + 14, bounds.y + 13, "AGENTS / independent sessions", theme.text);
-        // The lanes are drawn by whichever extension registered a panel for the
-        // `lanes` region; the interface only offers the rectangle.
-        const lanes: Rect = .{ .x = bounds.x + 8, .y = bounds.y + 44, .w = bounds.w - 16, .h = @as(f32, @floatFromInt(self.clients.len)) * 38 };
-        _ = try self.drawPanel(r, "lanes", lanes);
-        const transcript_y = bounds.y + 52 + @as(f32, @floatFromInt(self.clients.len)) * 38;
-        const transcript_bottom = if (self.clients[self.active].permission != null) self.permissionRect().y - 8 else bounds.y + bounds.h - 110;
-        const transcript: Rect = .{ .x = bounds.x + 14, .y = transcript_y, .w = bounds.w - 28, .h = @max(0, transcript_bottom - transcript_y) };
+        try r.text(bounds.x + 14, bounds.y + 13, "INSPECTOR", theme.text);
+
+        // What the inspector is about: the file the caret is in, and where.
+        const path = std.fs.path.basename(self.workspace.activePath() orelse "no file");
+        var subject: [128]u8 = undefined;
+        const line = self.workspace.activeDocument().lineOf(self.workspace.activeDocument().cursor) + 1;
+        const label = try std.fmt.bufPrint(&subject, "{s} · line {d}", .{ path, line });
+        try r.text(bounds.x + 14, bounds.y + 31, label, theme.accent);
+
+        const rows = [_][]const u8{ "Selection", "Current file", "Terminal output" };
+        const context_y = bounds.y + 46;
+        for (rows, 0..) |name, index| {
+            const y = context_y + @as(f32, @floatFromInt(index)) * 26;
+            const on = self.inspector_context[index];
+            try r.text(bounds.x + 14, y + 6, if (on) "[x]" else "[ ]", if (on) theme.accent else theme.muted);
+            try r.text(bounds.x + 40, y + 6, name, if (on) theme.text else theme.muted);
+            const detail = self.inspectorDetail(index);
+            try r.text(bounds.x + 200, y + 6, detail, theme.muted);
+        }
+
+        const pipe_y = context_y + 3 * 26 + 34;
+        try r.text(bounds.x + 14, pipe_y - 18, "PIPE TO", theme.muted);
+        for (self.clients, 0..) |client, index| {
+            const y = pipe_y + @as(f32, @floatFromInt(index)) * 26;
+            const chosen = index == self.active;
+            const ready = client.state == .ready;
+            if (chosen) try r.rect(.{ .x = bounds.x + 6, .y = y - 1, .w = 3, .h = 20 }, theme.accent);
+            var name: [96]u8 = undefined;
+            const named = try std.fmt.bufPrint(&name, "{d}  {s}", .{ index + 1, client.preset.name });
+            try r.text(bounds.x + 14, y + 6, named, if (ready) theme.text else theme.muted);
+            try r.text(bounds.x + bounds.w - 78, y + 6, if (ready) "READY" else "OFFLINE", if (ready) theme.accent else theme.muted);
+        }
+
+        // The run is evidence, not the navigation: it gets the room that is
+        // left after the context, the destinations, and the composer.
+        const run_y = pipe_y + @as(f32, @floatFromInt(self.clients.len)) * 26 + 26;
         const client = &self.clients[self.active];
-        if (client.transcript.items.len == 0 and try self.drawPanel(r, "transcript", transcript)) {
+        const permission = if (client.permission != null) self.permissionRect() else null;
+        const run_bottom = if (permission) |rect| rect.y - 8 else bounds.y + bounds.h - 110;
+        try r.text(bounds.x + 14, run_y, "RUN", theme.muted);
+        const run: Rect = .{ .x = bounds.x + 14, .y = run_y + 18, .w = bounds.w - 28, .h = @max(0, run_bottom - run_y - 18) };
+        if (client.transcript.items.len == 0 and try self.drawPanel(r, "transcript", run)) {
             // A registered panel owns this space, so the interface does not
             // carry a copy of what an extension would say.
         } else {
             const bytes = if (client.transcript.items.len == 0) default_help else client.transcript.items;
-            try wrappedTail(r, frame, transcript, bytes, self.transcript_scroll, theme.text);
+            try wrappedTail(r, frame, run, bytes, self.transcript_scroll, theme.text);
         }
+
         r.clip = bounds;
-        if (client.permission != null) {
-            const permission = self.permissionRect();
-            try r.rect(permission, theme.raised);
-            try r.rect(.{ .x = permission.x, .y = permission.y, .w = 3, .h = permission.h }, theme.amber);
-            r.clip = permission.inset(8);
-            try r.text(permission.x + 10, permission.y + 6, client.permissionTitle(), theme.amber);
-            try r.text(permission.x + 10, permission.y + 38, "Alt+Y allow once", theme.accent);
-            try r.text(permission.x + permission.w / 2, permission.y + 38, "Alt+N reject", theme.red);
+        if (permission) |rect| {
+            try r.rect(rect, theme.raised);
+            try r.rect(.{ .x = rect.x, .y = rect.y, .w = 3, .h = rect.h }, theme.amber);
+            r.clip = rect.inset(8);
+            try r.text(rect.x + 10, rect.y + 6, client.permissionTitle(), theme.amber);
+            try r.text(rect.x + 10, rect.y + 38, "Alt+Y allow once", theme.accent);
+            try r.text(rect.x + rect.w / 2, rect.y + 38, "Alt+N reject", theme.red);
         }
+
         r.clip = bounds;
         const prompt_box: Rect = .{ .x = bounds.x + 10, .y = bounds.y + bounds.h - 102, .w = bounds.w - 20, .h = 66 };
         try r.rect(prompt_box, if (self.focus == .prompt) theme.raised else theme.background);
         if (self.focus == .prompt) try r.rect(.{ .x = prompt_box.x, .y = prompt_box.y, .w = 2, .h = prompt_box.h }, theme.accent);
-        try wrappedTail(r, frame, prompt_box.inset(8), if (self.prompt_text.items.len == 0) "Ask this agent..." else self.prompt_text.items, 0, if (self.prompt_text.items.len == 0) theme.muted else theme.text);
+        // The composer names its destination: a draft is never sent somewhere
+        // the interface did not say.
+        var placeholder: [96]u8 = undefined;
+        const empty = try std.fmt.bufPrint(&placeholder, "Ask {s}…", .{client.preset.name});
+        try wrappedTail(r, frame, prompt_box.inset(8), if (self.prompt_text.items.len == 0) empty else self.prompt_text.items, 0, if (self.prompt_text.items.len == 0) theme.muted else theme.text);
         r.clip = bounds;
-        try r.text(bounds.x + 14, bounds.y + bounds.h - 27, "Ctrl+Enter send / F5 start / F6 stop", theme.muted);
+        try r.text(bounds.x + 14, bounds.y + bounds.h - 27, "click to attach · click a name to pipe", theme.muted);
+    }
+
+    /// A short, honest description of what a context row would carry. The
+    /// numbers are the point: a row that says nothing is a row that sends
+    /// nothing surprising.
+    fn inspectorDetail(self: *App, index: usize) []const u8 {
+        switch (index) {
+            0 => {
+                const range = self.selectedRange() orelse return "nothing selected";
+                const document = self.workspace.activeDocument();
+                const first = document.lineOf(range.start) + 1;
+                const last = document.lineOf(range.end) + 1;
+                return std.fmt.bufPrint(&self.inspector_scratch[0], "{s} · lines {d}-{d}", .{
+                    std.fs.path.basename(self.workspace.activePath() orelse "no file"), first, last,
+                }) catch "selection";
+            },
+            1 => {
+                const lines = self.workspace.activeDocument().lineCount();
+                return std.fmt.bufPrint(&self.inspector_scratch[1], "{d} lines", .{lines}) catch "file";
+            },
+            else => {
+                const terminal = if (self.terminal) |*value| value else return "no terminal";
+                return std.fmt.bufPrint(&self.inspector_scratch[2], "{d} rows of screen", .{terminal.rows()}) catch "terminal";
+            },
+        }
     }
 
     fn drawOverlay(self: *App, r: *Renderer) !void {

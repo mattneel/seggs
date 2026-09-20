@@ -232,4 +232,4 @@ jobs:
         shell: pwsh
         # Each option is quoted: PowerShell splits an unquoted `-Dname=value`
         # at the `=` and hands the rest to Zig as a step name.
-        run: zig build verify "-Dsdl-prefix=.deps/win" "-Dglslang=.deps/tools/glslang/bin/glslang.exe" "-Dpython=python"
+        run: zig build verify "-Dsdl-prefix=.deps/win" "-Dshader-dir=.deps/tools/shaders" "-Dpython=python"

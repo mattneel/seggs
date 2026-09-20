@@ -21,6 +21,7 @@ pub fn build(b: *std.Build) void {
     const prefix = b.option([]const u8, "sdl-prefix", "SDL3 and SDL3_ttf installation prefix") orelse ".deps/install";
     const python = b.option([]const u8, "python", "Python executable for the ACP mock") orelse "python3";
     const glslang = b.option([]const u8, "glslang", "Path to glslangValidator") orelse "glslangValidator";
+    const shader_dir = b.option([]const u8, "shader-dir", "Directory of precompiled SPIR-V shaders, instead of running glslang");
 
     // This target needs only Zig. SDL discovery and shader compilation stay lazy.
     const unit = b.addTest(.{ .root_module = b.createModule(.{
@@ -101,6 +102,16 @@ pub fn build(b: *std.Build) void {
             \\pub const metal: []const u8 = @embedFile("ui.metal");
             \\pub const vertex_spv: []const u8 = &.{};
             \\pub const fragment_spv: []const u8 = &.{};
+        );
+    } else if (shader_dir) |dir| blk: {
+        // A host where glslang cannot be run from the build graph hands over the
+        // same shaders, compiled first with the command the build would run.
+        _ = generated.addCopyFile(.{ .cwd_relative = b.pathJoin(&.{ dir, "ui.vert.spv" }) }, "ui.vert.spv");
+        _ = generated.addCopyFile(.{ .cwd_relative = b.pathJoin(&.{ dir, "ui.frag.spv" }) }, "ui.frag.spv");
+        break :blk generated.add("shaders.zig",
+            \\pub const metal: []const u8 = &.{};
+            \\pub const vertex_spv: []const u8 = @embedFile("ui.vert.spv");
+            \\pub const fragment_spv: []const u8 = @embedFile("ui.frag.spv");
         );
     } else blk: {
         const vs = b.addSystemCommand(&.{ glslang, "-V", "--target-env", "vulkan1.0", "-S", "vert" });

@@ -211,6 +211,29 @@ complex-script joining are not implemented, and a fallback face is used as-is:
 its own metrics decide advances, so a proportional fallback does not align to
 the editor's column grid.
 
+## Terminal
+
+`src/services/vt.zig` owns one terminal: libghostty-vt's emulator state, the
+render state a surface draws from, and the encoders that turn input into the
+bytes a program expects. The library parses escape sequences, keeps the screen,
+scrollback, and modes, reflows on resize, and encodes keys, mouse reports,
+focus events, and pastes; the editor supplies the window, the renderer, and the
+decisions about what it draws.
+
+The split is the same one Ghostling makes with Raylib and Ghostty makes with
+Metal, and it is why nothing in the library knows about Seggs: the render state
+is rows of cells with graphemes and styles, and the editor walks them into
+batched quads and glyphs like it does for its own text. The dock's geometry
+comes from `src/ui/layout.zig`, which splits the editor's column rather than
+the window, so the explorer and the agent column keep their heights.
+
+The library is C, so it crosses `translate-c` like SDL and Yoga. It is built by
+the Zig release Ghostty's manifest names rather than this repository's, and the
+C ABI is the boundary between them; `tools/bootstrap_ghostty.py` does that
+build and `-Dghostty-prefix` says where it landed. A surface holds buffers for
+one row's cells, because the render call fills a buffer per cell and the
+slices must not borrow one that the next cell overwrites.
+
 ## Extension host
 
 `src/ext/host.zig` embeds QuickJS-NG through the `quickjs_ng` dependency. Every

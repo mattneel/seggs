@@ -93,6 +93,27 @@ privileges; it isolates ownership and output, not authority.
 `terminal/wait_for_exit` blocks the app thread for up to five seconds.
 A process stop does not guarantee cleanup of every descendant process.
 
+## Terminal
+
+The emulator is libghostty-vt, so its parsing, modes, and encodings are as
+complete as the library's. What the editor draws from it is narrower: bold and
+italic are parsed and not shown, because the atlas is rasterized from one face
+and has no second weight or slope to draw them with; inverse and underline are
+drawn. A grapheme's first codepoint is drawn and its combining marks are not,
+because the atlas maps codepoints rather than shaped runs.
+
+Kitty graphics is parsed by the library and not drawn: the renderer would need
+image decoding and a texture path it does not have. There is no scrollbar, so a
+viewport scrolled into history shows no indication of where it is until it is
+scrolled back. Page Up and Page Down go to the program rather than to
+scrollback, which is what applications expect.
+
+The terminal needs a PTY, so it exists where `forkpty` does: Windows has no
+terminal dock, and `services/pty.zig` names a type there that refuses rather
+than a declaration the linker would have to find. The dock starts the user's
+shell from `SHELL`, or `/bin/sh`, and the editor has no setting for choosing
+another one yet.
+
 ## Platform and IDE scope
 
 The shader sources cover Vulkan and Metal.

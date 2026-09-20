@@ -26,14 +26,16 @@ ACP connects independent agent processes to the right-hand panel.
 | Capabilities | Editor-backed filesystem reads and writes, plus client-owned terminals with explicit process ownership and bounded output |
 | Integrations | Oh-My-Pi, Codex ACP adapter, Claude ACP adapter, custom argv, local mock |
 | Languages | Optional language server: diagnostics in the gutter, F12 definition, Shift+F12 references, Ctrl+I hover; prompts attach the selection and diagnostics |
+| Terminal | A shell in a dock below the editor, emulated by libghostty-vt: scrollback with reflow on resize, 24-bit and palette color, inverse and underline styles, the Kitty keyboard protocol, mouse tracking and reporting formats, focus events, bracketed paste, and input encoded from the terminal's own modes |
 | SeggsC | Extensions describe interface as data, take events, and ask the editor to act; each bundle runs in a context of its own and reloads while the editor runs |
 | Layout | Yoga lays out interface an extension describes, sized from the cell metrics so a font or density change moves the chrome with the text |
 | Extensions | TypeScript sources bundled by esbuild and evaluated in an embedded QuickJS-NG host with a `seggs` core API |
 | Development | Zig core tests, native transport smoke target, screenshot and window-transition gate, Python fixture tests, dependency bootstrap, Linux CI definition |
 
 The app calls SDL3 GPU functions directly.
-It does not use SDL_Renderer, Electron, a browser view, or a terminal renderer.
-SDL3_ttf rasterizes the startup glyph atlas from a system font.
+It does not use SDL_Renderer, Electron, or a browser view; the terminal is
+libghostty-vt's emulator behind the editor's own renderer, not a terminal
+widget. SDL3_ttf rasterizes the startup glyph atlas from a system font.
 The repository contains no font files.
 
 ## Extensions
@@ -181,11 +183,17 @@ Function keys depend on the system keyboard settings.
 | Shift+arrows / mouse drag | Select text |
 | Ctrl+1 through Ctrl+8 | Select an agent |
 | F5 / F6 | Start / stop the selected agent |
+| Ctrl+` | Toggle the terminal dock |
 | Ctrl+L / Escape | Focus prompt / focus editor |
 | Ctrl+Enter | Send to the selected ready agent |
 | Ctrl+Shift+Enter | Send to every ready agent |
 | Ctrl+Shift+X | Cancel the selected turn |
 | Alt+Y / Alt+N | Allow once / reject the visible permission request |
+
+While the terminal dock has focus the keyboard belongs to the shell: only
+Ctrl+` is kept by the editor, so Ctrl+C, Ctrl+Z, and the rest reach the program
+running there. The wheel scrolls the terminal's history, or goes to the program
+when it has asked for mouse reporting.
 
 The prompt accepts text at its end.
 It does not yet provide a full text-editor cursor or selection model.

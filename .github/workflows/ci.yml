@@ -163,9 +163,9 @@ jobs:
           npm ci --prefix extensions --no-audit --no-fund
           node extensions/build.mjs
       - name: Core, native ACP, and compile gates
-        run: zig build verify -Dsdl-prefix="$(brew --prefix)"
+        run: zig build verify -Dsdl-prefix="$(brew --prefix)" -Dghostty-prefix=.deps/install
       - name: Vulkan over Metal
-        run: zig build screenshot -Dsdl-prefix="$(brew --prefix)"
+        run: zig build screenshot -Dsdl-prefix="$(brew --prefix)" -Dghostty-prefix=.deps/install
 
   windows:
     runs-on: windows-latest
@@ -253,4 +253,4 @@ jobs:
         shell: pwsh
         # Each option is quoted: PowerShell splits an unquoted `-Dname=value`
         # at the `=` and hands the rest to Zig as a step name.
-        run: zig build verify "-Dsdl-prefix=.deps/win" "-Dshader-dir=.deps/tools/shaders" "-Dpython=python"
+        run: zig build verify "-Dsdl-prefix=.deps/win" "-Dghostty-prefix=.deps/install" "-Dshader-dir=.deps/tools/shaders" "-Dpython=python"

@@ -72,7 +72,10 @@ def main() -> int:
     if built is None:
         listing = ", ".join(sorted(p.name for p in (source / "zig-out/lib").glob("*"))) or "nothing"
         raise RuntimeError(f"libghostty-vt was not produced; zig-out/lib holds {listing}")
+    # The headers travel with the library: the editor translates its own
+    # bindings from them.
     shutil.copy2(built[0], prefix / "lib" / built[1])
+    shutil.copytree(source / "zig-out/include/ghostty", prefix / "include/ghostty")
     stamp.write_text(pin["commit"] + "\n")
     print(f"libghostty-vt {pin['commit'][:12]} built with Zig {pin['zig']} into {prefix}")
     return 0

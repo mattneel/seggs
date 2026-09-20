@@ -97,7 +97,12 @@ zig build -Dglslang=/absolute/path/to/glslangValidator
 
 The repository provides a Vulkan shader path for Windows.
 The bootstrap does not build a Windows SDK.
-Windows support remains experimental and unverified.
+The CI workflow provides one from the pinned releases and runs `verify`
+there, so the native build, the ACP integration suite, and the native tests
+are exercised on Windows. Rendering is not: a hosted Windows runner has no
+Vulkan driver, so the screenshot gate runs on Linux and macOS instead.
+Windows compiles its shaders with the same command the build would run and
+passes them to the build with `-Dshader-dir`.
 
 1. Install Zig 0.17.0 and Python 3.12 or later.
 2. Prepare matching SDL3 and SDL3_ttf development libraries in one SDK prefix.

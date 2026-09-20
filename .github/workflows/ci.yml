@@ -12,7 +12,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Restore the Zig toolchain
         id: zig
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps/zig
           key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
@@ -29,7 +29,7 @@ jobs:
         run: python3 tools/check_repo.py
       - name: Restore mdBook
         id: mdbook
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.local/bin/mdbook
           key: mdbook-0.5.4-${{ runner.os }}-${{ runner.arch }}
@@ -59,12 +59,12 @@ jobs:
             fonts-dejavu-core fonts-wqy-zenhei xvfb
       - name: Restore the Zig toolchain
         id: zig
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps/zig
           key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: Restore the SDL prefix
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .deps/src
@@ -78,14 +78,14 @@ jobs:
           if [ -d .deps/zig ]; then python3 tools/bootstrap.py; else python3 tools/bootstrap.py --install-zig; fi
           echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
       - name: Restore the Zig package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/zig
           key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
           restore-keys: zigpkg-${{ runner.os }}-${{ runner.arch }}-
       - name: Core, native ACP, and compile gates
         run: zig build verify
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -101,7 +101,7 @@ jobs:
         run: zig build screenshot
       - name: Keep the captures when they disagree
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: screenshots
           path: /tmp/seggs-shot-*.ppm
@@ -120,17 +120,17 @@ jobs:
       - uses: actions/checkout@v5
       - name: Restore the Zig toolchain
         id: zig
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps/zig
           key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
       - name: Restore Homebrew downloads
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/Library/Caches/Homebrew
           key: brew-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}-moltenvk
       - name: Restore the Zig package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.cache/zig
           key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
@@ -141,7 +141,7 @@ jobs:
           if [ ! -d .deps/zig ]; then python3 tools/install_zig.py; fi
           echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
           brew install sdl3 sdl3_ttf vulkan-loader molten-vk vulkan-validationlayers
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -163,7 +163,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Restore the Zig toolchain
         id: zig
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .deps/zig
           key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}
@@ -172,14 +172,14 @@ jobs:
         run: python tools/install_zig.py
       - name: Restore the SDL prefix and glslang
         id: sdk
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             .deps/win
             .deps/tools
           key: winsdk-${{ runner.arch }}-${{ hashFiles('dependencies.json') }}-glslang-16.6.0
       - name: Restore the Zig package cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~\AppData\Local\zig
           key: zigpkg-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}

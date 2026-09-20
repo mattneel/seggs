@@ -520,7 +520,14 @@ pub const App = struct {
                     const bytes = c.SDL_GetClipboardText();
                     if (bytes != null) {
                         defer c.SDL_free(bytes);
-                        try self.insert(std.mem.span(bytes));
+                        // A focused terminal takes the paste through the
+                        // emulator, which wraps it when the program asked for
+                        // bracketed paste and strips what would be a command.
+                        if (self.focus == .terminal) {
+                            try self.terminalPaste(std.mem.span(bytes));
+                        } else {
+                            try self.insert(std.mem.span(bytes));
+                        }
                     }
                 },
                 else => {},
@@ -1198,7 +1205,7 @@ pub const App = struct {
                 self.status("terminal: {s}", .{@errorName(err)});
                 return;
             };
-            self.terminal = vt.Terminal.init(80, 24) catch |err| {
+            self.terminal = vt.Terminal.init(self.allocator, 80, 24) catch |err| {
                 // The emulator could not start, so nothing would read the shell.
                 var orphan = self.shell.?;
                 orphan.deinit();

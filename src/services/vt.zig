@@ -1,5 +1,6 @@
 const std = @import("std");
 const g = @import("ghostty");
+const Allocator = std.mem.Allocator;
 
 /// A terminal: libghostty-vt's emulator state, the render state a surface draws
 /// from, and the encoder that turns input into the bytes a program expects.
@@ -8,6 +9,7 @@ const g = @import("ghostty");
 /// tools/bootstrap.py). Nothing here allocates through the library except
 /// through its default allocator, which is what the library's own examples do.
 pub const Terminal = struct {
+    allocator: Allocator,
     handle: g.GhosttyTerminal,
     render: g.GhosttyRenderState,
     row_iterator: g.GhosttyRenderStateRowIterator = null,
@@ -18,6 +20,8 @@ pub const Terminal = struct {
     /// must keep its own rather than borrowing one the next cell overwrites.
     grapheme_storage: [max_cells][max_graphemes]u32 = undefined,
     cell_storage: [max_cells]Cell = undefined,
+    /// Scratch for the one library call that rewrites its input.
+    paste_scratch: std.ArrayList(u8) = .empty,
     key_encoder: g.GhosttyKeyEncoder = null,
     key_event: g.GhosttyKeyEvent = null,
     mouse_encoder: g.GhosttyMouseEncoder = null,
@@ -47,7 +51,7 @@ pub const Terminal = struct {
         palette: [256]g.GhosttyColorRgb,
     };
 
-    pub fn init(initial_cols: u16, initial_rows: u16) !Terminal {
+    pub fn init(a: Allocator, initial_cols: u16, initial_rows: u16) !Terminal {
         var handle: g.GhosttyTerminal = null;
         try check(g.ghostty_terminal_new(null, &handle, initial_cols, initial_rows));
         errdefer g.ghostty_terminal_free(handle);
@@ -59,7 +63,7 @@ pub const Terminal = struct {
         errdefer g.ghostty_render_state_row_iterator_free(iterator);
         var cells: g.GhosttyRenderStateRowCells = null;
         try check(g.ghostty_render_state_row_cells_new(null, &cells));
-        return .{ .handle = handle, .render = render, .row_iterator = iterator, .row_cells = cells };
+        return .{ .allocator = a, .handle = handle, .render = render, .row_iterator = iterator, .row_cells = cells };
     }
 
     pub fn deinit(self: *Terminal) void {
@@ -70,6 +74,7 @@ pub const Terminal = struct {
         g.ghostty_render_state_row_iterator_free(self.row_iterator);
         g.ghostty_render_state_free(self.render);
         g.ghostty_terminal_free(self.handle);
+        self.paste_scratch.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -301,10 +306,15 @@ pub const Terminal = struct {
 
     /// Wrap pasted text: bracketed when the program asked, with unsafe control
     /// bytes stripped either way.
+    ///
+    /// The library strips those bytes by writing over the input, so it works on
+    /// a copy here: a caller's slice may be a literal, which is not writable.
     pub fn encodePaste(self: *Terminal, text: []const u8, out: []u8) ![]u8 {
+        self.paste_scratch.clearRetainingCapacity();
+        try self.paste_scratch.appendSlice(self.allocator, text);
         var written: usize = 0;
         const result = g.ghostty_paste_encode(
-            @constCast(text.ptr),
+            self.paste_scratch.items.ptr,
             text.len,
             self.mode(modeBracketedPaste()),
             out.ptr,
@@ -392,7 +402,7 @@ fn check(result: g.GhosttyResult) !void {
 }
 
 test "a terminal echoes what it is fed" {
-    var terminal = try Terminal.init(20, 4);
+    var terminal = try Terminal.init(std.testing.allocator, 20, 4);
     defer terminal.deinit();
     terminal.write("hello\r\nworld");
     try terminal.update();
@@ -422,7 +432,7 @@ test "a terminal echoes what it is fed" {
 }
 
 test "input is encoded the way the program asked for it" {
-    var terminal = try Terminal.init(20, 4);
+    var terminal = try Terminal.init(std.testing.allocator, 20, 4);
     defer terminal.deinit();
     var buffer: [128]u8 = undefined;
     // A cell size is what the input encoders need to place a mouse report.
@@ -472,7 +482,7 @@ test "input is encoded the way the program asked for it" {
 test "a terminal's whole lifecycle releases everything it took" {
     // The testing allocator fails the test on any leak, which is what keeps the
     // buffers a surface holds from quietly outliving the terminal.
-    var terminal = try Terminal.init(80, 24);
+    var terminal = try Terminal.init(std.testing.allocator, 80, 24);
     defer terminal.deinit();
     try terminal.resize(80, 24, 9, 22);
     terminal.write("\x1b[1;32mgreen\x1b[0m\r\nsecond row\r\n\x1b[4munderlined\x1b[0m");
@@ -495,7 +505,7 @@ test "a terminal's whole lifecycle releases everything it took" {
 }
 
 test "the viewport scrolls into history and back" {
-    var terminal = try Terminal.init(16, 3);
+    var terminal = try Terminal.init(std.testing.allocator, 16, 3);
     defer terminal.deinit();
     const Collector = struct {
         allocator: std.mem.Allocator,

@@ -21,6 +21,9 @@ const Unsupported = struct {
         return error.PtyUnsupported;
     }
 
+    /// The editor polls the PTY; there is nothing to poll where there is none.
+    pub fn setNonBlocking(_: *Unsupported) !void {}
+
     pub fn deinit(_: *Unsupported) void {}
 };
 

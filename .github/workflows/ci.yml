@@ -40,6 +40,7 @@ jobs:
             libfreetype6-dev libx11-dev libxext-dev libxrandr-dev \
             libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxrender-dev \
             libxtst-dev glslang-tools libvulkan-dev mesa-vulkan-drivers \
+            vulkan-validationlayers \
             fonts-dejavu-core fonts-wqy-zenhei xvfb
       - name: Install Zig and SDL baseline
         run: |
@@ -69,3 +70,52 @@ jobs:
           LVP=$(find /usr/share/vulkan/icd.d -name '*lvp*.json' -print -quit)
           test -n "$LVP"
           VK_ICD_FILENAMES="$LVP" xvfb-run -a zig build run -- --windowed --frames 8
+
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Zig and SDL
+        run: |
+          python3 tools/install_zig.py
+          echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
+          brew install sdl3 sdl3_ttf vulkan-loader molten-vk vulkan-validationlayers
+      - name: Core, native ACP, and compile gates
+        run: zig build verify -Dsdl-prefix="$(brew --prefix)"
+      - name: Vulkan over Metal
+        run: zig build screenshot -Dsdl-prefix="$(brew --prefix)"
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Zig
+        run: python tools/install_zig.py
+      - name: SDL, glslang, and PATH
+        shell: pwsh
+        run: |
+          # docs/BUILD.md: matching SDL3 and SDL3_ttf development libraries in
+          # one prefix, their DLL directory on PATH, and shader compilation.
+          $prefix = "$env:GITHUB_WORKSPACE/.deps/win"
+          $tools = "$env:GITHUB_WORKSPACE/.deps/tools"
+          New-Item -ItemType Directory -Force -Path "$prefix/include", "$prefix/lib", "$tools" | Out-Null
+          $packages = @(
+            @{ name = "SDL3"; url = "https://github.com/libsdl-org/SDL/releases/download/release-3.4.4/SDL3-devel-3.4.4-VC.zip" },
+            @{ name = "SDL3_ttf"; url = "https://github.com/libsdl-org/SDL_ttf/releases/download/release-3.2.2/SDL3_ttf-devel-3.2.2-VC.zip" }
+          )
+          foreach ($package in $packages) {
+            $archive = "$env:TEMP/$($package.name).zip"
+            Invoke-WebRequest -Uri $package.url -OutFile $archive
+            Expand-Archive -Path $archive -DestinationPath "$env:TEMP/$($package.name)" -Force
+            Copy-Item -Recurse -Force "$env:TEMP/$($package.name)/*/include/*" "$prefix/include/"
+            Copy-Item -Force "$env:TEMP/$($package.name)/*/lib/x64/*" "$prefix/lib/"
+          }
+          Invoke-WebRequest -Uri "https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-windows-x86_64-release.zip" -OutFile "$env:TEMP/glslang.zip"
+          Expand-Archive -Path "$env:TEMP/glslang.zip" -DestinationPath "$tools/glslang" -Force
+          "$env:GITHUB_WORKSPACE/.deps/zig" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$prefix/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "$tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Core, native ACP, and compile gates
+        run: zig build verify -Dsdl-prefix=.deps/win -Dglslang=.deps/tools/glslang/bin/glslang.exe -Dpython=python

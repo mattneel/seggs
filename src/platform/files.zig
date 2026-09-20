@@ -3,6 +3,23 @@ const builtin = @import("builtin");
 const c = @import("native");
 const Allocator = std.mem.Allocator;
 
+/// A writable path under the system's temporary directory, for callers that
+/// need a scratch file. The environment decides the directory, so the same code
+/// runs on a POSIX host and on Windows, where `/tmp` is not a location.
+pub fn tempPath(a: Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
+    const base: []const u8 = if (std.c.getenv(if (builtin.os.tag == .windows) "TEMP" else "TMPDIR")) |value|
+        std.mem.span(value)
+    else
+        if (builtin.os.tag == .windows) "C:\\Windows\\Temp" else "/tmp";
+    return std.fmt.allocPrint(a, "{s}{c}seggs-{s}-{d}{s}", .{
+        base,
+        std.fs.path.sep,
+        prefix,
+        c.SDL_GetPerformanceCounter(),
+        suffix,
+    });
+}
+
 pub fn read(a: Allocator, path: []const u8, limit: usize) ![]u8 {
     const z = try a.dupeSentinel(u8, path, 0);
     defer a.free(z);

@@ -23,7 +23,7 @@ test {
 const Allocator = std.mem.Allocator;
 
 fn newDir(a: Allocator) ![]u8 {
-    return std.fmt.allocPrint(a, "/tmp/seggs-save-{d}", .{c.SDL_GetPerformanceCounter()});
+    return files.tempPath(a, "save", "");
 }
 
 fn z(a: Allocator, path: []const u8) ![:0]u8 {

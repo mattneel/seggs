@@ -159,12 +159,54 @@ def app_output(result: subprocess.CompletedProcess) -> str:
     return (result.stdout or "") + (result.stderr or "")
 
 
+VALIDATION_LAYER = "VK_LAYER_KHRONOS_validation"
+LAYER_DIRS = (
+    Path("/usr/share/vulkan/explicit_layer.d"),
+    Path("/usr/local/share/vulkan/explicit_layer.d"),
+    Path("/etc/vulkan/explicit_layer.d"),
+    Path("/opt/homebrew/share/vulkan/explicit_layer.d"),
+)
+_reported_missing_layer = False
+
+
+def find_validation_layer() -> Path | None:
+    """The Khronos validation layer, wherever this host keeps its manifests."""
+    for directory in LAYER_DIRS:
+        for name in ("VkLayer_khronos_validation.json", "VK_LAYER_KHRONOS_validation.json"):
+            candidate = directory / name
+            if candidate.exists():
+                return candidate
+    return None
+
+
 def app_env() -> dict:
+    """What an app run needs, on each platform the gate runs on."""
+    global _reported_missing_layer
     env = dict(os.environ)
-    env.setdefault("SDL_VIDEODRIVER", "x11")
-    icd = Path("/usr/share/vulkan/icd.d/lvp_icd.json")
-    if icd.exists():
-        env.setdefault("VK_ICD_FILENAMES", str(icd))
+    if sys.platform != "darwin":
+        # The workflows have no display of their own, and macOS draws through
+        # Cocoa rather than a driver the gate could name.
+        env.setdefault("SDL_VIDEODRIVER", "x11")
+    # A software ICD keeps the two captures comparable where no GPU is present;
+    # on macOS Vulkan is MoltenVK sitting on Metal.
+    for icd in (
+        Path("/usr/share/vulkan/icd.d/lvp_icd.json"),
+        Path("/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json"),
+        Path("/usr/local/share/vulkan/icd.d/MoltenVK_icd.json"),
+    ):
+        if icd.exists():
+            env.setdefault("VK_ICD_FILENAMES", str(icd))
+            break
+    # A run is only checked against validation if the layer is in it. The
+    # workflows install the layers, so a gate there that finds none would be
+    # reporting on a check it never made.
+    if find_validation_layer() is not None:
+        env.setdefault("VK_INSTANCE_LAYERS", VALIDATION_LAYER)
+    elif os.environ.get("CI"):
+        require(False, f"{VALIDATION_LAYER} is not installed")
+    elif not _reported_missing_layer:
+        _reported_missing_layer = True
+        print("validation: the Khronos layer is not installed; renders are unchecked")
     # The binary's rpath is relative to the repository, so a run with another
     # working directory needs the libraries named outright.
     libs = Path(__file__).resolve().parent.parent / ".deps" / "install" / "lib"
@@ -174,15 +216,16 @@ def app_env() -> dict:
     return env
 
 
+def display_command(command: list[str], env: dict) -> list[str]:
+    """Run the app under a virtual X server when this host has no display."""
+    if env.get("DISPLAY") or not shutil.which("xvfb-run"):
+        return command
+    return ["xvfb-run", "-a", *command]
+
+
 def capture(binary: str, out: Path) -> None:
-    env = dict(os.environ)
-    env.setdefault("SDL_VIDEODRIVER", "x11")
-    icd = Path("/usr/share/vulkan/icd.d/lvp_icd.json")
-    if icd.exists():
-        env.setdefault("VK_ICD_FILENAMES", str(icd))
-    command = [binary, "--windowed", "--frames", "4", "--screenshot", str(out)]
-    if not env.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    env = app_env()
+    command = display_command([binary, "--windowed", "--frames", "4", "--screenshot", str(out)], env)
     out.unlink(missing_ok=True)
     subprocess.run(command, check=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=RUN_TIMEOUT)
     require(out.exists(), f"{out}: the app did not write a screenshot")
@@ -192,9 +235,7 @@ def atlas_coverage(binary: str, fixture: str) -> tuple[int, int]:
     """Render `fixture` and read back the atlas counters the app logs."""
     path = Path("/tmp/seggs-coverage.txt")
     path.write_text(fixture, encoding="utf-8")
-    command = [binary, "--file", str(path), "--windowed", "--frames", "2"]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--file", str(path), "--windowed", "--frames", "2"], app_env())
     result = subprocess.run(command, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     if result.returncode != 0 or ATLAS_LINE.search(app_output(result)) is None:
         # The run's own output is the only thing that explains a missing line.
@@ -241,9 +282,7 @@ def check_text_scale(binary: str) -> None:
     fixture.write_text(SCALE_FIXTURE, encoding="utf-8")
     out = Path("/tmp/seggs-scale.ppm")
     out.unlink(missing_ok=True)
-    command = [binary, "--file", str(fixture), "--windowed", "--frames", "4", "--screenshot", str(out)]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--file", str(fixture), "--windowed", "--frames", "4", "--screenshot", str(out)], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     diagnostics = [line for line in app_output(result).splitlines() if "Validation Error" in line or "VUID" in line]
     require(not diagnostics, f"the run reported {len(diagnostics)} Vulkan validation error(s): {diagnostics[0] if diagnostics else ''}")
@@ -309,9 +348,7 @@ def check_baseline(binary: str) -> None:
     fixture.write_text(BASELINE_FIXTURE, encoding="utf-8")
     out = Path("/tmp/seggs-baseline.ppm")
     out.unlink(missing_ok=True)
-    command = [binary, "--file", str(fixture), "--windowed", "--frames", "4", "--screenshot", str(out)]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--file", str(fixture), "--windowed", "--frames", "4", "--screenshot", str(out)], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     metrics = METRICS_LINE.search(app_output(result))
     require(metrics is not None, "the app did not report its atlas metrics")
@@ -408,9 +445,7 @@ def check_ime(binary: str) -> None:
     """
     out = Path("/tmp/seggs-ime.ppm")
     out.unlink(missing_ok=True)
-    command = [binary, "--windowed", "--frames", "9", "--exercise-ime", "--screenshot", str(out)]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--windowed", "--frames", "9", "--exercise-ime", "--screenshot", str(out)], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     compositions = IME_COMPOSITION.findall(app_output(result))
     require(len(compositions) >= 2, f"expected two compositions, saw {len(compositions)}")
@@ -433,9 +468,7 @@ def check_panel(binary: str) -> None:
     call. None of that shows up in a pixel comparison, so the round trip is
     driven and its result read from the log.
     """
-    command = [binary, "--windowed", "--frames", "22", "--exercise-click"]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--windowed", "--frames", "22", "--exercise-click"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     loaded = EXTENSION_LINE.search(app_output(result))
     require(loaded is not None, "the extension host reported no extensions")
@@ -492,9 +525,7 @@ def check_extensions(binary: str) -> None:
     (bundles / "good.js").write_text('seggs.status("good loaded");\n', encoding="utf-8")
     (bundles / "broken.js").write_text("this is not javascript(\n", encoding="utf-8")
     report = workspace / ".seggs" / "extensions.json"
-    command = [binary, "--windowed", "--frames", "900"]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--windowed", "--frames", "900"], app_env())
     process = subprocess.Popen(
         command, cwd=workspace, env=app_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
@@ -538,9 +569,7 @@ def check_narrow(binary: str) -> None:
     take events, which is checked by clicking the activity rail: it is the one
     region every width keeps.
     """
-    command = [binary, "--windowed", "--window-size", "860x600", "--frames", "22", "--exercise-click"]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--windowed", "--window-size", "860x600", "--frames", "22", "--exercise-click"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     loaded = EXTENSION_LINE.search(app_output(result))
     require(loaded is not None and int(loaded.group(1)) >= 5, "the extensions did not load at a narrow width")
@@ -557,9 +586,7 @@ def check_window_transitions(binary: str) -> None:
     request actually reaches the window, and that frames keep rendering after
     the transitions instead of the swapchain stalling.
     """
-    command = [binary, "--windowed", "--frames", "9", "--exercise-window"]
-    if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
-        command = ["xvfb-run", "-a", *command]
+    command = display_command([binary, "--windowed", "--frames", "9", "--exercise-window"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     require(ATLAS_LINE.search(app_output(result)) is not None, "the frame loop did not finish after the transitions")
     steps = WINDOW_LINE.findall(app_output(result))

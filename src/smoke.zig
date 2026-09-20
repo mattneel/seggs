@@ -133,7 +133,10 @@ pub fn main(init: std.process.Init) !void {
     try require(contains(fs_client.transcript.items, "fs-read-ok"));
     std.log.info("PASS: fs/read_text_file returns file content through the capability broker", .{});
 
-    const write_path = "/tmp/seggs-smoke-write.txt";
+    const write_path_text = try files.tempPath(a, "smoke-write", ".txt");
+    defer a.free(write_path_text);
+    const write_path = try a.dupeSentinel(u8, write_path_text, 0);
+    defer a.free(write_path);
     const write_prompt_text = try std.fmt.allocPrint(a, "fswrite {s}|written-by-smoke", .{write_path});
     defer a.free(write_prompt_text);
     try fs_client.prompt(write_prompt_text);
@@ -146,7 +149,7 @@ pub fn main(init: std.process.Init) !void {
     const written = try files.read(a, write_path, 1024 * 1024);
     defer a.free(written);
     try require(std.mem.eql(u8, written, "written-by-smoke"));
-    _ = c.SDL_RemovePath(write_path);
+    _ = c.SDL_RemovePath(write_path.ptr);
     std.log.info("PASS: fs/write_text_file writes file content through the capability broker", .{});
 
     // Terminal capability: the client owns the process, its bounded output, and

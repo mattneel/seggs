@@ -97,10 +97,12 @@ A process stop does not guarantee cleanup of every descendant process.
 
 The emulator is libghostty-vt, so its parsing, modes, and encodings are as
 complete as the library's. What the editor draws from it is narrower: bold and
-italic are parsed and not shown, because the atlas is rasterized from one face
-and has no second weight or slope to draw them with; inverse and underline are
-drawn. A grapheme's first codepoint is drawn and its combining marks are not,
-because the atlas maps codepoints rather than shaped runs.
+italic are drawn by shape rather than by a second face, because the atlas is
+rasterized from one face - bold is a second strike a fraction of a pixel across
+and italic is the same glyph with its top edge leaned. A real bold or italic
+face would look better, and none ships with the repository. Inverse and
+underline are drawn. A grapheme's first codepoint is drawn and its combining
+marks are not, because the atlas maps codepoints rather than shaped runs.
 
 Kitty graphics is parsed by the library and not drawn: the renderer would need
 image decoding and a texture path it does not have. There is no scrollbar, so a

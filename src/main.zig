@@ -395,7 +395,16 @@ fn exerciseWindow(window: *c.SDL_Window, frame: usize) !void {
     var pixel_h: c_int = 0;
     _ = c.SDL_GetWindowSize(window, &logical_w, &logical_h);
     _ = c.SDL_GetWindowSizeInPixels(window, &pixel_w, &pixel_h);
-    std.log.info("window after step {d}: logical {d}x{d}, pixels {d}x{d}", .{ frame, logical_w, logical_h, pixel_w, pixel_h });
+    // The scale is what makes the two sizes differ, so a run at a scale other
+    // than one is the only evidence that a high-density window is exercised.
+    std.log.info("window after step {d}: logical {d}x{d}, pixels {d}x{d}, scale {d:.2}", .{
+        frame,
+        logical_w,
+        logical_h,
+        pixel_w,
+        pixel_h,
+        c.SDL_GetWindowDisplayScale(window),
+    });
 }
 
 fn exists(a: std.mem.Allocator, path: []const u8) bool {

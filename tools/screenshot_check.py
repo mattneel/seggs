@@ -34,6 +34,7 @@ SCRIPT_FIXTURES = (
 RUN_TIMEOUT = 120
 ATLAS_LINE = re.compile(r"atlas: (\d+) glyphs packed, (\d+) placeholder hits")
 WINDOW_LINE = re.compile(r"window after step (\d+): logical (\d+)x(\d+), pixels (\d+)x(\d+)")
+SCALE_LINE = re.compile(r"logical (\d+)x(\d+), pixels (\d+)x(\d+), scale (\d+\.\d+)")
 METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
@@ -600,6 +601,31 @@ def check_window_transitions(binary: str) -> None:
     )
 
 
+DENSITY_SCALE = "2"
+
+
+def check_density(binary: str) -> None:
+    """A display reporting a scale other than one must still render.
+
+    The editor asks for a high-density window and the platform decides the
+    factor: the CI runners report one, so the flag alone would never be
+    exercised. X11 accepts a named factor, so the transitions run again there
+    and must finish, which is what a high-density display has to survive.
+    """
+    env = app_env()
+    if env.get("SDL_VIDEODRIVER") != "x11":
+        print("density: this video driver takes no scaling hint; the scaled run is not exercised here")
+        return
+    env["SDL_VIDEO_X11_SCALING_FACTOR"] = DENSITY_SCALE
+    command = display_command([binary, "--windowed", "--frames", "9", "--exercise-window"], env)
+    result = subprocess.run(command, check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    require(ATLAS_LINE.search(app_output(result)) is not None, "the frame loop did not finish at a scaled display")
+    scaled = [step for step in SCALE_LINE.findall(app_output(result)) if step[4] == DENSITY_SCALE + ".00"]
+    require(scaled, f"no window report carried scale {DENSITY_SCALE}")
+    step = scaled[0]
+    print(f"density: scale {step[4]}, logical {step[0]}x{step[1]} with a {step[2]}x{step[3]} backbuffer, transitions survived")
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("usage: screenshot_check.py <seggs-binary>", file=sys.stderr)
@@ -623,6 +649,7 @@ def main() -> int:
         check_extensions(binary)
         check_narrow(binary)
         check_window_transitions(binary)
+        check_density(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1

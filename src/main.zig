@@ -268,7 +268,9 @@ fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
     }
     if (frame < 90) return;
     if (frame == 90) {
-        app.terminalInput("echo seggs-terminal\r") catch {};
+        // The styled lines are what the screen grab measures: printf expands
+        // the escapes the shell is handed, so the emulator sees real SGR.
+        app.terminalInput("printf 'seggs-terminal\\nplain\\n\\033[1mbold\\033[0m\\n\\033[3mitalic\\033[0m\\n'\r") catch {};
         return;
     }
     if (frame != 240) return;

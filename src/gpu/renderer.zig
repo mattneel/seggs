@@ -1,4 +1,7 @@
 const std = @import("std");
+
+var diag_count: usize = 0;
+var shear_log: usize = 0;
 const builtin = @import("builtin");
 const c = @import("native");
 const shaders = @import("shaders");
@@ -160,8 +163,29 @@ pub const Renderer = struct {
     /// offsets the atlas measured are what put it back on the baseline rather
     /// than at the top of the line.
     fn drawGlyph(self: *Renderer, x: f32, y: f32, g: Atlas.Glyph, color: Color) !void {
+        return self.drawGlyphSheared(x, y, g, color, 0);
+    }
+
+    fn drawGlyphSheared(self: *Renderer, x: f32, y: f32, g: Atlas.Glyph, color: Color, shear: f32) !void {
+        if (@import("builtin").is_test) {} else if (y >= 640 and diag_count < 6) {
+            diag_count += 1;
+            std.log.info("glyph: at {d:.1},{d:.1} rect {d}x{d} off {d},{d} color {d:.2},{d:.2},{d:.2} clip {d:.0},{d:.0} {d:.0}x{d:.0}", .{ x, y, g.w, g.h, g.offset_x, g.offset_y, color[0], color[1], color[2], self.clip.x, self.clip.y, self.clip.w, self.clip.h });
+        }
         if (g.w <= 0 or g.h <= 0) return;
-        try self.quad(.{ .x = x + g.offset_x, .y = y + g.offset_y, .w = g.w / 2, .h = g.h / 2 }, .{ .x = g.x / Atlas.width, .y = g.y / Atlas.height, .w = g.w / Atlas.width, .h = g.h / Atlas.height }, color);
+        try self.quadSheared(.{ .x = x + g.offset_x, .y = y + g.offset_y, .w = g.w / 2, .h = g.h / 2 }, .{ .x = g.x / Atlas.width, .y = g.y / Atlas.height, .w = g.w / Atlas.width, .h = g.h / Atlas.height }, color, shear);
+    }
+
+    /// A glyph drawn with a lean, for a cell whose style is italic.
+    pub fn glyphShearedAt(self: *Renderer, x: f32, y: f32, cp: u21, color: Color, shear: f32) !f32 {
+        const index = self.shaper.glyphIndex(cp);
+        if (index == 0) {
+            const fallback = try self.atlas.fallbackGlyph(cp);
+            try self.drawGlyphSheared(x, y, fallback, color, shear);
+            return fallback.advance;
+        }
+        const glyph = try self.atlas.glyphFor(cp, index);
+        try self.drawGlyphSheared(x, y, glyph, color, shear);
+        return self.atlas.advanceFor(cp);
     }
 
     /// Draw a run. Glyph selection comes from the shaper; advances come from
@@ -185,6 +209,13 @@ pub const Renderer = struct {
     }
 
     fn quad(self: *Renderer, bounds: Rect, uv: Rect, color: Color) !void {
+        return self.quadSheared(bounds, uv, color, 0);
+    }
+
+    /// The same quad, with its top edge moved `shear` pixels right. A terminal
+    /// draws italic without a second face by leaning the glyph; the atlas holds
+    /// one upright bitmap, so the lean is geometry.
+    fn quadSheared(self: *Renderer, bounds: Rect, uv: Rect, color: Color, shear: f32) !void {
         if (bounds.w <= 0 or bounds.h <= 0) return;
         const x0 = @max(bounds.x, self.clip.x);
         const y0 = @max(bounds.y, self.clip.y);
@@ -200,8 +231,9 @@ pub const Renderer = struct {
         const right = x1 / self.width * 2 - 1;
         const top = 1 - y0 / self.height * 2;
         const bottom = 1 - y1 / self.height * 2;
-        const tl: Vertex = .{ .position = .{ left, top }, .uv = .{ u_min, v_min }, .color = color };
-        const tr: Vertex = .{ .position = .{ right, top }, .uv = .{ u_max, v_min }, .color = color };
+        const offset = shear / self.width * 2;
+        const tl: Vertex = .{ .position = .{ left + offset, top }, .uv = .{ u_min, v_min }, .color = color };
+        const tr: Vertex = .{ .position = .{ right + offset, top }, .uv = .{ u_max, v_min }, .color = color };
         const bl: Vertex = .{ .position = .{ left, bottom }, .uv = .{ u_min, v_max }, .color = color };
         const br: Vertex = .{ .position = .{ right, bottom }, .uv = .{ u_max, v_max }, .color = color };
         try self.vertices.appendSlice(self.allocator, &.{ tl, bl, tr, tr, bl, br });

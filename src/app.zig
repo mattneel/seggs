@@ -1251,9 +1251,11 @@ pub const App = struct {
         const terminal = if (self.terminal) |*terminal| terminal else return;
         const bounds = self.geometry.terminal;
         if (bounds.h <= 0 or bounds.w <= 0) return;
-        const colors = terminal.colors();
-        const background = rgbColor(colors.background);
-        const foreground = rgbColor(colors.foreground);
+        // The emulator owns the dock's colors; the editor's theme is the
+        // fallback for the case where it cannot answer at all.
+        const colors = terminal.colors() catch null;
+        const background = if (colors) |value| rgbColor(value.background) else theme.background;
+        const foreground = if (colors) |value| rgbColor(value.foreground) else theme.text;
         r.clip = bounds;
         try r.rect(bounds, background);
 
@@ -1296,7 +1298,15 @@ pub const App = struct {
                     // A grapheme's later codepoints are combining marks; the
                     // atlas maps codepoints, so the base is what it can draw.
                     const codepoint = std.math.cast(u21, cell.codepoints[0]) orelse continue;
-                    _ = try painter.r.glyphAt(x, y + painter.ascent, codepoint, cell_foreground);
+                    // The atlas holds one upright face, so italic is a lean and
+                    // bold is a second strike a fraction of a pixel across:
+                    // the usual shapes for a terminal with no second font.
+                    const baseline = y + painter.ascent;
+                    const lean: f32 = if (cell.style.italic) painter.ascent * 0.22 else 0;
+                    _ = try painter.r.glyphShearedAt(x, baseline, codepoint, cell_foreground, lean);
+                    if (cell.style.bold) {
+                        _ = try painter.r.glyphShearedAt(x + 0.6, baseline, codepoint, cell_foreground, lean);
+                    }
                 }
             }
         };
@@ -1309,7 +1319,7 @@ pub const App = struct {
             .line_height = self.line_height,
             .ascent = r.atlas.ascent,
             .foreground = foreground,
-            .palette = paletteColors(colors.palette, background),
+            .palette = if (colors) |value| paletteColors(value.palette, background) else paletteFallback(background),
         };
         try terminal.visitRows(&painter, Painter.visit);
 
@@ -1441,6 +1451,14 @@ pub const App = struct {
     /// take, minus the events.
     pub fn terminalInput(self: *App, bytes: []const u8) !void {
         try self.terminalText(bytes);
+    }
+
+    /// The palette a terminal with no emulator colors falls back on: the
+    /// editor's own, so the dock still reads as part of the window.
+    fn paletteFallback(fallback: theme.Color) [256]theme.Color {
+        var palette: [256]theme.Color = undefined;
+        for (&palette) |*entry| entry.* = fallback;
+        return palette;
     }
 
     fn rgbColor(value: ghostty.GhosttyColorRgb) theme.Color {

@@ -67,6 +67,23 @@ BASELINE_FIXTURE = "\n" + "H" * GLYPH_RUN + "\n" + "." * GLYPH_RUN + "\n"
 DOT_HEIGHT = 4  # device pixels a period may cover
 
 
+# The dock's frame region at the default window size: the terminal occupies the
+# editor's column below the text, and a shell's prompt is the first thing in it.
+DOCK_REGION = (250, 636, 740, 240)
+
+
+def count_ink(pixels: bytes, width: int, height: int, x0: int, y0: int, w: int, h: int) -> int:
+    """Pixels in a region that are brighter than the panel behind them."""
+    lit = 0
+    for y in range(y0, min(y0 + h, height)):
+        row = y * width * 3
+        for x in range(x0, min(x0 + w, width)):
+            i = row + x * 3
+            if pixels[i] > 100 and pixels[i + 1] > 100:
+                lit += 1
+    return lit
+
+
 def parse_ppm(path: Path) -> tuple[int, int, bytes]:
     data = path.read_bytes()
     parts = data.split(b"\n", 3)
@@ -613,7 +630,8 @@ def check_terminal(binary: str) -> None:
     keyboard takes, and reads the emulator's screen back: the shell's answer
     must appear there, which no single component could fake.
     """
-    command = display_command([binary, "--windowed", "--frames", "260", "--exercise-terminal"], app_env())
+    out = Path("/tmp/seggs-terminal.ppm")
+    command = display_command([binary, "--windowed", "--frames", "260", "--exercise-terminal", "--screenshot", str(out)], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     output = app_output(result)
     if TERMINAL_LINE.search(output) is None:
@@ -622,7 +640,12 @@ def check_terminal(binary: str) -> None:
             print(f"  {line}")
     require(TERMINAL_LINE.search(output) is not None, "the terminal did not carry the shell's answer")
     require(ATLAS_LINE.search(output) is not None, "the frame loop did not finish with the terminal open")
-    print("terminal: a real shell ran in the dock and its answer reached the screen")
+    # The dock is drawn, not just emulated: a screen that reads text back while
+    # the panel stays blank is the failure this check exists to catch.
+    width, height, pixels = parse_ppm(out)
+    dock = count_ink(pixels, width, height, *DOCK_REGION)
+    require(dock > 500, f"the terminal dock drew {dock} lit pixels; a shell in it should draw text")
+    print(f"terminal: a real shell ran in the dock, its answer reached the screen, and the dock drew {dock} lit pixels")
 
 
 def check_density(binary: str) -> None:

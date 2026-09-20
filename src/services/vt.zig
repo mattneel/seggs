@@ -112,10 +112,13 @@ pub const Terminal = struct {
         _ = g.ghostty_render_state_set(self.render, g.GHOSTTY_RENDER_STATE_OPTION_DIRTY, @ptrCast(&clean));
     }
 
-    pub fn colors(self: *Terminal) Colors {
-        self.colors_cache = std.mem.zeroInit(g.GhosttyRenderStateColors, .{});
+    /// The emulator's defaults. The struct is sized: the size field is what
+    /// tells the library which of its fields this build understands, so
+    /// leaving it zero makes the call fail and every color come back black.
+    pub fn colors(self: *Terminal) !Colors {
         var out = std.mem.zeroInit(g.GhosttyRenderStateColors, .{});
-        _ = g.ghostty_render_state_colors_get(self.render, @ptrCast(&out));
+        out.size = @sizeOf(g.GhosttyRenderStateColors);
+        try check(g.ghostty_render_state_colors_get(self.render, @ptrCast(&out)));
         self.colors_cache = out;
         var palette: [256]g.GhosttyColorRgb = undefined;
         for (&palette, 0..) |*entry, index| entry.* = out.palette[index];
@@ -163,11 +166,15 @@ pub const Terminal = struct {
                 if (count == max_cells) break;
                 var grapheme_len: u32 = 0;
                 _ = g.ghostty_render_state_row_cells_get(self.row_cells, g.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&grapheme_len));
+                // Sized structs again: the style is read through one, so the
+                // size must be set before the library will fill any of it.
                 var style = std.mem.zeroInit(g.GhosttyStyle, .{});
+                style.size = @sizeOf(g.GhosttyStyle);
+                const got_style = g.ghostty_render_state_row_cells_get(self.row_cells, g.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, @ptrCast(&style));
+                if (got_style != g.GHOSTTY_SUCCESS) style = std.mem.zeroInit(g.GhosttyStyle, .{});
                 if (grapheme_len != 0) {
                     const take = @min(grapheme_len, max_graphemes);
                     _ = g.ghostty_render_state_row_cells_get(self.row_cells, g.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&self.grapheme_storage[count]));
-                    _ = g.ghostty_render_state_row_cells_get(self.row_cells, g.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, @ptrCast(&style));
                     self.cell_storage[count] = .{ .codepoints = self.grapheme_storage[count][0..take], .style = style };
                 } else {
                     self.cell_storage[count] = .{ .codepoints = &.{}, .style = style };

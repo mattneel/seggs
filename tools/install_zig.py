@@ -43,7 +43,9 @@ def pinned_entry(key: str) -> dict:
             f"No pinned checksum for Zig {VERSION} on {key}. Download the archive from "
             f"https://ziglang.org/builds/, verify it, and add the sha256 to tools/zig-checksums.json."
         )
-    return {"tarball": f"https://ziglang.org/builds/zig-{key}-{VERSION}.tar.xz", "shasum": digest}
+    # Windows builds are published as ZIP archives; every other host as tar.xz.
+    extension = "zip" if key.endswith("-windows") else "tar.xz"
+    return {"tarball": f"https://ziglang.org/builds/zig-{key}-{VERSION}.{extension}", "shasum": digest}
 
 
 def install(destination: Path) -> None:

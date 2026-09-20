@@ -21,7 +21,9 @@ const Terminal = struct {
 
 pub const Client = struct {
     pub const State = enum { offline, initialize, new_session, ready, busy, cancelling, failed };
-    const Request = struct { id: u64, kind: enum { initialize, new_session, prompt, set_config }, deadline: u64 };
+    const Request = struct { id: u64, kind: enum { initialize, authenticate, new_session, prompt, set_config }, deadline: u64 };
+    /// An authentication method the harness says it accepts.
+    pub const AuthMethod = struct { id: []u8, name: []u8 };
     pub const Permission = struct { parsed: std.json.Parsed(rpc.Value) };
     const ConfigOption = struct {
         id: []u8,
@@ -44,6 +46,7 @@ pub const Client = struct {
     tool_events: usize = 0,
     terminals: std.StringArrayHashMapUnmanaged(*Terminal) = .empty,
     terminal_counter: usize = 0,
+    auth_methods: std.ArrayList(AuthMethod) = .empty,
 
     pub fn init(a: Allocator, preset: Agent, cwd: []const u8) Client {
         return .{ .allocator = a, .preset = preset, .cwd = preset.cwd orelse cwd };
@@ -52,6 +55,8 @@ pub const Client = struct {
     pub fn deinit(self: *Client) void {
         self.stop();
         self.transcript.deinit(self.allocator);
+        self.clearAuth();
+        self.auth_methods.deinit(self.allocator);
         self.clearConfig();
         self.config.deinit(self.allocator);
         if (self.last_error) |message| self.allocator.free(message);
@@ -101,6 +106,52 @@ pub const Client = struct {
         }));
         self.pending = .{ .id = id, .kind = .initialize, .deadline = c.SDL_GetTicks() + 30_000 };
         try self.append("\n[ACP] Initialize. Filesystem and isolated terminal capabilities advertised.\n");
+    }
+
+    /// Ask the harness for a session once authentication is done or unneeded.
+    fn beginSession(self: *Client) !void {
+        const next = self.next_id;
+        self.next_id += 1;
+        try self.sendOwned(try rpc.request(self.allocator, next, "session/new", .{ .cwd = self.cwd, .mcpServers = [0]struct {}{} }));
+        self.pending = .{ .id = next, .kind = .new_session, .deadline = c.SDL_GetTicks() + 60_000 };
+        self.state = .new_session;
+    }
+
+    fn beginAuthenticate(self: *Client, method: []const u8) !void {
+        const next = self.next_id;
+        self.next_id += 1;
+        try self.sendOwned(try rpc.request(self.allocator, next, "authenticate", .{ .methodId = method }));
+        self.pending = .{ .id = next, .kind = .authenticate, .deadline = c.SDL_GetTicks() + 120_000 };
+        self.state = .initialize;
+        try self.append("[ACP] Authenticating with ");
+        try self.append(method);
+        try self.append(".\n");
+    }
+
+    /// Remember the methods the harness accepts, so a login that needs a person
+    /// can be reported with the names the harness uses.
+    fn parseAuthMethods(self: *Client, result: rpc.Value) !void {
+        self.clearAuth();
+        const methods = rpc.field(result, "authMethods") orelse return;
+        if (methods != .array) return;
+        for (methods.array.items) |entry| {
+            const id = rpc.str(entry, "id");
+            if (id.len == 0 or id.len > 128) continue;
+            const name = rpc.str(entry, "name");
+            const owned_id = try self.allocator.dupe(u8, id);
+            errdefer self.allocator.free(owned_id);
+            const owned_name = try self.allocator.dupe(u8, if (name.len == 0) id else name);
+            errdefer self.allocator.free(owned_name);
+            try self.auth_methods.append(self.allocator, .{ .id = owned_id, .name = owned_name });
+        }
+    }
+
+    fn clearAuth(self: *Client) void {
+        for (self.auth_methods.items) |method| {
+            self.allocator.free(method.id);
+            self.allocator.free(method.name);
+        }
+        self.auth_methods.clearRetainingCapacity();
     }
 
     pub fn stop(self: *Client) void {
@@ -264,6 +315,16 @@ pub const Client = struct {
                 self.pending = null;
                 if (rpc.field(value, "error")) |agent_error| {
                     const message = rpc.str(agent_error, "message");
+                    if (pending.kind != .prompt and self.auth_methods.items.len != 0) {
+                        // A request that fails while the harness has named methods
+                        // is the case a login would settle.
+                        try self.append("\n[Authentication] The harness offers:");
+                        for (self.auth_methods.items) |method| {
+                            try self.append(" ");
+                            try self.append(method.id);
+                        }
+                        try self.append(".\n");
+                    }
                     if (pending.kind == .prompt) {
                         self.state = .ready;
                         if (self.permission != null) try self.answerPermission(false);
@@ -278,12 +339,17 @@ pub const Client = struct {
                     .initialize => {
                         const version = rpc.integer(rpc.field(result, "protocolVersion") orelse return error.ProtocolVersion) orelse return error.ProtocolVersion;
                         if (version != rpc.version) return error.ProtocolVersion;
-                        const next = self.next_id;
-                        self.next_id += 1;
-                        try self.sendOwned(try rpc.request(self.allocator, next, "session/new", .{ .cwd = self.cwd, .mcpServers = [0]struct {}{} }));
-                        self.pending = .{ .id = next, .kind = .new_session, .deadline = c.SDL_GetTicks() + 60_000 };
-                        self.state = .new_session;
+                        try self.parseAuthMethods(result);
+                        // A method named in the config is an explicit choice; a
+                        // harness that needs a login without one reports the
+                        // methods it offers instead of guessing.
+                        if (self.preset.auth) |method| {
+                            try self.beginAuthenticate(method);
+                        } else {
+                            try self.beginSession();
+                        }
                     },
+                    .authenticate => try self.beginSession(),
                     .new_session => {
                         const session = rpc.str(result, "sessionId");
                         if (session.len == 0 or session.len > 4096) return error.InvalidSession;

@@ -95,6 +95,36 @@ pub fn main(init: std.process.Init) !void {
     try require(clients[0].completed_turns == 2);
     std.log.info("PASS: three native ACP transports, stream isolation, permission rejection, cancellation, and session reuse", .{});
 
+    // Authentication: a method named in the configuration is used, and a
+    // harness that refuses the session reports the methods it accepts.
+    {
+        const auth_argv = [_][]const u8{ args[1], args[2], "--name", "auth", "--require-auth" };
+        var client = Client.init(a, .{ .id = "auth", .name = "Auth", .argv = &auth_argv, .auth = "mock-login" }, cwd);
+        defer client.deinit();
+        try client.start();
+        while (client.state == .initialize or client.state == .new_session) {
+            try require(c.SDL_GetTicks() < deadline);
+            client.pump();
+            c.SDL_Delay(2);
+        }
+        try require(client.state == .ready);
+        try require(contains(client.transcript.items, "Authenticating with mock-login"));
+        try require(client.session_id != null);
+
+        const bare_argv = [_][]const u8{ args[1], args[2], "--name", "bare", "--require-auth" };
+        var bare = Client.init(a, .{ .id = "bare", .name = "Bare", .argv = &bare_argv }, cwd);
+        defer bare.deinit();
+        try bare.start();
+        while (bare.state != .failed and bare.state != .ready) {
+            try require(c.SDL_GetTicks() < deadline);
+            bare.pump();
+            c.SDL_Delay(2);
+        }
+        try require(bare.state == .failed);
+        try require(contains(bare.transcript.items, "The harness offers: mock-login"));
+        std.log.info("PASS: a configured method authenticates, and a refused session names the methods the harness offers", .{});
+    }
+
     // Early exit: a process that terminates without completing the handshake
     // must transition the lane to FAILED instead of hanging on the deadline.
     const dead = [_][]const u8{ args[1], "-c", "import sys; sys.exit(7)" };

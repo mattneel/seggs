@@ -5,6 +5,10 @@ pub const Agent = struct {
     name: []const u8,
     argv: []const []const u8,
     cwd: ?[]const u8 = null,
+    /// The ACP authentication method to use for this agent. Empty means the
+    /// client does not authenticate on its own, and a harness that needs a
+    /// login reports the methods it offers instead.
+    auth: ?[]const u8 = null,
 };
 
 pub const Config = struct {
@@ -32,6 +36,10 @@ pub fn validate(config: Config) !void {
         for (agent.argv) |arg| {
             if (arg.len > 16 * 1024) return error.InvalidAgent;
             for (arg) |byte| if (byte == 0) return error.InvalidAgent;
+        }
+        if (agent.auth) |auth| {
+            if (auth.len == 0 or auth.len > 128) return error.InvalidAgent;
+            for (auth) |byte| if (byte < 33 or byte > 126) return error.InvalidAgent;
         }
         if (agent.cwd) |cwd| {
             if (!std.fs.path.isAbsolute(cwd)) return error.AbsoluteCwdRequired;

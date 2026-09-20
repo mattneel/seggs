@@ -1,5 +1,8 @@
 {
     "0.17.0-dev.1970+67f39b551": {
-        "x86_64-linux": "878323a2abafc101741ce48f6af9832177269f6c3261ccc1d2272db5d1a83ab2"
+        "x86_64-linux": "878323a2abafc101741ce48f6af9832177269f6c3261ccc1d2272db5d1a83ab2",
+        "x86_64-windows": "c0bd8afcd58ef7d066c47a09a79de42c91a57efa973b5a096c3926f47e36d5d0",
+        "aarch64-macos": "0b8cf47f4042a1a043d3eafe1baf6b12f3c344e08fc0577434b9f028012af01d",
+        "x86_64-macos": "6e6131f80b92b5e47c454e2c5f2dd697c12634eaa5c10eff31c81ebd29b6330b"
     }
 }

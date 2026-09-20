@@ -29,8 +29,11 @@ class Turn:
 
 
 class MockAgent:
-    def __init__(self, name: str, fragment: int, delay: float, output: BinaryIO) -> None:
+    def __init__(self, name: str, fragment: int, delay: float, output: BinaryIO, require_auth: bool = False) -> None:
         self.name = name
+        self.require_auth = require_auth
+        self.auth_method = "mock-login"
+        self.authenticated = False
         self.fragment = fragment
         self.delay = delay
         self.output = output
@@ -100,8 +103,24 @@ class MockAgent:
                 "protocolVersion": 1,
                 "agentInfo": {"name": "seggs-mock", "title": self.name, "version": "0.1.0"},
                 "agentCapabilities": {"loadSession": False, "promptCapabilities": {"image": False, "audio": False, "embeddedContext": False}},
-                "authMethods": [],
+                "authMethods": (
+                    [{"id": self.auth_method, "name": "Mock login", "description": "The mock accepts its own method"}]
+                    if self.require_auth
+                    else []
+                ),
             })
+        elif method == "authenticate":
+            if not self.initialized:
+                self.error(request_id, -32600, "Initialize first")
+                return
+            if not isinstance(params.get("methodId"), str):
+                self.error(request_id, -32602, "methodId is required")
+                return
+            if params["methodId"] != self.auth_method:
+                self.error(request_id, -32602, "Unknown authentication method")
+                return
+            self.authenticated = True
+            self.result(request_id, {})
         elif method == "session/new":
             if not self.initialized:
                 self.error(request_id, -32600, "Initialize first")
@@ -109,6 +128,9 @@ class MockAgent:
             cwd = params.get("cwd", "")
             if not isinstance(cwd, str) or not os.path.isabs(cwd) or not isinstance(params.get("mcpServers"), list):
                 self.error(request_id, -32602, "Absolute cwd and an mcpServers array are required")
+                return
+            if self.require_auth and not self.authenticated:
+                self.error(request_id, -32000, f"Authentication required: {self.auth_method}")
                 return
             self.serial += 1
             session = f"mock-{os.getpid()}-{self.serial}"
@@ -274,10 +296,11 @@ def main() -> int:
     parser.add_argument("--name", default="local")
     parser.add_argument("--fragment", type=int, default=0, help="Maximum bytes per stdout write")
     parser.add_argument("--delay", type=float, default=0.01, help="Delay between text chunks")
+    parser.add_argument("--require-auth", action="store_true", help="Refuse a session until the client authenticates")
     args = parser.parse_args()
     if not 0 <= args.fragment <= 65536 or not 0 <= args.delay <= 1:
         parser.error("Invalid fragment size or delay")
-    agent = MockAgent(args.name, args.fragment, args.delay, sys.stdout.buffer)
+    agent = MockAgent(args.name, args.fragment, args.delay, sys.stdout.buffer, args.require_auth)
     try:
         while not agent.closed.is_set():
             line = sys.stdin.buffer.readline(MAX_FRAME + 2)

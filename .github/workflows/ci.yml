@@ -52,6 +52,10 @@ jobs:
           # esbuild is a development dependency, so the bundles need it installed.
           npm ci --prefix extensions --no-audit --no-fund
           node extensions/build.mjs
+      - name: The editor runs and reports
+        env:
+          SDL_VIDEODRIVER: x11
+        run: xvfb-run -a zig build run -- --windowed --frames 2 2>&1 | tail -20
       - name: Screenshot comparison
         env:
           SDL_VIDEODRIVER: x11

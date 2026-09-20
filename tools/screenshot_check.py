@@ -189,8 +189,10 @@ def atlas_coverage(binary: str, fixture: str) -> tuple[int, int]:
     result = subprocess.run(command, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
     if result.returncode != 0 or ATLAS_LINE.search(result.stderr) is None:
         # The run's own output is the only thing that explains a missing line.
-        print("coverage run exit " + str(result.returncode))
-        print("\n".join(result.stderr.splitlines()[-12:]))
+        print(f"coverage run exit {result.returncode}, stdout {len(result.stdout)} bytes, stderr {len(result.stderr)} bytes")
+        for name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+            for line in stream.splitlines()[-8:]:
+                print(f"  {name}: {line}")
     require(result.returncode == 0, f"the app exited {result.returncode} for {path.name}")
     match = ATLAS_LINE.search(result.stderr)
     require(match is not None, "the app did not report atlas coverage")

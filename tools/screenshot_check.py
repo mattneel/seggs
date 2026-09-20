@@ -150,6 +150,15 @@ def compare(a: tuple[int, int, bytes], b: tuple[int, int, bytes]) -> None:
     )
 
 
+def app_output(result: subprocess.CompletedProcess) -> str:
+    """The app's log, in whichever stream the display wrapper used.
+
+    Without a display the gate runs the app through `xvfb-run`, which merges the
+    command's stderr into stdout, so the same lines arrive on the other stream.
+    """
+    return (result.stdout or "") + (result.stderr or "")
+
+
 def app_env() -> dict:
     env = dict(os.environ)
     env.setdefault("SDL_VIDEODRIVER", "x11")
@@ -186,15 +195,15 @@ def atlas_coverage(binary: str, fixture: str) -> tuple[int, int]:
     command = [binary, "--file", str(path), "--windowed", "--frames", "2"]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    if result.returncode != 0 or ATLAS_LINE.search(result.stderr) is None:
+    result = subprocess.run(command, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    if result.returncode != 0 or ATLAS_LINE.search(app_output(result)) is None:
         # The run's own output is the only thing that explains a missing line.
-        print(f"coverage run exit {result.returncode}, stdout {len(result.stdout)} bytes, stderr {len(result.stderr)} bytes")
-        for name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+        print(f"coverage run exit {result.returncode}, stdout {len(result.stdout)} bytes, stderr {len(app_output(result))} bytes")
+        for name, stream in (("stdout", result.stdout), ("stderr", app_output(result))):
             for line in stream.splitlines()[-8:]:
                 print(f"  {name}: {line}")
     require(result.returncode == 0, f"the app exited {result.returncode} for {path.name}")
-    match = ATLAS_LINE.search(result.stderr)
+    match = ATLAS_LINE.search(app_output(result))
     require(match is not None, "the app did not report atlas coverage")
     return int(match.group(1)), int(match.group(2))
 
@@ -235,11 +244,11 @@ def check_text_scale(binary: str) -> None:
     command = [binary, "--file", str(fixture), "--windowed", "--frames", "4", "--screenshot", str(out)]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, check=True, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    diagnostics = [line for line in result.stderr.splitlines() if "Validation Error" in line or "VUID" in line]
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    diagnostics = [line for line in app_output(result).splitlines() if "Validation Error" in line or "VUID" in line]
     require(not diagnostics, f"the run reported {len(diagnostics)} Vulkan validation error(s): {diagnostics[0] if diagnostics else ''}")
-    require("leaked" not in result.stderr, "the run leaked memory at shutdown")
-    metrics = METRICS_LINE.search(result.stderr)
+    require("leaked" not in app_output(result), "the run leaked memory at shutdown")
+    metrics = METRICS_LINE.search(app_output(result))
     require(metrics is not None, "the app did not report its atlas metrics")
     advance = float(metrics.group(1))
     width, height, pixels = parse_ppm(out)
@@ -303,8 +312,8 @@ def check_baseline(binary: str) -> None:
     command = [binary, "--file", str(fixture), "--windowed", "--frames", "4", "--screenshot", str(out)]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, check=True, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    metrics = METRICS_LINE.search(result.stderr)
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    metrics = METRICS_LINE.search(app_output(result))
     require(metrics is not None, "the app did not report its atlas metrics")
     advance = float(metrics.group(1))
     pitch = float(metrics.group(2))
@@ -402,12 +411,12 @@ def check_ime(binary: str) -> None:
     command = [binary, "--windowed", "--frames", "9", "--exercise-ime", "--screenshot", str(out)]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, check=True, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    compositions = IME_COMPOSITION.findall(result.stderr)
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    compositions = IME_COMPOSITION.findall(app_output(result))
     require(len(compositions) >= 2, f"expected two compositions, saw {len(compositions)}")
     require(compositions[0] == ("7", "2", "5"), f"first composition reported {compositions[0]}, expected 7 cells with selection 2..5")
     require(compositions[1] == ("4", "1", "3"), f"second composition reported {compositions[1]}, expected 4 cells with selection 1..3")
-    commit = IME_COMMIT.search(result.stderr)
+    commit = IME_COMMIT.search(app_output(result))
     require(commit is not None, "the run did not report a commit")
     inserted = int(commit.group(2)) - int(commit.group(1))
     require(inserted == 7, f"the commit inserted {inserted} byte(s), expected 7")
@@ -427,22 +436,22 @@ def check_panel(binary: str) -> None:
     command = [binary, "--windowed", "--frames", "22", "--exercise-click"]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, check=True, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    loaded = EXTENSION_LINE.search(result.stderr)
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    loaded = EXTENSION_LINE.search(app_output(result))
     require(loaded is not None, "the extension host reported no extensions")
     require(int(loaded.group(1)) >= 2, f"only {loaded.group(1)} extension(s) loaded, expected the panel and status bundles")
-    click = PANEL_CLICK.search(result.stderr)
+    click = PANEL_CLICK.search(app_output(result))
     require(click is not None, "a click on an extension panel did not reach a handler")
     # The run then presses Tab and Enter, and clicks an explorer row and a lane.
     # Between them the two kinds of request an extension can make are covered:
     # one the editor applies to the document, one it applies to an agent.
-    opened = EDITOR_OPEN.search(result.stderr)
+    opened = EDITOR_OPEN.search(app_output(result))
     require(opened is not None, "an explorer row did not open a file")
-    action = AGENT_ACTION.search(result.stderr)
+    action = AGENT_ACTION.search(app_output(result))
     require(action is not None, "a lane click did not reach the editor as an agent action")
     # And a pointer moving over a row, which panels use to respond before a
     # click. It is dispatched only when the node under the pointer changes.
-    hover = HOVER_LINE.search(result.stderr)
+    hover = HOVER_LINE.search(app_output(result))
     require(hover is not None, "moving the pointer over a panel reached no handler")
     print(
         f"panel: {loaded.group(1)} extension(s) loaded, click reached panel {click.group(1)}, "
@@ -532,10 +541,10 @@ def check_narrow(binary: str) -> None:
     command = [binary, "--windowed", "--window-size", "860x600", "--frames", "22", "--exercise-click"]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, check=True, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    loaded = EXTENSION_LINE.search(result.stderr)
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    loaded = EXTENSION_LINE.search(app_output(result))
     require(loaded is not None and int(loaded.group(1)) >= 5, "the extensions did not load at a narrow width")
-    action = APP_ACTION.search(result.stderr)
+    action = APP_ACTION.search(app_output(result))
     require(action is not None, "a panel stopped taking events at a narrow width")
     print(f"narrow: {loaded.group(1)} extension(s) at 860x600, rail handled {action.group(1)}")
 
@@ -551,13 +560,13 @@ def check_window_transitions(binary: str) -> None:
     command = [binary, "--windowed", "--frames", "9", "--exercise-window"]
     if not os.environ.get("DISPLAY") and shutil.which("xvfb-run"):
         command = ["xvfb-run", "-a", *command]
-    result = subprocess.run(command, check=True, env=app_env(), capture_output=True, text=True, timeout=RUN_TIMEOUT)
-    require(ATLAS_LINE.search(result.stderr) is not None, "the frame loop did not finish after the transitions")
-    steps = WINDOW_LINE.findall(result.stderr)
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    require(ATLAS_LINE.search(app_output(result)) is not None, "the frame loop did not finish after the transitions")
+    steps = WINDOW_LINE.findall(app_output(result))
     require(len(steps) >= 3, f"expected three transitions, saw {len(steps)}")
     resized = [step for step in steps if (int(step[1]), int(step[2])) == RESIZE_TARGET]
     require(resized, f"the resize to {RESIZE_TARGET[0]}x{RESIZE_TARGET[1]} never reached the window")
-    refused = re.findall(r"(\w+) refused:", result.stderr)
+    refused = re.findall(r"(\w+) refused:", app_output(result))
     print(
         f"window: {len(steps)} transitions exercised, resize reached "
         f"{RESIZE_TARGET[0]}x{RESIZE_TARGET[1]}, refusals: {refused or 'none'}"

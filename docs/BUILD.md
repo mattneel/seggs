@@ -19,7 +19,7 @@ Install the packages on an Ubuntu or Debian development system.
 sudo apt-get update
 sudo apt-get install -y \
   build-essential cmake git pkg-config python3 \
-  libfreetype6-dev libx11-dev libxext-dev libxrandr-dev \
+  libfreetype6-dev libtinyxml2-dev libx11-dev libxext-dev libxrandr-dev \
   libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxrender-dev \
   libxtst-dev glslang-tools libvulkan-dev mesa-vulkan-drivers \
   vulkan-validationlayers fonts-dejavu-core fonts-wqy-zenhei
@@ -48,7 +48,7 @@ xcode-select --install
 Install the build dependencies through Homebrew.
 
 ```sh
-brew install cmake pkg-config freetype
+brew install cmake pkg-config freetype tinyxml2
 ```
 
 The macOS path embeds Metal source and does not need glslangValidator.
@@ -78,7 +78,14 @@ The installer refuses to replace an existing destination.
 
 The bootstrap uses release tags and records their resolved commits in `.deps/resolved.json`.
 It refuses a modified tracked source checkout.
-The build still depends on system FreeType and driver versions.
+MicroTex, the TeX engine display math is drawn with, is fetched by the bootstrap
+and compiled by `build.zig` rather than built by its own CMake: that CMake
+requires gtkmm or Qt on Linux, and the library requires neither. It is not a
+submodule and not a vendored copy - `.deps/MicroTex` is ignored, like the other
+pins - so a bootstrap run is what puts it there. Its one system dependency is
+tinyxml2, alongside the C++17 compiler.
+
+The build still depends on system FreeType, tinyxml2, and driver versions.
 It is not a hermetic dependency lock.
 
 ## Existing SDL installation

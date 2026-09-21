@@ -76,16 +76,37 @@ The prompt supports append, backspace, and paste, not a complete cursor model.
 ## Transcript and liveness
 
 The transcript reads Markdown, not a Markdown implementation: headings,
-bullets, quotes, rules, fenced code, and the four inline runs, with a line it
-does not recognise kept verbatim as a paragraph rather than dropped. Tables,
-links, images, and nested block structure are not read as such. Inline bold and
-italic are parsed and their markers taken off, but the text is drawn plain,
-because the atlas holds one face - as with a theme's `fontStyle`, weight and
-slant are not faked with colour. A fenced block goes through the editor's own
-tokenizer for the languages it knows (Zig, C and C++, Python, JavaScript and
-TypeScript); any other language draws as plain text rather than wrongly. A
-message over a megabyte, or one that would produce more than 4096 blocks, is
-refused by name and shown wrapped instead of styled.
+bullets (an ordered item keeps the number it was written with), quotes, rules,
+fenced code, tables, math, and the inline runs, with a line it does not
+recognise kept verbatim as a paragraph rather than dropped. Images are not read,
+and nested block structure is flattened. Inline bold and italic are parsed and
+their markers taken off, but the text is drawn plain, because the atlas holds
+one face - as with a theme's `fontStyle`, weight and slant are not faked with
+colour. A table whose columns together ask for more than the panel has is drawn
+as the source it was written as rather than shredded across the dock. A fenced
+block goes through the editor's own tokenizer for the languages it knows (Zig, C
+and C++, Python, JavaScript and TypeScript); any other language draws as plain
+text rather than wrongly. A message over a megabyte, or one that would produce
+more than 4096 blocks, is refused by name and shown wrapped instead of styled.
+
+Three of those are read and not fully drawn, and that is a deliberate floor
+rather than an oversight. **Display math is typeset and inline math is not**: a
+formula on lines of its own is laid out by the TeX engine and drawn as the
+mathematics it is, while a formula inside a sentence draws as the LaTeX that was
+written. The reference's inline conversion is a table of some six hundred
+commands, and the inline case is where a half-converted formula would show. A
+display formula the engine declines to lay out falls back to the same source, so
+mathematics never costs the reader the text. A formula is set at the size of the
+surrounding text rather than at a size the engine chose, because the glyphs come
+from the atlas; and a filled shape wider than its panel is dropped only when it
+falls wholly outside it, so the drawing primitives reject at the clip edge where
+the glyph path clips exactly. **A link's address is shown but is not
+clickable** - the pointer is wired for chips and folds, not for prose runs, so
+the address is drawn beside its words and left as text. **A strikethrough is
+carried by colour and not by a line through the words**, because the atlas has
+one face and nothing to draw a rule with; a struck run is drawn in the muted
+role, which is honest about it not being body text without pretending to be a
+decoration.
 
 A call's chip is one line: its title and subject are bounded and elided, so a
 chip says what the call was rather than everything it carried - the fields
@@ -114,13 +135,55 @@ Missing ACP features include:
 - Session resume, and choosing an authentication method from the interface: a
   preset may name the method to use, and a harness that needs a login has the
   methods it offers reported rather than a prompt that asks which one.
-- Image, audio, and embedded resource prompts.
+- Content types the panel does not draw. Of ACP's six - `text`, `image`,
+  `audio`, `resource`, `resource_link` - `text` is drawn as prose and `image` is
+  drawn as a picture; audio, embedded resources and resource links are not read
+  as such. Only `image` is advertised as a prompt capability, so a prompt
+  carries no audio or embedded context; the same rule as everywhere else applies
+  to output, where a part that cannot be drawn says what it was rather than
+  vanishing.
+- Pictures an agent sends are bounded, and the bounds are what a reader meets
+  when one is refused. A payload is kept whole only up to 2 MiB after base64 is
+  taken off, an image is decoded only up to 4 MP with no side past 4096 (a
+  decompression bomb is refused from its header, before anything is inflated),
+  and no picture is enlarged: one wider than the dock is scaled down to fit it
+  and one smaller is drawn at its own size, with the height capped at twenty
+  rows of the panel. Each refusal is named on the line the picture would have
+  occupied - the mime type, the size, and which bound it met - because "an image
+  was dropped" is not something a reader can act on. A picture is decoded on the
+  frame that first shows it; the renderer keeps pictures up to 8 MP in all,
+  evicting the least recently drawn, and a session that scrolls past more than
+  that re-decodes rather than holding them. A GIF is drawn as its first frame,
+  because one picture is drawn where the part arrived and an animation is not
+  that. Pictures travel in one direction: the client accepts an image an agent
+  sends and draws it, and nothing in the editor attaches one to a prompt.
+- A tool call's embedded `terminal` content is drawn, with one bound worth
+  naming: the screen is shown at most twelve rows tall, whatever the terminal's
+  own height, because a terminal as tall as the panel would push everything else
+  out of the transcript. The screen is still a real terminal - it keeps its own
+  scrollback and is sized to the panel's width - so the bound is on what is
+  drawn rather than on what is kept. The output stays on screen after the agent
+  releases the terminal, which is what the protocol asks for: the client's record
+  is freed by `terminal/release`, and the editor keeps the screen it parsed, so
+  the display does not depend on the process still existing.
+- The optional programmatic tool `name` is read where a call's `kind` says
+  nothing, and shaping uses it through a small table of words a tool name is
+  built from (`read`, `write`, `bash`, `grep`, and the like), matched on whole
+  tokens rather than substrings. A name built from none of those words gets the
+  generic card: a tool whose name is a house word rather than a common one is
+  drawn plainly rather than shaped, which is the honest outcome of not knowing
+  what it is. The table is deliberately short - a long one would be a guess about
+  other people's naming, and a wrong shape is worse than a plain card.
 - A config-option selector UI (the client parses and sets `configOptions` but does not render a selector).
-- Tool-specific rich renderers. A tool call is drawn as a chip with its fields
-  and its diff, and the review surface lists proposed changes, but neither knows
-  what a particular tool's output means; and the ACP client does not route agent
-  edits into the review queue, so what is waiting there came from a test, a gate,
-  or the person.
+- Tool-specific rich renderers beyond a handful of shapes. A call is drawn
+  through a registry that binds a tool's kind to one of five shapes - a file, a
+  change, a command, a search, or the generic card - so a read shows its path, a
+  command its exit code and its output, and an edit its diff, while a kind no
+  shape knows gets the generic card rather than a dump of its JSON. What is
+  missing is a renderer for one tool's own semantics: the shapes are shared, so
+  a tool whose output means something no shape covers is drawn plainly rather
+  than wrongly. The ACP client also does not route agent edits into the review
+  queue, so what is waiting there came from a test, a gate, or the person.
 - Remote transports and extension-specific RPC methods.
 
 Permissions apply only to requests that a harness exposes through ACP.
@@ -142,8 +205,10 @@ face would look better, and none ships with the repository. Inverse and
 underline are drawn. A grapheme's first codepoint is drawn and its combining
 marks are not, because the atlas maps codepoints rather than shaped runs.
 
-Kitty graphics is parsed by the library and not drawn: the renderer would need
-image decoding and a texture path it does not have. The scrollbar is drawn
+Kitty graphics is parsed by the library and not drawn. The renderer has the path
+a terminal image would use - a picture is decoded, uploaded and drawn in the
+transcript - but nothing wires a terminal's graphics protocol to it, so a
+program that draws in the terminal still draws nothing there. The scrollbar is drawn
 only when there is history behind the viewport, and it is the editor's shape
 rather than the program's: a terminal that sets an unusual scrollbar style gets
 the plain one. Page Up and Page Down go to the program rather than to

@@ -17,6 +17,9 @@ with the files and terminals they ask for.
   proposed edits, and permission requests that are explicit and one-shot.
 - Renders the transcript as Markdown, with a fenced diff drawn as a diff and tool
   calls drawn as chips where they happened, each opening to its fields and diff.
+- Draws a displayed formula as the mathematics it is, typeset by a TeX engine
+  rather than left as backslashes, and falls back to the source when the engine
+  will not read it.
 - Runs shells in a dock of tabs beside the editor: every dock resizes by dragging
   its divider, and one widget draws every list the interface opens.
 - Repaints the whole interface, the terminal, and syntax colouring from a theme
@@ -27,6 +30,9 @@ with the files and terminals they ask for.
   breakpoints, and Git for status and diffs.
 - Draws its own interface, which extensions replace region by region without a
   restart.
+- Writes a frame to a file in any of five image formats, and can drive itself to
+  the state a reader would reach first, so what it looks like is checkable
+  without a person in front of it.
 
 ## Where to start
 

@@ -7,7 +7,7 @@ The application targets **Zig 0.17.0**, **SDL3**, and the **SDL3 GPU API**.
 ACP connects independent agent processes to the right-hand panel.
 
 > **Scaffold status:** The repository contains implementation code, not a production IDE.
-> Native compilation, the core tests (121), the native tests (105), and the ACP transport test now pass on Linux (Zig 0.17.0, SDL3).
+> Native compilation, the Zig test suite (304 declared tests), and the ACP transport test now pass on Linux (Zig 0.17.0, SDL3).
 > The GPU path renders under software Vulkan (lavapipe); hardware GPU execution remains unverified.
 > The Python fixture suite passed 11 tests.
 > See [validation](docs/VALIDATION.md) and [limitations](docs/LIMITATIONS.md).
@@ -22,12 +22,14 @@ ACP connects independent agent processes to the right-hand panel.
 | Workspace | Bounded explorer, quick open, command palette, one active file, external-change check before save |
 | Themes | A theme document, or an imported TextMate `.tmTheme` or VS Code colour theme, sets the chrome, the terminal palette, and syntax colouring |
 | Transcript | Markdown prose, fenced diffs in the theme's diff colours, and tool calls as chips placed where they happened, openable to their fields and diff |
+| Display math | A formula the agent wrote is typeset by a TeX engine and drawn as the mathematics it is, in either the one-line or the opened-and-closed form; a formula the engine refuses falls back to its source rather than disappearing |
 | ACP | JSON-RPC over newline-delimited stdio, initialization, new sessions, prompts, text/tool/plan updates, cancellation |
 | Parallel agents | Up to eight independent processes, per-agent state, separate transcripts, one destination per request |
 | Permissions | Explicit one-time approval or rejection, no automatic approval, bounded pending requests |
 | Capabilities | Editor-backed filesystem reads and writes, plus client-owned terminals with explicit process ownership and bounded output |
 | Integrations | Oh-My-Pi, Codex ACP adapter, Claude ACP adapter, custom argv, local mock |
 | Languages | Optional language server: diagnostics in the gutter, F12 definition, Shift+F12 references, Ctrl+I hover; prompts attach the selection and diagnostics |
+| QA capture | `--screenshot PATH` writes the last frame in the format the extension names, and `--exercise-NAME` drives a path to the state a person would reach before the capture. `--help` lists both |
 | Terminal | Tabs in a dock below the editor, one shell each, emulated by libghostty-vt: open, close, reorder, and switch; the shells this machine offers read from `/etc/shells`; scrollback with reflow on resize, 24-bit and palette color, inverse and underline styles, the Kitty keyboard protocol, mouse tracking and reporting formats, focus events, bracketed paste, and input encoded from the terminal's own modes |
 | SeggsC | Extensions describe interface as data, take events, and ask the editor to act; each bundle runs in a context of its own and reloads while the editor runs |
 | Layout | Yoga lays out interface an extension describes, sized from the cell metrics so a font or density change moves the chrome with the text, and every dock resizes by dragging its divider |

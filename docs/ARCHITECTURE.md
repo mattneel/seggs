@@ -77,6 +77,23 @@ Each vertex contains position, texture coordinates, and color.
 The glyph atlas also contains a white texel for solid rectangles.
 A frame uploads the stream through a transfer buffer and submits one graphics pass.
 
+Pictures are the one thing that samples a different texture, and they do not get a
+second pipeline. The renderer keeps **segments** - a texture, the first vertex and
+how many - beside the stream: a quad sampling the texture the current segment
+samples extends it, and one sampling a different texture opens a new segment,
+drawn with the same pipeline, vertex format and shader after rebinding the
+sampler. With no picture on screen there is exactly one segment, so a frame of text
+takes the path it always took.
+
+The glyph atlas was the first idea for holding one and it was rejected for a reason
+worth keeping: `Atlas.glyphFor` answers a full atlas with the `?` placeholder and
+never evicts, so an image taking the room a run of text needs would land the
+failure on **every glyph on screen** rather than on the picture, and permanently.
+One texture per picture instead, under a pixel budget across the set of them -
+counted, evicted least-recently-drawn first, and refused by name when one picture
+is larger than the whole space - so the cap is a real limit on GPU memory rather
+than a packing-capacity cliff.
+
 Linux and Windows use SPIR-V from the GLSL sources.
 The fragment sampler occupies set 2, binding 0, as SDL's Vulkan shader contract requires.
 macOS uses the corresponding Metal source.
@@ -161,6 +178,21 @@ exist because those are the themes people already have; neither is complete, and
 theme that fails to parse leaves the last good one in place and says why - and
 `themes/monokai.json` is the shipped example.
 
+`themes/catalog/` is the Shiki collection vendored whole: 65 files at a pinned
+commit, each checked byte-for-byte against the upstream blob hash rather than by
+name, with the licences recorded in [SOURCES](SOURCES.md) - a catalog is other
+people's work and the repository should say whose. It is read by
+`src/ui/theme_catalog.zig`, which scans the directory into rows **without parsing
+anything**: the cost of the list is 65 stats and 65 head reads rather than 65
+parses, and a row's label comes from the file name for exactly that reason, with
+the few names that differ from the theme's own `displayName` accepted as the
+price. A theme is loaded only when a row is chosen, which is what makes a preview
+affordable. `src/ui/theme_picker.zig` holds the switcher's state - the filtered
+rows, the selection, and the three things a picker can do: preview the row the
+pointer is on, put the previous theme back on Escape, and take the chosen one on
+Enter. Applying repaints what is **already drawn** and not only what comes after,
+which is why the preview and the commit take the same path.
+
 Syntax colouring reaches a theme through named roles rather than through literal
 scopes: `src/editor/highlight.zig` classifies a token and answers with
 `comment`, `string.quoted`, `keyword.control`, `constant.numeric`, or
@@ -243,14 +275,47 @@ draw the same words on any machine and the drawing allocates nothing per frame.
 
 ## Transcript
 
-An agent's prose is Markdown, and the panel renders it: headings, bullets,
-quotes, rules, fenced code, and inline runs. A fenced block that reads as a
+An agent's prose is Markdown, and the panel renders it: headings, bullets (an
+ordered item keeps the number it was written with), quotes, rules, fenced code,
+tables, formulas, and the inline runs - plain, bold, italic, code, struck, links,
+and math. A fenced block that reads as a
 unified diff is drawn as one, in the theme's added and removed colours; any other
 fence goes through the editor's own tokenizer with the language the fence names,
 so a transcript and the file beside it colour code the same way. A document the
 parser refuses - it is bounded in both bytes and blocks, because the text comes
 from a process the editor does not control - is wrapped and drawn plainly and
 reported once, since a transcript that cannot be styled is still a transcript.
+
+Three things are read and deliberately not drawn in full, because the alternative
+is a lie rather than a layout. A table whose columns together ask for more than
+the panel has is drawn as the source it was written as - the agent's own pipes,
+wrapped - because a table shredded across a forty-column dock is not a table. A
+formula is drawn as the LaTeX that was written, in a role of its own: we do not
+typeset it, and a half-converted formula is worse than the source. A struck run
+carries a rule through it, because the atlas has one face and no decoration to
+draw one with, and a retraction a reader has to read twice is one they will miss.
+A link records where its words landed so a click can open it: the pointer here is
+ours rather than a terminal's, which is the one place a link can be a target
+instead of an escape sequence.
+
+A content part that is not words is kept rather than counted. An image is decoded
+under two caps decided differently on purpose: the payload, from its base64 length
+**before anything is allocated**, because that is what stops a part allocating its
+way past the bound; and the decoded pixels, from the header **before anything is
+inflated**, because a small file decodes to a bitmap far larger than the file. The
+format comes from the bytes rather than from the declared mime - a part claiming
+`image/jpeg` over a PNG decodes as a PNG and keeps the claim it made - and a part
+that cannot be drawn gets a row naming what it was and which bound it met.
+"Not base64", "a mime type this client does not read", "past the payload cap",
+"not one of the four formats", "past the decode cap" and "not decodable" are six
+different facts, and a reader is owed the one that applies rather than a single
+counter that says something happened.
+
+Markdown is drawn by the same walk that draws the calls, and each row remembers
+the block kind that produced it. The panel keeps a census of the rows it put on
+the screen by kind, which the screenshot gate reads - so "the table arm draws" is
+a number rather than a claim, and an arm that stops drawing is a count of zero
+rather than a missing line someone has to notice.
 
 Tool calls are records rather than text. `src/acp/tool_call.zig` parses an update
 into a call with a kind, a state, a one-line subject, labelled fields, an
@@ -267,6 +332,38 @@ lane and the agent's own id for the call, because the record itself is replaced
 as the call progresses and two lanes can name a call the same thing. A call that
 cannot be parsed at all still leaves its title as a line of text, since a call
 that happened should not vanish because its shape was wrong.
+
+What a call is drawn *as* is decided next door, in `src/ui/tools/`. ACP gives a
+call one of ten kinds, and the registry binds each to one of five shapes - a
+file, a change, a command, a search, or the generic card - so a read shows its
+path, a command its exit code and its output, and an edit its diff, while a kind
+no shape knows gets the generic card rather than a dump of its JSON. The shapes
+are shared and their differences are configuration, so two tools of one shape are
+two rows of a binding table rather than two files, and `cardFor` never fails: a
+call the interface cannot afford to dress gets a plain card rather than none,
+because a transcript that cannot draw a call is worse than one that draws it
+plainly. `src/ui/tool_card.zig` holds the vocabulary every card is built from - a
+status line, sections with bars, a framed-or-plain variant, and a plan of what a
+section costs in display rows and what it withheld - and `src/ui/tool_call.zig` is
+the drawer that turns a card into pixels and nothing else. A card spends its
+budget in display rows only on what is drawn, and counts what it withheld without
+laying anything out, so a shut card costs what its preview costs rather than what
+its payload does.
+
+What an agent announces rather than says is drawn as records too.
+`src/acp/stream.zig` holds the text that arrives in pieces - reasoning, the
+user's own words, and the summary a compaction leaves - as one record per
+contiguous run, placed where the run began, because a model reasons in hundreds
+of chunks and a transcript with hundreds of entries for one thought is not a
+transcript. `src/acp/plan.zig` holds a plan that replaces itself rather than
+appending, and `src/acp/session_state.zig` holds what a session is: the context
+and cost, the mode, its name, the commands it takes, and the last compaction.
+They are drawn by `src/ui/stream_card.zig`, `plan_card.zig`, `usage_card.zig` and
+`session_cards.zig`; which runs the reader has opened lives in
+`src/ui/folds.zig`, keyed by the handle the client gave the run, because a run has
+no agent id of its own and an offset moves when the transcript drops its front.
+`src/acp/limits.zig` holds the one bounded-value helper those readers share, so a
+bound is stated once rather than three times slightly differently.
 
 Exporting a lane writes the prose and then a `[Calls]` trailer: one line per
 call, its kind in brackets, its state, and its subject, in arrival order.
@@ -307,6 +404,32 @@ shows hover. A minimal DAP client (`src/services/dap.zig`) uses the same
 framing to launch a debug session, observe the stopped event, read the stack
 trace and variables, and resume with continue or step. A PTY service
 (`src/services/pty.zig`) forks a shell onto a pseudo-terminal (POSIX only).
+Display mathematics is the one place the transcript draws something that is not
+text, and it is drawn by a TeX engine rather than approximated. `src/ui/markdown.zig`
+already parses a formula into a block of its own, in either form an agent writes
+it - `$$x$$` on a line, or `$$` and `$$` opened and closed separately - and
+`src/ui/math.zig` takes that body to MicroTex, which lays out atoms, boxes and
+glue and then draws through its own abstract `Graphics2D`. That interface is
+where the editor takes over: `src/ui/microtex_shim.cpp` implements it, and every
+call it receives - a colour, a line, a filled box, a run of text - arrives in
+`src/ui/math.zig` as one of a small set of drawing operations.
+
+Those operations are the beginning of a drawing layer rather than a special case
+for mathematics. `Renderer.quadCorners` fills four arbitrary corners, which is
+what a line, a rotated box, and a stroke all reduce to; the renderer had none of
+them before because a terminal draws nothing that is not axis-aligned. Every call
+carries the current transform as a 2D affine, so a primitive that could not
+rotate would have been one only TeX could use.
+
+A layout is expensive - the engine resolves macros and builds a box tree - and the
+transcript rebuilds its rows on every frame, so `src/ui/math.zig` keeps what it
+has laid out. That cache is built from an allocator with the process's lifetime,
+not from the frame arena the layout runs on: a map built on frame memory holds
+pointers into memory the next frame has already reused. The rows a formula
+occupies are counted from its height above the baseline and its depth below it,
+and the rows it does not draw are marked as its own, because the walk gives every
+row exactly one line of height.
+
 A prompt carries the editor context the agent needs: `src/editor/prompt.zig`
 attaches the active selection and the language server's diagnostics for the
 active file, each labelled with its file and one-based line.

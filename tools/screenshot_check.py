@@ -775,6 +775,49 @@ def check_run(binary: str) -> None:
     )
 
 
+def check_terminal_paints(binary: str) -> None:
+    """A shell draws something, and what it draws is visible.
+
+    The suite passed once while every coloured thing a shell prints - the
+    prompt, an ls, a git status - was painted in the background colour, because
+    a theme's placeholder palette was being handed to a live emulator. Nothing
+    failed, because nothing asserted that a terminal draws at all.
+
+    A lit-pixel census rather than a comparison against a reference: the claim
+    is only that the shell's own screen holds pixels brighter than what is
+    behind them, which is the weakest statement worth making and the one least
+    likely to churn.
+
+    **What this does not catch, and it was measured rather than assumed:** a
+    palette that paints ANSI colours in the background colour. That was the bug
+    this was written after, and restoring it still passes here, because the
+    shell in this fixture is `sh` and its prompt is plain text - visible either
+    way. Only output that is actually coloured tells the two apart, and nothing
+    in this fixture prints any. Making it bite needs a fixture that emits a
+    colour code, which is worth doing and has not been done.
+
+    What it does catch is a terminal that draws nothing at all, which is a real
+    regression class of its own.
+    """
+    screenshot = Path(tempfile.gettempdir()) / "seggs-terminal-paint.ppm"
+    # Frame 66 is after a shell has printed its prompt (measured: nothing is lit
+    # in the screen at frame 45, 83 pixels are by frame 66) and before the
+    # fixture exits its shells at 70, after which there is no dock to measure.
+    # The threshold is a quarter of what was measured, so a slower machine
+    # arriving later in the same window still passes rather than flaking.
+    command = display_command([binary, "--windowed", "--window-size", "1200x800", "--frames", "66", "--exercise-tabs", "--screenshot", str(screenshot)], app_env())
+    subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    width, height, pixels = parse_ppm(screenshot)
+    # The shell's screen, not the dock: the tab strip along the top of the dock
+    # carries lit labels of its own, and measuring them would let this pass on a
+    # terminal that draws nothing - which is exactly what it did before the
+    # region was narrowed. At 1200x800 the dock is the bottom 220 rows of the
+    # editor column and its strip is the first 26, so the screen is below that
+    # and above the status bar.
+    lit = count_ink(pixels, width, height, 270, height - 200, 620, 140)
+    require(lit >= 20, f"a live shell drew {lit} lit pixel(s) in its own screen; its output is not reaching the screen")
+
+
 def check_tabs(binary: str) -> None:
     """The terminal's tabs: adding, moving, and closing all agree on which is
     showing. The fixture does each in turn and reports where it ended up, which
@@ -907,10 +950,11 @@ def main() -> int:
         check_compose(binary)
         check_tabs(binary)
         check_tool_calls(binary)
+        check_terminal_paints(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1
-    print("PASS: renders agree, glyphs draw at the reported scale and baseline, composition draws and commits, extension panels take events and reload, fallback covers uncovered scripts, window transitions hold, tool calls draw as chips and open on a click")
+    print("PASS: renders agree, glyphs draw at the reported scale and baseline, composition draws and commits, extension panels take events and reload, fallback covers uncovered scripts, window transitions hold, tool calls draw as chips and open on a click, a live shell paints")
     return 0
 
 

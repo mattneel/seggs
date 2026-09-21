@@ -533,8 +533,14 @@ fn exerciseClick(app: *App, frame: usize) void {
         12 => {
             // Opening a file from the explorer: the request travels from the
             // panel to the editor and back as a status message.
-            const point = app.panelFocusPoint("explorer") orelse {
-                std.log.warn("open: no explorer row was focusable", .{});
+            // The navigator is native, so the fixture clicks a row of the tree
+            // rather than a panel an extension used to draw there.
+            const row = app.explorerFirstFileRow() orelse {
+                std.log.warn("open: no file row was drawn", .{});
+                return;
+            };
+            const point = app.explorerRowPoint(row) orelse {
+                std.log.warn("open: that row is not on screen", .{});
                 return;
             };
             var ev = std.mem.zeroes(c.SDL_Event);
@@ -563,8 +569,11 @@ fn exerciseClick(app: *App, frame: usize) void {
         },
         16 => {
             // Moving the pointer onto a row has to reach the panel that drew it.
-            const point = app.hoverPoint("explorer") orelse {
-                std.log.warn("hover: no explorer row was drawn", .{});
+            // The navigator is native now, so the pointer is moved over a panel
+            // an extension still draws: the check is that a panel takes events,
+            // and the tab strip is one.
+            const point = app.hoverPoint("tabs") orelse {
+                std.log.warn("hover: no tab was drawn", .{});
                 return;
             };
             var ev = std.mem.zeroes(c.SDL_Event);

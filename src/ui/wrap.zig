@@ -55,6 +55,33 @@ pub fn spans(a: Allocator, bytes: []const u8, columns: usize, out: *std.ArrayLis
     try out.append(a, bytes[start..]);
 }
 
+/// `bytes` shortened to fit `columns`, with an ellipsis where it was cut.
+///
+/// A row in a list is one line: a filename that wraps is a filename whose
+/// neighbours move, and a navigator that reflows as names appear is one nobody
+/// can scan. The result points into `buffer`, which must outlive it.
+pub fn elide(buffer: []u8, bytes: []const u8, columns: usize) []const u8 {
+    const width = @max(1, columns);
+    const cells = cellCount(bytes);
+    if (cells <= width) return bytes;
+    // One column of the budget is the ellipsis itself.
+    const kept = width - 1;
+    var index: usize = 0;
+    var taken: usize = 0;
+    while (taken < kept and index < bytes.len) : (taken += 1) index = text.next(bytes, index);
+    const slice = buffer[0..@min(buffer.len, index + 3)];
+    @memcpy(slice[0..index], bytes[0..index]);
+    @memcpy(slice[index..][0..3], "…");
+    return slice;
+}
+
+fn cellCount(bytes: []const u8) usize {
+    var cells: usize = 0;
+    var index: usize = 0;
+    while (index < bytes.len) : (index = text.next(bytes, index)) cells += 1;
+    return cells;
+}
+
 /// How many rows `bytes` needs at `columns`, which is what a caller sizing a
 /// row has to know before it draws anything.
 pub fn rowCount(bytes: []const u8, columns: usize) usize {
@@ -138,6 +165,16 @@ test "rows break between words when there is a word boundary to use" {
     try std.testing.expectEqual(@as(usize, 2), rowCount("hello world", 8));
     try std.testing.expectEqual(@as(usize, 3), rowCount("hello wonderful", 8));
     try std.testing.expectEqual(@as(usize, 2), rowCount("hello\nworld", 40));
+}
+
+test "a name too long for its row is cut, not wrapped" {
+    var buffer: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("src", elide(&buffer, "src", 8));
+    // Eight columns, seven kept, then the ellipsis.
+    const cut = elide(&buffer, "src/gpu/renderer.zig", 8);
+    try std.testing.expectEqual(@as(usize, 8), cellCount(cut));
+    try std.testing.expect(std.mem.endsWith(u8, cut, "…"));
+    try std.testing.expect(std.mem.startsWith(u8, cut, "src/gpu"));
 }
 
 test "a row can be counted before it is drawn" {

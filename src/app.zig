@@ -27,6 +27,7 @@ fn inspectorRowHeight(line_height: f32) f32 {
 const review = @import("editor/review.zig");
 const wrap = @import("ui/wrap.zig");
 const shell_integration = @import("services/shell.zig");
+const tree_widget = @import("ui/tree.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
@@ -112,6 +113,13 @@ pub const App = struct {
     /// Which way the left dock is looking.
     dock: Dock = .files,
 
+    /// The source navigator: the workspace's files as the folders that hold
+    /// them. A flat list of paths is what enumeration gives; a tree is what a
+    /// reader navigates.
+    files: tree_widget.Tree,
+    /// First row the tree is showing, for scrolling.
+    tree_first: usize = 0,
+
     /// Position in `focus_order` while the panels own the keyboard.
     panel_focus: usize = 0,
     /// Node the pointer is over, owned for the same reason the ids are.
@@ -163,7 +171,8 @@ pub const App = struct {
         errdefer a.free(clients);
         for (config.agents, clients) |preset, *client| client.* = Client.init(a, preset, root);
         const cached = try workspace.activeDocument().snapshot(a);
-        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a) };
+        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a), .files = tree_widget.Tree.init(a) };
+        try self.rebuildFiles();
         self.status("F5 starts the selected agent. Ctrl+P opens files.", .{});
         return self;
     }
@@ -185,6 +194,7 @@ pub const App = struct {
         for (self.runs.items) |*run| run.deinit();
         self.runs.deinit(self.allocator);
         self.review.deinit();
+        self.files.deinit();
         self.panel_tree.deinit();
         self.panel_rects.deinit(self.allocator);
         for (self.panel_nodes.items) |node| self.allocator.free(node.id);
@@ -638,6 +648,10 @@ pub const App = struct {
                         self.first_line = 0;
                         self.first_column = 0;
                         self.selection_anchor = null;
+                        // Files move on disk while the editor is open, so the
+                        // navigator is rebuilt with them rather than left
+                        // showing a tree that is no longer there.
+                        self.rebuildFiles() catch {};
                         self.status("Reloaded from disk.", .{});
                     } else |err| {
                         self.status("Reload failed: {s}", .{@errorName(err)});
@@ -1081,6 +1095,20 @@ pub const App = struct {
                 self.dock = if (x < dock.x + 70) .files else .runs;
                 return;
             }
+            if (self.dock == .files) {
+                const step = self.line_height;
+                const row = @as(usize, @intFromFloat(@max(0, y - dock.y - 34) / step)) + self.tree_first;
+                if (self.files.visibleAt(row)) |node| {
+                    if (node.folder) {
+                        try self.files.toggle(node.path);
+                    } else {
+                        const full = try std.fs.path.join(self.allocator, &.{ self.workspace.root, node.path });
+                        defer self.allocator.free(full);
+                        try self.openFile(full);
+                    }
+                }
+                return;
+            }
             if (self.dock == .runs) {
                 // The inbox sits above the runs, and answering it is a keystroke
                 // rather than a click: what a row can do here is select its run.
@@ -1238,7 +1266,10 @@ pub const App = struct {
             if (self.dock == .runs) {
                 try self.drawRuns(r, frame);
             } else {
-                _ = try self.drawPanel(r, frame, "explorer", g.explorer);
+                // The navigator is native: a file tree is not something to
+                // describe to the renderer, it is something the renderer knows
+                // how to draw.
+                try self.drawExplorerTree(r);
             }
             try self.drawDockSwitch(r);
         }
@@ -1657,7 +1688,10 @@ pub const App = struct {
             }
             return;
         }
-        terminal.scroll(@intCast(-lines));
+        // `lines` is already the direction the wheel moved, and the emulator
+        // reads a negative delta as upward into history. Negating it here turned
+        // every upward scroll into a downward one.
+        terminal.scroll(@intCast(lines));
     }
 
     /// Type into the terminal as if the keyboard had: the same path the keys
@@ -1724,6 +1758,32 @@ pub const App = struct {
     /// is visible from outside.
     pub fn inspectorContext(self: *const App, index: usize) bool {
         return if (index < self.inspector_context.len and self.inspector_context[index]) true else false;
+    }
+
+    /// The drawn row of the first file in the navigator, so a caller outside the
+    /// interface can exercise opening one without knowing how the tree is built.
+    pub fn explorerFirstFileRow(self: *const App) ?usize {
+        var seen: usize = 0;
+        var found: ?usize = null;
+        const Finder = struct {
+            seen: *usize,
+            found: *?usize,
+            fn visit(finder: *@This(), node: *const tree_widget.Node) anyerror!void {
+                if (finder.found.* == null and !node.folder) finder.found.* = finder.seen.*;
+                finder.seen.* += 1;
+            }
+        };
+        var finder: Finder = .{ .seen = &seen, .found = &found };
+        self.files.visit(&finder, Finder.visit) catch return null;
+        return found;
+    }
+
+    /// A point inside a navigator row, for callers outside the interface.
+    pub fn explorerRowPoint(self: *const App, row: usize) ?struct { x: f32, y: f32 } {
+        const bounds = self.geometry.explorer;
+        if (bounds.w <= 0 or row < self.tree_first) return null;
+        const offset = @as(f32, @floatFromInt(row - self.tree_first)) * self.line_height;
+        return .{ .x = bounds.x + bounds.w - 20, .y = bounds.y + 42 + offset };
     }
 
     /// The clickable point of a context row, for callers outside the interface
@@ -1993,6 +2053,72 @@ pub const App = struct {
         }
     }
 
+    /// Rebuild the navigator from the workspace's files, keeping whatever the
+    /// reader had opened open.
+    pub fn rebuildFiles(self: *App) !void {
+        const entries = self.workspace.explorer.entries.items;
+        const relative = try self.allocator.alloc([]const u8, entries.len);
+        defer self.allocator.free(relative);
+        for (entries, relative) |path, *name| name.* = self.relativePath(path);
+        try self.files.rebuild(relative);
+        // A navigator that opens with everything shut shows nothing, so the
+        // folders at the top are open and the rest are the reader's to open.
+        for (self.files.nodes.items) |node| {
+            if (node.depth == 0 and node.folder) try self.files.expand(node.path);
+        }
+    }
+
+    /// The navigator: folders that open and close, names that stay on one line.
+    /// A row is a name, not a paragraph - a filename that wraps moves every row
+    /// under it, and a navigator nobody can scan is not a navigator.
+    fn drawExplorerTree(self: *App, r: *Renderer) !void {
+        const bounds = self.geometry.explorer;
+        r.clip = bounds;
+        try r.rect(bounds, theme.panel);
+        const line = r.atlas.line_height;
+        const rows: usize = @intFromFloat(@max(0, bounds.h - 34) / line);
+        if (self.tree_first > self.files.count()) self.tree_first = 0;
+        const Painter = struct {
+            r: *Renderer,
+            tree: *const tree_widget.Tree,
+            bounds: Rect,
+            line: f32,
+            first: usize,
+            rows: usize,
+            index: usize = 0,
+            scratch: [256]u8 = undefined,
+
+            fn visit(painter: *@This(), node: *const tree_widget.Node) anyerror!void {
+                defer painter.index += 1;
+                if (painter.index < painter.first) return;
+                const row = painter.index - painter.first;
+                if (row >= painter.rows) return;
+                const y = painter.bounds.y + 34 + @as(f32, @floatFromInt(row)) * painter.line;
+                const step = painter.r.atlas.advance * 2;
+                const indent = @as(f32, @floatFromInt(node.depth)) * step;
+                const x = painter.bounds.x + 10 + indent;
+                if (node.folder) {
+                    // A folder says whether it is open, which is the difference
+                    // between a tree and a list.
+                    const mark = if (painter.tree.isExpanded(node.path)) "▾" else "▸";
+                    try painter.r.text(x, y + 4, mark, theme.accent);
+                }
+                const room: usize = @intFromFloat(@max(4, (painter.bounds.x + painter.bounds.w - 8 - x - step) / painter.r.atlas.advance));
+                const label = wrap.elide(&painter.scratch, node.name, room);
+                try painter.r.text(x + step, y + 4, label, if (node.folder) theme.text else theme.muted);
+            }
+        };
+        var painter: Painter = .{
+            .r = r,
+            .tree = &self.files,
+            .bounds = bounds,
+            .line = line,
+            .first = self.tree_first,
+            .rows = rows,
+        };
+        try self.files.visit(&painter, Painter.visit);
+    }
+
     /// The runs this session knows about. A run that needs a person says so
     /// rather than looking like the ones that are merely working.
     fn drawRuns(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
@@ -2237,8 +2363,11 @@ pub const App = struct {
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = 1, .h = bounds.h }, theme.border);
         try r.text(bounds.x + 14, bounds.y + 13, "INSPECTOR", theme.text);
 
-        // What the inspector is about: the file the caret is in, and where.
-        const path = std.fs.path.basename(self.workspace.activePath() orelse "no file");
+        // What the inspector is about: the buffer the caret is in, and where.
+        // The name comes from the same place the tab strip gets it, because two
+        // names for one buffer is how an inspector ends up saying "no file"
+        // about the file that is on screen.
+        const path = self.workspace.bufferName(self.workspace.activeIndex());
         var subject: [128]u8 = undefined;
         const line = self.workspace.activeDocument().lineOf(self.workspace.activeDocument().cursor) + 1;
         const label = try std.fmt.bufPrint(&subject, "{s} · line {d}", .{ path, line });
@@ -2362,7 +2491,7 @@ pub const App = struct {
                 const first = document.lineOf(range.start) + 1;
                 const last = document.lineOf(range.end) + 1;
                 return std.fmt.bufPrint(&self.inspector_scratch[0], "{s} · lines {d}-{d}", .{
-                    std.fs.path.basename(self.workspace.activePath() orelse "no file"), first, last,
+                    self.workspace.bufferName(self.workspace.activeIndex()), first, last,
                 }) catch "selection";
             },
             1 => {

@@ -17,7 +17,10 @@ pub const Buffer = struct {
     }
 
     fn name(self: *const Buffer) []const u8 {
-        return if (self.path) |path| std.fs.path.basename(path) else "Welcome.zig";
+        // A buffer with no path is not a file, and naming it after one makes
+        // every panel that reads the name claim something that is not true:
+        // the startup buffer is text this program wrote, and it says so.
+        return if (self.path) |path| std.fs.path.basename(path) else "Welcome";
     }
 
     fn deinit(self: *Buffer, a: Allocator) void {

@@ -13,4 +13,5 @@ test {
     _ = @import("agents/registry.zig");
     _ = @import("ui/layout.zig");
     _ = @import("ui/wrap.zig");
+    _ = @import("ui/tree.zig");
 }

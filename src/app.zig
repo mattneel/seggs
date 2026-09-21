@@ -3056,21 +3056,43 @@ pub const App = struct {
         return .{ .x = bounds.x + bounds.w - 20, .y = bounds.y + 42 + offset };
     }
 
-    /// Where a lane's tab is drawn, or null when the strip has no room for it.
-    /// The draw and the click both come through here, so the tab a point lands
-    /// on is the tab that was drawn.
     /// The lanes that are open, in strip order. A tab is a running agent:
     /// a lane nobody started is something the template list offers, not a tab
     /// the reader is already paying for. An agent costs memory and a process
     /// from the moment it exists, so the strip lists what exists.
-    fn openAgents(self: *const App, out: *[max_agents]usize) []const usize {
-        var count: usize = 0;
-        for (self.clients, 0..) |client, index| {
-            if (!client.state.up()) continue;
-            out[count] = index;
-            count += 1;
+    ///
+    /// This walks the clients where they are rather than filling a list with
+    /// them, so there is no buffer for a ninth lane to run off the end of and
+    /// no number to stay under: how many of the open lanes the strip can draw
+    /// is a question about the strip's width, and it is asked by the tab
+    /// rectangle rather than answered here.
+    const OpenAgents = struct {
+        clients: []const Client,
+        position: usize = 0,
+
+        /// How many lanes are open. The strip shares its room out across this
+        /// count, so it is the length of the same walk the cursor makes.
+        fn count(lanes: OpenAgents) usize {
+            var total: usize = 0;
+            for (lanes.clients) |client| {
+                if (client.state.up()) total += 1;
+            }
+            return total;
         }
-        return out[0..count];
+
+        /// The next open lane's index among the clients, or null at the end.
+        fn next(lanes: *OpenAgents) ?usize {
+            while (lanes.position < lanes.clients.len) {
+                const index = lanes.position;
+                lanes.position += 1;
+                if (lanes.clients[index].state.up()) return index;
+            }
+            return null;
+        }
+    };
+
+    fn openAgents(self: *const App) OpenAgents {
+        return .{ .clients = self.clients };
     }
 
     /// Stop a lane and leave the dock showing something that is still running.
@@ -3099,12 +3121,16 @@ pub const App = struct {
         return false;
     }
 
+    /// Where a lane's tab is drawn, or null when the strip has no room for it.
+    /// The draw and the click both come through here, so the tab a point lands
+    /// on is the tab that was drawn. A lane the strip has no room for has no
+    /// tab of its own: it is reached through the dock's lists, and the strip's
+    /// width decides how many tabs there are without deciding how many lanes
+    /// may run.
     fn agentTabRect(self: *const App, index: usize) ?Rect {
         const strip = self.agentStrip();
-        var open: [max_agents]usize = undefined;
-        const lanes = self.openAgents(&open);
-        if (strip.w <= 0 or index >= lanes.len) return null;
-        const count = lanes.len;
+        const count = self.openAgents().count();
+        if (strip.w <= 0 or index >= count) return null;
         const gap: f32 = 4;
         // Tabs share the strip, so every lane is reachable in a dock that fits
         // four of them at their widest. Below the least a name can be read in,
@@ -3135,9 +3161,9 @@ pub const App = struct {
     pub fn agentTabAt(self: *const App, x: f32, y: f32) ?AgentTabHit {
         const strip = self.agentStrip();
         if (!strip.contains(x, y)) return null;
-        var open: [max_agents]usize = undefined;
-        const lanes = self.openAgents(&open);
-        for (lanes, 0..) |index, position| {
+        var lanes = self.openAgents();
+        var position: usize = 0;
+        while (lanes.next()) |index| : (position += 1) {
             const tab = self.agentTabRect(position) orelse break;
             if (!tab.contains(x, y)) continue;
             // The close box is the last of a tab, which is where a reader looks
@@ -3160,9 +3186,6 @@ pub const App = struct {
     /// How many shells the jump list will show. A machine with more than this
     /// in /etc/shells has more than anyone picks from by eye.
     const max_shells = 8;
-
-    /// The lanes a strip can show at once, which is the registry's own limit.
-    const max_agents = 8;
 
     /// A point inside a lane's tab, for callers outside the interface that need
     /// to exercise the strip without a pointer device.
@@ -4974,9 +4997,9 @@ pub const App = struct {
         try r.rect(strip, theme.background);
         try r.rect(.{ .x = strip.x, .y = strip.y + strip.h - 1, .w = strip.w, .h = 1 }, theme.border);
         var scratch: [128]u8 = undefined;
-        var open: [max_agents]usize = undefined;
-        const lanes = self.openAgents(&open);
-        for (lanes, 0..) |index, position| {
+        var open = self.openAgents();
+        var position: usize = 0;
+        while (open.next()) |index| : (position += 1) {
             const tab = self.agentTabRect(position) orelse break;
             const client = self.clients[index];
             const active = index == self.active;
@@ -5871,4 +5894,32 @@ fn drawSpan(r: *Renderer, x: f32, y: f32, bytes: []const u8, color: theme.Color)
         at = text.next(bytes, at);
     }
     return pen;
+}
+
+// The strip's view of the lanes it lists. A dozen lanes is more than any strip
+// has room for tabs at once, which is the state the strip was always able to
+// be in and the state the roster cap kept out of reach: every lane past the
+// eighth is a lane the dock still has, still starts, and still reaches
+// through its own lists.
+test "the strip's view of the open lanes is not bounded by the strip" {
+    const a = std.testing.allocator;
+    const preset = @import("agents/registry.zig").Agent{ .id = "lane", .name = "Lane", .argv = &.{"lane-acp"} };
+    var clients: [12]Client = undefined;
+    for (&clients) |*client| client.* = Client.init(a, preset, "/");
+    defer {
+        for (&clients) |*client| client.deinit();
+    }
+    for (&clients) |*client| client.state = .ready;
+    var lanes = App.OpenAgents{ .clients = &clients };
+    var seen: usize = 0;
+    while (lanes.next()) |index| : (seen += 1) try std.testing.expectEqual(seen, index);
+    try std.testing.expectEqual(clients.len, seen);
+    try std.testing.expectEqual(clients.len, lanes.count());
+    // A lane that is not up is not listed, which is the other half of the same
+    // walk: the strip lists what is running rather than what was configured.
+    clients[3].state = .offline;
+    var rest = App.OpenAgents{ .clients = &clients };
+    seen = 0;
+    while (rest.next()) |index| : (seen += 1) try std.testing.expect(index != 3);
+    try std.testing.expectEqual(clients.len - 1, seen);
 }

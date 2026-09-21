@@ -68,7 +68,7 @@ def config_check(path: Path) -> None:
     require(set(value) <= {"fullscreen", "agents", "persist_transcripts", "lsp"}, f"{path}: unknown config field")
     require(isinstance(value.get("fullscreen", True), bool), f"{path}: invalid fullscreen")
     agents = value.get("agents", [])
-    require(isinstance(agents, list) and 1 <= len(agents) <= 8, f"{path}: invalid agent count")
+    require(isinstance(agents, list) and 1 <= len(agents), f"{path}: invalid agent count")
     ids = set()
     for agent in agents:
         require(set(agent) <= {"id", "name", "argv", "cwd"}, f"{path}: unknown agent field")

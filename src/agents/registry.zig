@@ -28,7 +28,11 @@ pub const builtins = [_]Agent{
 };
 
 pub fn validate(config: Config) !void {
-    if (config.agents.len == 0 or config.agents.len > 8) return error.AgentCount;
+    // A roster with nothing in it is a mistake: there would be nothing to
+    // start. How many agents there are is not this module's to bound, the
+    // same way the number of shells is not the terminal's - the dock lists
+    // every lane it has, and the strip draws the tabs that fit.
+    if (config.agents.len == 0) return error.AgentCount;
     for (config.agents, 0..) |agent, index| {
         if (agent.id.len == 0 or agent.id.len > 64 or agent.name.len == 0 or agent.name.len > 64 or agent.argv.len == 0 or agent.argv.len > 64 or agent.argv[0].len == 0) return error.InvalidAgent;
         for (agent.id) |byte| if (byte < 33 or byte > 126) return error.InvalidAgent;
@@ -55,4 +59,18 @@ test "first-class presets and unique IDs" {
     try std.testing.expectEqualStrings("codex-acp", builtins[1].argv[0]);
     try std.testing.expectEqualStrings("claude-agent-acp", builtins[2].argv[0]);
     try std.testing.expectError(error.DuplicateAgentId, validate(.{ .agents = &.{ builtins[0], builtins[0] } }));
+}
+
+test "a roster larger than a strip can show is still a valid roster" {
+    // The strip is where the number of tabs comes from, so a dozen lanes is a
+    // dock that draws what fits rather than a config that refuses to load.
+    // What is still refused is a roster with nothing in it.
+    var ids: [12][8]u8 = undefined;
+    var roster: [12]Agent = undefined;
+    for (&roster, 0..) |*agent, index| {
+        const id = std.fmt.bufPrint(&ids[index], "lane-{d}", .{index}) catch unreachable;
+        agent.* = .{ .id = id, .name = "Lane", .argv = &.{"lane-acp"} };
+    }
+    try validate(.{ .agents = &roster });
+    try std.testing.expectError(error.AgentCount, validate(.{ .agents = &.{} }));
 }

@@ -3620,12 +3620,20 @@ pub const App = struct {
                 .starting, .working => theme.amber,
                 else => theme.accent,
             };
-            try r.text(tab.x + 6, tab.y + 4, "●", mark);
-            const room: usize = @intFromFloat(@max(2, (tab.w - 34) / r.atlas.advance));
+            // The mark, a gap, then the name. The mark is a state and the name
+            // is an identity, and running them together reads as one glyph with
+            // a smudge on its left. The name's position and the room it has are
+            // derived from the same numbers, so widening the gap cannot leave
+            // the elision thinking there is more room than there is.
+            const mark_x = tab.x + 6;
+            const label_x = mark_x + r.atlas.advance + 5;
+            const trailing = 34; // the close box and the margin before it
+            const room: usize = @intFromFloat(@max(2, (tab.x + tab.w - trailing - label_x) / r.atlas.advance));
+            try r.text(mark_x, tab.y + 4, "●", mark);
             // A name longer than the scratch is drawn as it is: the tab's own
             // clip is what cuts it.
             const label = if (client.preset.name.len + 3 > scratch.len) client.preset.name else wrap.elide(&scratch, client.preset.name, room);
-            try r.text(tab.x + 18, tab.y + 4, label, if (active) theme.accent else theme.text);
+            try r.text(label_x, tab.y + 4, label, if (active) theme.accent else theme.text);
             try r.text(tab.x + tab.w - 14, tab.y + 4, "×", if (active) theme.text else theme.muted);
         }
         const plus = self.agentPlusRect();

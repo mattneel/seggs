@@ -75,6 +75,41 @@ pub const Terminal = struct {
         palette: [256]g.GhosttyColorRgb,
     };
 
+    /// What the terminal draws with when the program in it has said nothing.
+    /// This is where a theme's terminal half lands: the editor's chrome and
+    /// the shell's 16 ANSI colours are chosen by the same document, which is
+    /// the point of having one format rather than one per surface.
+    pub const Palette = struct {
+        foreground: g.GhosttyColorRgb,
+        background: g.GhosttyColorRgb,
+        cursor: g.GhosttyColorRgb,
+        /// The sixteen a program reaches for by name, which is all an editor
+        /// theme ever carries.
+        ansi: [16]g.GhosttyColorRgb,
+    };
+
+    /// Set the default colors. A program can still override any of these - it
+    /// owns the terminal it is running in - and OSC 4 sets entries by index.
+    ///
+    /// The emulator addresses 256 palette entries and a theme names 16, so the
+    /// rest are read back and put where they were: a theme is not a statement
+    /// about the colors it does not mention, and blanking them would break
+    /// every program that uses the extended range.
+    pub fn setPalette(self: *Terminal, palette: Palette) !void {
+        var full: [256]g.GhosttyColorRgb = undefined;
+        if (self.colors()) |existing| {
+            full = existing.palette;
+        } else |_| {
+            @memset(&full, palette.foreground);
+        }
+        for (palette.ansi, 0..) |color, index| full[index] = color;
+
+        try check(g.ghostty_terminal_set(self.handle, g.GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, @ptrCast(&palette.foreground)));
+        try check(g.ghostty_terminal_set(self.handle, g.GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, @ptrCast(&palette.background)));
+        try check(g.ghostty_terminal_set(self.handle, g.GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, @ptrCast(&palette.cursor)));
+        try check(g.ghostty_terminal_set(self.handle, g.GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, @ptrCast(&full)));
+    }
+
     pub fn init(a: Allocator, initial_cols: u16, initial_rows: u16) !Terminal {
         var handle: g.GhosttyTerminal = null;
         try check(g.ghostty_terminal_new(null, &handle, initial_cols, initial_rows));

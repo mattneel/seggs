@@ -56,52 +56,109 @@ pub const Scanner = struct {
     block_comment: bool = false,
     skip: bool = false,
 
+    /// The colour at a position, which is its role resolved through whatever
+    /// theme is loaded.
     pub fn color(self: *Scanner, bytes: []const u8, at: usize) theme.Color {
+        return resolve(self.roleAt(bytes, at));
+    }
+
+    /// What a position in the line is, in the vocabulary themes are written in.
+    ///
+    /// The scanner already decides this - it is the same state machine either
+    /// way - but naming the decision is what lets a theme reach our syntax. A
+    /// theme file describes `comment` and `string.quoted`; a scanner that
+    /// answers with a colour directly can only ever be themed by rewriting it,
+    /// which is why importing one would otherwise be decorative.
+    pub const Role = enum {
+        plain,
+        comment,
+        string,
+        number,
+        keyword,
+        decorator,
+
+        /// The TextMate selector this role answers to, which is the name every
+        /// editor's theme files use for the same thing. Empty for plain text:
+        /// it has no rule of its own, and what it gets is the editor's
+        /// foreground.
+        pub fn scope(self: Role) []const u8 {
+            return switch (self) {
+                .plain => "",
+                .comment => "comment",
+                .string => "string.quoted",
+                .number => "constant.numeric",
+                .keyword => "keyword.control",
+                .decorator => "storage.type.annotation",
+            };
+        }
+    };
+
+    /// A loaded theme's rule for a role, and the palette's own role colour when
+    /// the theme says nothing about it. A theme is a document written by
+    /// someone else about a language we only partly understand, so a scope it
+    /// never mentions must keep working rather than go blank.
+    fn resolve(role: Role) theme.Color {
+        const scope = role.scope();
+        if (scope.len > 0) {
+            if (theme.styleFor(theme.current, scope).fg) |fg| return fg;
+        }
+        return switch (role) {
+            .plain => theme.text,
+            .comment => theme.muted,
+            .string => theme.accent,
+            .number => theme.amber,
+            .keyword, .decorator => theme.purple,
+        };
+    }
+
+    /// The same decision as `color`, with no colour: the state machine lives
+    /// here so that carrying state and drawing cannot disagree about it.
+    pub fn roleAt(self: *Scanner, bytes: []const u8, at: usize) Role {
         const byte = bytes[at];
         if (self.skip) {
             self.skip = false;
-            return theme.muted;
+            return .comment;
         }
         if (self.block_comment) {
             if (byte == '*' and at + 1 < bytes.len and bytes[at + 1] == '/') {
                 self.block_comment = false;
                 self.skip = true;
             }
-            return theme.muted;
+            return .comment;
         }
-        if (self.comment) return theme.muted;
+        if (self.comment) return .comment;
         if (self.quote != 0) {
             if (self.escaped) {
                 self.escaped = false;
             } else if (byte == '\\') {
                 self.escaped = true;
             } else if (byte == self.quote) self.quote = 0;
-            return theme.accent;
+            return .string;
         }
         if (at + 1 < bytes.len and byte == '/' and bytes[at + 1] == '/') {
             self.comment = true;
-            return theme.muted;
+            return .comment;
         }
         if (at + 1 < bytes.len and byte == '/' and bytes[at + 1] == '*') {
             self.block_comment = true;
-            return theme.muted;
+            return .comment;
         }
         if (byte == '"' or byte == '\'') {
             self.quote = byte;
-            return theme.accent;
+            return .string;
         }
-        if (byte >= '0' and byte <= '9') return theme.amber;
-        if (byte == '@') return theme.purple;
+        if (byte >= '0' and byte <= '9') return .number;
+        if (byte == '@') return .decorator;
         if (std.ascii.isAlphabetic(byte) or byte == '_') {
             var start = at;
             while (start > 0 and (std.ascii.isAlphanumeric(bytes[start - 1]) or bytes[start - 1] == '_')) : (start -= 1) {}
             var end = at;
             while (end < bytes.len and (std.ascii.isAlphanumeric(bytes[end]) or bytes[end] == '_')) : (end += 1) {}
             for (self.language.keywords()) |keyword| {
-                if (std.mem.eql(u8, bytes[start..end], keyword)) return theme.purple;
+                if (std.mem.eql(u8, bytes[start..end], keyword)) return .keyword;
             }
         }
-        return theme.text;
+        return .plain;
     }
 
     /// Reset line-local state; block comments carry across lines.
@@ -147,4 +204,50 @@ test "block comments span lines" {
     try std.testing.expectEqual(theme.muted, scan.color("still", 0));
     scan.scanLine("more */ code");
     try std.testing.expectEqual(theme.text, scan.color("code", 0));
+}
+
+test "a theme's scope rules reach the syntax they name" {
+    const a = std.testing.allocator;
+    // A theme that says what a comment and a keyword look like. This is the
+    // whole point of importing one: the rules arrive in someone else's
+    // vocabulary and have to land on our tokenizer.
+    const document =
+        \\{"name":"probe",
+        \\ "syntax":[
+        \\   {"scope":"comment","fg":"#ff0000"},
+        \\   {"scope":"keyword.control","fg":"#00ff00"},
+        \\   {"scope":"string.quoted","fg":"#0000ff"}]}
+    ;
+    const parsed = try theme.parse(a, document);
+    defer theme.deinit(parsed, a);
+
+    const previous = theme.current;
+    const previous_palette = .{ theme.text, theme.muted, theme.accent, theme.purple };
+    theme.apply(parsed);
+    defer {
+        theme.apply(previous);
+        theme.text = previous_palette[0];
+        theme.muted = previous_palette[1];
+        theme.accent = previous_palette[2];
+        theme.purple = previous_palette[3];
+    }
+
+    // A scanner carries state from one position to the next - that is how a
+    // block comment or an open string spans a line - so each of these gets its
+    // own rather than inheriting the last one's idea of what it was reading.
+    const zero = struct {
+        fn at(line: []const u8) theme.Color {
+            var scanner: Scanner = .{ .language = .zig };
+            return scanner.color(line, 0);
+        }
+    }.at;
+
+    // Each line is a position whose role the scanner decides, and the colour
+    // has to be the one the theme named for that role.
+    try std.testing.expectEqual(theme.rgb(0xff0000), zero("// hi"));
+    try std.testing.expectEqual(theme.rgb(0x0000ff), zero("\"quoted\""));
+    try std.testing.expectEqual(theme.rgb(0x00ff00), zero("const x = 1;"));
+    // A scope the theme says nothing about keeps the palette's own colour
+    // rather than going blank: a document is a partial statement by nature.
+    try std.testing.expectEqual(theme.amber, zero("42"));
 }

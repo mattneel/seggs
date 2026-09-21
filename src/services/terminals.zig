@@ -84,6 +84,10 @@ const Unsupported = struct {
     pub fn activeSession(_: *Unsupported) ?*Session {
         return null;
     }
+
+    pub fn sessionAt(_: *Unsupported, _: usize) ?*Session {
+        return null;
+    }
 };
 
 const Posix = struct {
@@ -144,6 +148,14 @@ const Posix = struct {
 
     pub fn count(self: *const Posix) usize {
         return self.sessions.items.len;
+    }
+
+    /// Every session, in strip order. A theme reaches all of them, not only
+    /// the one on screen: a tab that is behind another is still drawn with the
+    /// palette the reader chose when they switch to it.
+    pub fn sessionAt(self: *Posix, index: usize) ?*Session {
+        if (index >= self.sessions.items.len) return null;
+        return &self.sessions.items[index];
     }
 
     pub fn activeSession(self: *Posix) ?*Session {

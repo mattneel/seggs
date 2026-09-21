@@ -19,7 +19,11 @@ pub const Node = struct {
     kind: Kind = .column,
     /// Leaf content. Only `text` uses it.
     text: []const u8 = "",
-    color: Color = theme.text,
+    /// Null means the theme's text colour, resolved when it is drawn rather
+    /// than when the node is described: a snapshot taken here would be the
+    /// palette as it was when an extension happened to describe itself, and
+    /// would survive a theme change with the wrong colour in it.
+    color: ?Color = null,
     /// Fill drawn behind a container before its children. Null leaves it clear.
     background: ?Color = null,
     style: Style = .{},
@@ -377,7 +381,7 @@ fn renderNode(node: *const Node, r: *Renderer, a: std.mem.Allocator, origin_x: f
     const height = yoga.YGNodeLayoutGetHeight(ref);
     if (node.background) |fill| try r.rect(.{ .x = x, .y = y, .w = width, .h = height }, fill);
     switch (node.kind) {
-        .box => try r.rect(.{ .x = x, .y = y, .w = width, .h = height }, node.color),
+        .box => try r.rect(.{ .x = x, .y = y, .w = width, .h = height }, node.color orelse theme.text),
         .text => {
             // Wrapped at the width the layout gave it, which is the width it
             // was measured against.
@@ -385,7 +389,7 @@ fn renderNode(node: *const Node, r: *Renderer, a: std.mem.Allocator, origin_x: f
             var spans: std.ArrayList([]const u8) = .empty;
             try wrap.spans(a, node.text, columns, &spans);
             for (spans.items, 0..) |span, index| {
-                try r.text(x, y + @as(f32, @floatFromInt(index)) * node.metrics.line_height, span, node.color);
+                try r.text(x, y + @as(f32, @floatFromInt(index)) * node.metrics.line_height, span, node.color orelse theme.text);
             }
         },
         .row, .column => {},

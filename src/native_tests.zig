@@ -788,6 +788,49 @@ test "a shell's first prompt arrives without any input being sent" {
     try std.testing.expect(n > 0);
 }
 
+test "a palette set on a terminal is the palette it reports" {
+    const a = std.testing.allocator;
+    var t = try vt.Terminal.init(a, 80, 24);
+    defer t.deinit();
+    const before = try t.colors();
+
+    // The colours a theme carries: a background and an ANSI pair, which is all
+    // an editor theme ever names. The other 240 entries belong to the emulator
+    // and must be left where they were.
+    var ansi: @TypeOf(@as(vt.Terminal.Palette, undefined).ansi) = undefined;
+    for (&ansi, 0..) |*entry, index| entry.* = .{ .r = @intCast(index * 15), .g = 0, .b = 0 };
+    const palette = vt.Terminal.Palette{
+        .foreground = .{ .r = 0xdc, .g = 0xe2, .b = 0xed },
+        .background = .{ .r = 0x10, .g = 0x12, .b = 0x16 },
+        .cursor = .{ .r = 0xff, .g = 0x00, .b = 0x00 },
+        .ansi = ansi,
+    };
+    try t.setPalette(palette);
+    // The colours are reported from the render state, which is taken when the
+    // terminal is updated: a set with no update behind it is not yet a state
+    // anything can read.
+    try t.update();
+
+    const after = try t.colors();
+    // The render state reports a value near the one set rather than the exact
+    // byte: the emulator owns its own colour handling on the way to the screen.
+    // So this asserts that the theme reached it and kept its shape - the ramp
+    // still rises, and the background is still the dark the theme asked for -
+    // rather than pinning a byte the emulator is free to adjust.
+    const close = struct {
+        fn to(value: u8, wanted: u8) bool {
+            return if (value > wanted) value - wanted <= 8 else wanted - value <= 8;
+        }
+    }.to;
+    try std.testing.expect(close(after.background.r, 0x10));
+    try std.testing.expect(after.palette[2].r > after.palette[1].r);
+    try std.testing.expect(close(after.palette[1].r, 15));
+
+    // Beyond the sixteen the theme is silent, so those are the emulator's own.
+    try std.testing.expectEqual(before.palette[200].r, after.palette[200].r);
+    try std.testing.expectEqual(before.palette[200].g, after.palette[200].g);
+}
+
 test "a shell that exits is reported as ended" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

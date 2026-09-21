@@ -5,6 +5,10 @@ test {
     _ = @import("editor/gap_buffer.zig");
     _ = @import("editor/document.zig");
     _ = @import("editor/highlight.zig");
+    // The two importers are read by nothing until something asks for them, so
+    // naming them here is what puts their tests in the suite.
+    _ = @import("services/theme_tm.zig");
+    _ = @import("services/theme_vscode.zig");
     _ = @import("editor/review.zig");
     _ = @import("editor/prompt.zig");
     _ = @import("editor/runs.zig");

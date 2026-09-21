@@ -11,10 +11,13 @@ const Config = @import("agents/registry.zig").Config;
 const Renderer = @import("gpu/renderer.zig").Renderer;
 const layout = @import("ui/layout.zig");
 const vt = @import("services/vt.zig");
+const files = @import("platform/files.zig");
 const pty = @import("services/pty.zig");
 const process = @import("services/process.zig");
 const ghostty = @import("ghostty");
 const theme = @import("ui/theme.zig");
+const theme_tm = @import("services/theme_tm.zig");
+const theme_vscode = @import("services/theme_vscode.zig");
 const runs = @import("editor/runs.zig");
 
 /// The dividers between docks, which is what a reader drags to resize one.
@@ -65,6 +68,7 @@ pub const App = struct {
         commands,
         templates,
         destinations,
+        shells,
 
         /// Whether this overlay is a list the menu draws. Quitting is a question
         /// with three answers, not a list of rows.
@@ -81,6 +85,7 @@ pub const App = struct {
                 .commands => "COMMANDS",
                 .templates => "AGENTS",
                 .destinations => "SEND TO",
+                .shells => "SHELLS",
                 else => "",
             };
         }
@@ -203,6 +208,14 @@ pub const App = struct {
     terminal_encode: [256]u8 = undefined,
     /// The fraction of the body the terminal dock takes when it is open.
     terminal_fraction: f32 = 0.28,
+    /// What /etc/shells offers on this machine, each entry validated once.
+    /// Fixed buffers rather than owned slices because the menu points at these
+    /// and the list of installed shells does not change while we run.
+    shell_paths: [max_shells][256]u8 = undefined,
+    shell_lens: [max_shells]usize = @splat(0),
+    shell_count: usize = 0,
+    shells_detected: bool = false,
+
     /// Whether the dock is on screen. The sessions keep running while it is
     /// away: this is the dock, not the shells.
     terminal_shown: bool = true,
@@ -607,7 +620,7 @@ pub const App = struct {
         if (keycode == c.SDLK_F12) return self.navigate(shift);
         if (keycode == c.SDLK_F5) return self.startAgent();
         if (keycode == c.SDLK_F6) {
-            self.clients[self.active].stop();
+            self.closeAgent(self.active);
             return;
         }
         if (alt and (keycode == c.SDLK_Y or keycode == c.SDLK_N)) {
@@ -682,7 +695,7 @@ pub const App = struct {
                         try self.closeFocused();
                     }
                 },
-                c.SDLK_T => if (shift) try self.newTerminalTab(),
+                c.SDLK_T => if (shift) try self.openShells() else {},
                 c.SDLK_LEFT => if (shift) self.moveTerminalTab(false),
                 c.SDLK_RIGHT => if (shift) self.moveTerminalTab(true),
                 c.SDLK_A => {
@@ -749,8 +762,12 @@ pub const App = struct {
         }
         if (self.focus == .terminal) {
             // A focused terminal owns the keyboard: the shell is the program
-            // that wants Ctrl+C and every other control key.
+            // that wants Ctrl+C and every other control key. The dock's own
+            // chrome is the exception, in both directions - the same keys in
+            // every terminal the reader has used mean "another tab" and "put
+            // this one away" rather than bytes for the program underneath.
             if (ctrl and keycode == c.SDLK_GRAVE) return self.toggleTerminal();
+            if (ctrl and shift and keycode == c.SDLK_T) return self.openShells();
             try self.terminalKey(keycode, ctrl, shift, alt);
             return;
         }
@@ -1034,6 +1051,23 @@ pub const App = struct {
         }
     }
 
+    /// Whether the keyboard is somewhere in the agent dock. Its composer is one
+    /// place the keyboard can be and a panel the extension drew inside the dock
+    /// is another, and a close key that only recognises the first does nothing
+    /// for a reader whose last click landed in the transcript - which is most
+    /// of the dock's area.
+    fn agentDockFocused(self: *const App) bool {
+        switch (self.focus) {
+            .prompt => return true,
+            .panels => {
+                const node = self.focusedTarget() orelse return false;
+                const dock = self.geometry.agents;
+                return dock.w > 0 and dock.contains(node.bounds.x, node.bounds.y);
+            },
+            else => return false,
+        }
+    }
+
     fn focusedTarget(self: *const App) ?PanelNode {
         if (self.focus_order.items.len == 0) return null;
         const index = self.focus_order.items[self.panel_focus % self.focus_order.items.len];
@@ -1167,7 +1201,7 @@ pub const App = struct {
                         self.shells.select(index);
                         self.closeTerminalTab();
                     },
-                    .new_tab => try self.newTerminalTab(),
+                    .new_tab => try self.newTerminalTab(null),
                 }
                 return;
             }
@@ -1238,7 +1272,7 @@ pub const App = struct {
                         self.active = index;
                         self.transcript_scroll = 0;
                     },
-                    .close => |index| self.clients[index].stop(),
+                    .close => |index| self.closeAgent(index),
                     .new_tab => try self.openOverlay(.templates, self.agentPlusRect()),
                 }
             } else if (self.clients[self.active].permission != null and self.permissionRect().contains(x, y)) {
@@ -1306,12 +1340,57 @@ pub const App = struct {
                 if (!client.state.up()) continue;
                 try self.menu_items.append(self.allocator, .{ .label = client.preset.name, .detail = client.state.label(), .key = index });
             },
+            // The whole path, because that is what tells one apart from another
+            // on a machine where /bin/sh and /usr/bin/sh are both listed.
+            .shells => for (self.shell_paths[0..self.shell_count], self.shell_lens[0..self.shell_count], 0..) |path, len, index| {
+                try self.menu_items.append(self.allocator, .{ .label = path[0..len], .key = index });
+            },
             else => return error.NotAList,
         }
         self.menu.setItems(self.menu_items.items, &.{});
         self.menu.open(which.title());
         self.overlay_trigger = trigger;
         self.overlay = which;
+    }
+
+    /// Read the shells this machine offers. /etc/shells is the system's own
+    /// answer to that question, and it is written by the package that installs
+    /// a shell, so it is believed rather than guessed at - but an entry that is
+    /// not actually installed is dropped: a row that cannot start is worse than
+    /// a shorter list.
+    fn detectShells(self: *App) void {
+        if (self.shells_detected) return;
+        self.shells_detected = true;
+        const listing = files.read(self.allocator, "/etc/shells", 4096) catch {
+            self.addShell("/bin/sh");
+            return;
+        };
+        defer self.allocator.free(listing);
+        var lines = std.mem.splitScalar(u8, listing, '\n');
+        while (lines.next()) |raw| self.addShell(std.mem.trim(u8, raw, " \t\r"));
+    }
+
+    fn addShell(self: *App, path: []const u8) void {
+        if (path.len == 0 or path.len > self.shell_paths[0].len) return;
+        if (path[0] != '/') return;
+        if (self.shell_count == max_shells) return;
+        for (self.shell_paths[0..self.shell_count], self.shell_lens[0..self.shell_count]) |existing, len| {
+            if (std.mem.eql(u8, existing[0..len], path)) return;
+        }
+        _ = files.stamp(self.allocator, path) catch return;
+        @memcpy(self.shell_paths[self.shell_count][0..path.len], path);
+        self.shell_lens[self.shell_count] = path.len;
+        self.shell_count += 1;
+    }
+
+    /// The shell list: which programs on this machine a tab can run.
+    fn openShells(self: *App) !void {
+        self.detectShells();
+        if (self.shell_count == 0) {
+            self.status("No shells found in /etc/shells.", .{});
+            return;
+        }
+        try self.openOverlay(.shells, null);
     }
 
     /// The destination list: where the composer's request can go. A list with no
@@ -1388,6 +1467,12 @@ pub const App = struct {
                 self.overlay = .none;
                 try self.pipeTo(item.key);
             },
+            .shells => {
+                self.overlay = .none;
+                if (item.key < self.shell_count) {
+                    try self.newTerminalTab(self.shell_paths[item.key][0..self.shell_lens[item.key]]);
+                }
+            },
             else => self.overlay = .none,
         }
     }
@@ -1407,7 +1492,11 @@ pub const App = struct {
             self.sidebar,
             .{ .line_height = self.line_height, .char_width = self.char_width },
             if (self.terminalOpen()) self.terminal_fraction else 0,
-            self.resize,
+            .{
+                .explorer = self.resize.explorer,
+                .agents = self.resize.agents,
+                .agents_open = self.agentsOpen(),
+            },
         );
         const g = self.geometry;
         try r.rect(.{ .x = 0, .y = 0, .w = r.width, .h = r.height }, theme.background);
@@ -1553,7 +1642,7 @@ pub const App = struct {
         // two questions. Asking the second one first reads "the dock is put
         // away" as "there are no sessions", and answers by starting another
         // shell every time the key is pressed.
-        if (self.shells.count() == 0) return self.newTerminalTab();
+        if (self.shells.count() == 0) return self.newTerminalTab(null);
         self.terminal_shown = !self.terminal_shown;
         if (self.terminal_shown) {
             self.status("Terminal shown.", .{});
@@ -1581,8 +1670,79 @@ pub const App = struct {
 
     /// Open another tab: a new shell with its own screen, which is what the
     /// reader means by asking for one.
-    pub fn newTerminalTab(self: *App) !void {
-        const shell_path: []const u8 = if (std.c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
+    /// The emulator's colour shape, named without importing the bindings: the
+    /// terminal half of a theme is the one place the editor hands colours to
+    /// something that is not us.
+    const Swatch = @TypeOf(@as(vt.Terminal.Palette, undefined).foreground);
+
+    fn swatch(color: theme.Color) Swatch {
+        const channel = struct {
+            fn of(value: f32) u8 {
+                return @intFromFloat(@round(std.math.clamp(value, 0, 1) * 255));
+            }
+        }.of;
+        return .{ .r = channel(color[0]), .g = channel(color[1]), .b = channel(color[2]) };
+    }
+
+    /// A theme's terminal half in the shape the emulator wants. Sixteen ANSI
+    /// entries is what a terminal program addresses by name, and it is also
+    /// what every editor theme carries, which is why the native format has
+    /// exactly that and no more.
+    fn terminalPalette(t: theme.Theme) vt.Terminal.Palette {
+        var ansi: [16]Swatch = undefined;
+        for (&ansi, 0..) |*entry, index| entry.* = swatch(t.terminal.ansi[index]);
+        return .{
+            .foreground = swatch(t.terminal.foreground),
+            .background = swatch(t.terminal.background),
+            .cursor = swatch(t.terminal.cursor),
+            .ansi = ansi,
+        };
+    }
+
+    /// Hand the loaded theme to every shell, not only the one on screen: a tab
+    /// behind another is drawn with the palette the reader chose when they
+    /// switch to it.
+    ///
+    /// A terminal is drawn by the emulator rather than by us, so the editor's
+    /// colours reach it only by being pushed across. That is the whole reason
+    /// the native format carries a terminal palette instead of leaving it at
+    /// the emulator's default.
+    pub fn applyTerminalPalette(self: *App) void {
+        const palette = terminalPalette(theme.current);
+        var index: usize = 0;
+        while (self.shells.sessionAt(index)) |session| : (index += 1) {
+            session.terminal.setPalette(palette) catch |err| {
+                self.status("terminal palette: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+    }
+
+    /// Load a theme and put it on everything. The format is decided by the
+    /// document rather than by the file's name, because one that has been
+    /// renamed is still a theme: an XML plist is a TextMate theme, a JSON
+    /// document that names token colours is a VS Code one, and anything else
+    /// is the native format.
+    pub fn loadTheme(self: *App, path: []const u8) !void {
+        const bytes = try files.read(self.allocator, path, 1024 * 1024);
+        defer self.allocator.free(bytes);
+        const trimmed = std.mem.trimLeft(u8, bytes, " \t\r\n");
+        const parsed = if (trimmed.len > 0 and trimmed[0] == '<')
+            try theme_tm.parse(self.allocator, bytes)
+        else if (std.mem.indexOf(u8, bytes, "tokenColors") != null)
+            try theme_vscode.parse(self.allocator, bytes)
+        else
+            try theme.parse(self.allocator, bytes);
+        theme.apply(parsed);
+        self.applyTerminalPalette();
+        self.status("Theme: {s}", .{parsed.name});
+    }
+
+    pub fn newTerminalTab(self: *App, chosen: ?[]const u8) !void {
+        // A shell the reader picked, or the one they are in: SHELL is what an
+        // environment says the reader's shell is, and /bin/sh is what the
+        // system promises exists.
+        const shell_path: []const u8 = chosen orelse if (std.c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
         var plan = shell_integration.integrate(self.allocator, shell_path) catch |err| {
             self.status("terminal: no command markers ({s})", .{@errorName(err)});
             return;
@@ -1648,9 +1808,8 @@ pub const App = struct {
         }
         // 3. The lane the dock is showing, which is what its own tab's `x`
         //    does.
-        if (self.focus == .prompt and self.clients[self.active].state.up()) {
-            self.clients[self.active].stop();
-            self.status("Closed {s}.", .{self.clients[self.active].preset.name});
+        if (self.agentDockFocused() and self.clients[self.active].state.up()) {
+            self.closeAgent(self.active);
             return;
         }
         // 4. The file the editor is showing, when another one is behind it.
@@ -2159,10 +2318,52 @@ pub const App = struct {
     /// Where a lane's tab is drawn, or null when the strip has no room for it.
     /// The draw and the click both come through here, so the tab a point lands
     /// on is the tab that was drawn.
+    /// The lanes that are open, in strip order. A tab is a running agent:
+    /// a lane nobody started is something the template list offers, not a tab
+    /// the reader is already paying for. An agent costs memory and a process
+    /// from the moment it exists, so the strip lists what exists.
+    fn openAgents(self: *const App, out: *[max_agents]usize) []const usize {
+        var count: usize = 0;
+        for (self.clients, 0..) |client, index| {
+            if (!client.state.up()) continue;
+            out[count] = index;
+            count += 1;
+        }
+        return out[0..count];
+    }
+
+    /// Stop a lane and leave the dock showing something that is still running.
+    /// A stopped lane's transcript is a record, not a place to type, so the
+    /// dock moves to a live one - and when there is none, the dock is gone.
+    pub fn closeAgent(self: *App, index: usize) void {
+        if (index >= self.clients.len) return;
+        const name = self.clients[index].preset.name;
+        self.clients[index].stop();
+        self.status("Closed {s}.", .{name});
+        if (index != self.active) return;
+        for (self.clients, 0..) |client, other| {
+            if (client.state.up()) {
+                self.active = other;
+                self.transcript_scroll = 0;
+                return;
+            }
+        }
+    }
+
+    /// Whether the dock is on screen: it is, exactly when something is running
+    /// in it. There is no agent panel with no agents, the way there is no
+    /// terminal dock with no shells.
+    pub fn agentsOpen(self: *const App) bool {
+        for (self.clients) |client| if (client.state.up()) return true;
+        return false;
+    }
+
     fn agentTabRect(self: *const App, index: usize) ?Rect {
         const strip = self.agentStrip();
-        if (strip.w <= 0 or index >= self.clients.len) return null;
-        const count = self.clients.len;
+        var open: [max_agents]usize = undefined;
+        const lanes = self.openAgents(&open);
+        if (strip.w <= 0 or index >= lanes.len) return null;
+        const count = lanes.len;
         const gap: f32 = 4;
         // Tabs share the strip, so every lane is reachable in a dock that fits
         // four of them at their widest. Below the least a name can be read in,
@@ -2193,8 +2394,10 @@ pub const App = struct {
     pub fn agentTabAt(self: *const App, x: f32, y: f32) ?AgentTabHit {
         const strip = self.agentStrip();
         if (!strip.contains(x, y)) return null;
-        for (0..self.clients.len) |index| {
-            const tab = self.agentTabRect(index) orelse break;
+        var open: [max_agents]usize = undefined;
+        const lanes = self.openAgents(&open);
+        for (lanes, 0..) |index, position| {
+            const tab = self.agentTabRect(position) orelse break;
             if (!tab.contains(x, y)) continue;
             // The close box is the last of a tab, which is where a reader looks
             // for it, and it takes the click before the tab does.
@@ -2212,6 +2415,13 @@ pub const App = struct {
     };
 
     const agentPlusWidth: f32 = 24;
+
+    /// How many shells the jump list will show. A machine with more than this
+    /// in /etc/shells has more than anyone picks from by eye.
+    const max_shells = 8;
+
+    /// The lanes a strip can show at once, which is the registry's own limit.
+    const max_agents = 8;
 
     /// A point inside a lane's tab, for callers outside the interface that need
     /// to exercise the strip without a pointer device.
@@ -2805,6 +3015,7 @@ pub const App = struct {
     /// thing a terminal's tabs are: open, switch, close.
     fn drawAgents(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
         const bounds = self.geometry.agents;
+        if (bounds.w <= 0) return;
         r.clip = bounds;
         try r.rect(bounds, theme.panel);
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = 1, .h = bounds.h }, theme.border);
@@ -2895,20 +3106,25 @@ pub const App = struct {
         try r.rect(strip, theme.background);
         try r.rect(.{ .x = strip.x, .y = strip.y + strip.h - 1, .w = strip.w, .h = 1 }, theme.border);
         var scratch: [128]u8 = undefined;
-        for (0..self.clients.len) |index| {
-            const tab = self.agentTabRect(index) orelse break;
+        var open: [max_agents]usize = undefined;
+        const lanes = self.openAgents(&open);
+        for (lanes, 0..) |index, position| {
+            const tab = self.agentTabRect(position) orelse break;
             const client = self.clients[index];
             const active = index == self.active;
             if (active) try r.rect(tab, theme.raised);
-            // A lane that is not up reads as not open: a hollow mark and a muted
-            // name, so a tab that is dead is visible without being loud.
-            const up = client.state.up();
-            try r.text(tab.x + 6, tab.y + 4, if (up) "●" else "○", if (up) theme.accent else theme.muted);
+            // Every tab is a live agent, so the mark says what it is doing
+            // rather than whether it exists.
+            const working = switch (client.state) {
+                .busy, .cancelling, .initialize, .new_session => true,
+                else => false,
+            };
+            try r.text(tab.x + 6, tab.y + 4, "●", if (working) theme.amber else theme.accent);
             const room: usize = @intFromFloat(@max(2, (tab.w - 34) / r.atlas.advance));
             // A name longer than the scratch is drawn as it is: the tab's own
             // clip is what cuts it.
             const label = if (client.preset.name.len + 3 > scratch.len) client.preset.name else wrap.elide(&scratch, client.preset.name, room);
-            try r.text(tab.x + 18, tab.y + 4, label, if (active) theme.accent else if (up) theme.text else theme.muted);
+            try r.text(tab.x + 18, tab.y + 4, label, if (active) theme.accent else theme.text);
             try r.text(tab.x + tab.w - 14, tab.y + 4, "×", if (active) theme.text else theme.muted);
         }
         const plus = self.agentPlusRect();

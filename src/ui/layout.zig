@@ -64,6 +64,11 @@ pub const Layout = struct {
     /// the width this layout would choose, which is what keeps a window resize
     /// working after a drag.
     pub const Resize = struct {
+    /// Whether the agent dock is on screen at all. There is no agent panel
+    /// with no agents in it, the way there is no terminal dock with no shells:
+    /// an empty column of chrome is room taken from the editor to say nothing.
+    agents_open: bool = true,
+
         explorer: ?f32 = null,
         agents: ?f32 = null,
 
@@ -106,7 +111,7 @@ pub const Layout = struct {
         else
             0;
         const right_room = width - rail - left - Resize.min_editor;
-        const right = if (width < agents_breakpoint)
+        const right = if (!resize.agents_open or width < agents_breakpoint)
             0
         else
             @round(clamp(resize.agents orelse right_wanted, Resize.min_agents, @max(Resize.min_agents, right_room)));
@@ -124,6 +129,18 @@ pub const Layout = struct {
         };
     }
 };
+
+test "a closed agent dock leaves its room to the editor" {
+    const metrics: Layout.Metrics = .{ .line_height = 22, .char_width = 9.5 };
+    const open = Layout.calculateResized(1440, 900, true, metrics, 0, .{});
+    const closed = Layout.calculateResized(1440, 900, true, metrics, 0, .{ .agents_open = false });
+    // A panel with nothing in it is a column of chrome that costs the editor
+    // its room and says nothing with it.
+    try std.testing.expect(open.agents.w > 0);
+    try std.testing.expectEqual(@as(f32, 0), closed.agents.w);
+    try std.testing.expect(closed.editor.w > open.editor.w);
+    try std.testing.expectEqual(@as(f32, 1440), closed.activity.w + closed.explorer.w + closed.editor.w);
+}
 
 test "the shell's screen sits below the tab strip and fits inside the dock" {
     const dock: Rect = .{ .x = 100, .y = 500, .w = 600, .h = 216 };

@@ -50,23 +50,62 @@ def build_ghostty(prefix: Path) -> dict:
     return {"repository": pin["repository"], "commit": commit, "zig": pin["zig"]}
 
 
+def fetch_sources(resolved: dict) -> None:
+    """Fetch the pins the build compiles itself, and build nothing.
+
+    MicroTex is fetched and not built: its CMake requires a GUI backend on Linux
+    - gtkmm or Qt - and the library has no such dependency. The base source list
+    compiles with a C++17 compiler and tinyxml2 alone, and the drawing comes
+    from the editor through the library's own abstract Graphics2D, so build.zig
+    compiles those sources and keeps a desktop toolkit out of a headless build.
+
+    tinyxml2 is fetched for the same reason. It is one C++ source file and one
+    header, and requiring it from the system would mean requiring a package that
+    exists on all three platforms the gate builds on.
+
+    This stands apart from the SDL build because macOS takes SDL from Homebrew
+    and Windows from a prepared prefix, and both still need these two.
+    """
+    for name in ("tinyxml2", "MicroTex"):
+        pin = PINS[name]
+        source, commit = checkout(name, pin.get("repository"), pin.get("commit") or pin.get("tag"))
+        resolved[name] = {**pin, "commit": commit}
+        print(f"{name} source: {source}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--prefix", type=Path, default=ROOT / ".deps/install")
     parser.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 2))
     parser.add_argument("--install-zig", action="store_true")
+    parser.add_argument(
+        "--sources-only",
+        action="store_true",
+        help="Fetch the pins the build compiles itself and build nothing. macOS and Windows take SDL from elsewhere and still need these.",
+    )
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs must be positive")
-    if platform.system() not in ("Linux", "Darwin"):
+    # Fetching is git and nothing else, so it works on a platform this script
+    # will not build SDL for.
+    if not args.sources_only and platform.system() not in ("Linux", "Darwin"):
         parser.error("This bootstrap supports Linux and macOS. See docs/BUILD.md for Windows SDK setup.")
-    for command in ("git", "cmake", "pkg-config"):
+    commands = ("git",) if args.sources_only else ("git", "cmake", "pkg-config")
+    for command in commands:
         if shutil.which(command) is None:
             parser.error(f"Missing {command}. See docs/BUILD.md.")
     if args.install_zig:
         run([sys.executable, str(ROOT / "tools/install_zig.py")])
     prefix = args.prefix.resolve()
-    resolved = {}
+    # Merged rather than replaced: a sources-only run happens before the SDL
+    # build on some jobs, and on others after it, and neither should erase what
+    # the other recorded.
+    resolved = json.loads((ROOT / ".deps/resolved.json").read_text()) if (ROOT / ".deps/resolved.json").exists() else {}
+    if args.sources_only:
+        fetch_sources(resolved)
+        (ROOT / ".deps/resolved.json").write_text(json.dumps(resolved, indent=2) + "\n")
+        print("Fetched the sources the build compiles. SDL and libghostty-vt are not built by this run.")
+        return
     for name in ("SDL", "SDL_ttf"):
         pin = PINS[name]
         source, commit = checkout(name, pin["repository"], pin["tag"])
@@ -87,17 +126,7 @@ def main() -> None:
         run(["cmake", "--build", str(build), "--parallel", str(args.jobs)])
         run(["cmake", "--install", str(build)])
     resolved["ghostty"] = build_ghostty(prefix)
-    # MicroTex is fetched and not built. Its CMake requires a GUI backend on
-    # Linux - gtkmm or Qt - and the library has no such dependency: the base
-    # source list compiles with a C++17 compiler and tinyxml2 alone, and the
-    # drawing comes from the editor through the library's own abstract
-    # Graphics2D interface. build.zig compiles those sources, which is what
-    # keeps a desktop toolkit out of a headless build.
-    for name in ("tinyxml2", "MicroTex"):
-        pin = PINS[name]
-        source, commit = checkout(name, pin.get("repository"), pin.get("commit") or pin.get("tag"))
-        resolved[name] = {**pin, "commit": commit}
-        print(f"{name} source: {source}")
+    fetch_sources(resolved)
     (ROOT / ".deps/resolved.json").write_text(json.dumps(resolved, indent=2) + "\n")
     print(f"SDL SDK prefix: {prefix}")
     print("Zig toolchain, Vulkan driver, and system fonts remain external prerequisites.")

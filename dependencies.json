@@ -18,6 +18,11 @@
     "MicroTex": {
         "repository": "https://github.com/NanoMichael/MicroTex.git",
         "commit": "0e3707f6dafebb121d98b53c64364d16fefe481d",
-        "notes": "The TeX engine behind display math, MIT. Fetched rather than built: its CMake insists on a GUI backend on Linux (gtkmm or Qt), and the library has no such dependency - the base source list is 78 C++ files that compile with nothing but a C++17 compiler and tinyxml2, and the drawing is supplied by the editor through the library's own abstract Graphics2D interface. Its fonts are C++ source (src/res/font/*.def.cpp) rather than a font binary, so nothing here is a font binary in the repository. tinyxml2 is a system dependency, like FreeType for SDL_ttf."
+        "notes": "The TeX engine behind display math, MIT. Fetched rather than built: its CMake insists on a GUI backend on Linux (gtkmm or Qt), and the library has no such dependency - the base source list is 78 C++ files that compile with nothing but a C++17 compiler and tinyxml2, and the drawing is supplied by the editor through the library's own abstract Graphics2D interface. Its fonts are C++ source (src/res/font/*.def.cpp) rather than a font binary, so nothing here is a font binary in the repository. tinyxml2, the XML parser it reads those mappings with, is fetched beside it and compiled by the same build."
+    },
+    "tinyxml2": {
+        "repository": "https://github.com/leethomason/tinyxml2.git",
+        "tag": "10.0.0",
+        "notes": "The XML parser MicroTex reads its resource mappings with, zlib licence. Fetched and compiled here rather than required from the system: it is one C++ source file and one header, and no package for it exists on all three platforms the gate builds on - pkg-config found it on none of them."
     }
 }

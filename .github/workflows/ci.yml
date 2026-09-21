@@ -159,6 +159,8 @@ jobs:
           if [ ! -d .deps/zig ]; then python3 tools/install_zig.py; fi
           echo "$GITHUB_WORKSPACE/.deps/zig" >> "$GITHUB_PATH"
           brew install sdl3 sdl3_ttf vulkan-loader molten-vk vulkan-validationlayers
+      - name: Sources the build compiles itself
+        run: python3 tools/bootstrap.py --sources-only
       - name: Build the terminal library
         run: python3 tools/bootstrap_ghostty.py
       - uses: actions/setup-node@v5
@@ -252,6 +254,8 @@ jobs:
           "$env:GITHUB_WORKSPACE/.deps/install/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
 
           "$env:GITHUB_WORKSPACE/.deps/tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - name: Sources the build compiles itself
+        run: python tools/bootstrap.py --sources-only
       - name: Build the terminal library
         run: python tools/bootstrap_ghostty.py
       - name: Runtime libraries on the path

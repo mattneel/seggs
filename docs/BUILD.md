@@ -49,7 +49,13 @@ Install the build dependencies through Homebrew.
 
 ```sh
 brew install cmake pkg-config freetype
+python3 tools/bootstrap.py --sources-only
 ```
+
+The last command fetches the two sources the build compiles itself - the engine
+behind display math and the XML parser it reads with - which the full bootstrap
+would fetch alongside SDL. macOS takes SDL from Homebrew, so it needs these two
+on their own.
 
 The macOS path embeds Metal source and does not need glslangValidator.
 SDL compiles the MSL source at runtime.
@@ -137,11 +143,13 @@ passes them to the build with `-Dshader-dir`.
 2. Prepare matching SDL3 and SDL3_ttf development libraries in one SDK prefix.
 3. Add the SDK's DLL directory to PATH.
 4. Add glslangValidator to PATH.
-5. Build libghostty-vt into `.deps/install` with `python tools/bootstrap_ghostty.py`; it is built by its own Zig release, not the one in `.zigversion`.
-6. Run the native build with that SDK prefix.
+5. Fetch the two sources the build compiles itself with `python tools/bootstrap.py --sources-only`. The engine behind display math and the XML parser it reads with are fetched rather than built, and no system package for either exists on all three platforms, so this step is not optional on a platform that takes SDL from somewhere else.
+6. Build libghostty-vt into `.deps/install` with `python tools/bootstrap_ghostty.py`; it is built by its own Zig release, not the one in `.zigversion`.
+7. Run the native build with that SDK prefix.
 
 ```powershell
 $env:Path = "C:\sdk\bin;C:\tools\glslang\bin;$env:Path"
+python tools/bootstrap.py --sources-only
 python tools/bootstrap_ghostty.py
 zig build verify -Dsdl-prefix=C:/sdk -Dghostty-prefix=.deps/install -Dpython=python
 zig build run -Dsdl-prefix=C:/sdk -Dghostty-prefix=.deps/install -- --windowed

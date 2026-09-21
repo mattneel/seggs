@@ -177,6 +177,13 @@ pub fn build(b: *std.Build) void {
     // The list is explicit rather than globbed for the reason the Yoga list
     // above is: bumping the pin then fails here rather than silently compiling a
     // partial engine and rendering wrong.
+    // Checked while configuring rather than left to the compiler: a missing
+    // checkout means the bootstrap that fetches these did not run, and the
+    // compiler's own error names a file without naming the remedy.
+    for ([_][]const u8{ ".deps/src/MicroTex", ".deps/src/tinyxml2" }) |directory| {
+        std.Io.Dir.cwd().access(b.graph.io, directory, .{}) catch
+            std.debug.panic("{s} is missing. Run `python3 tools/bootstrap.py --sources-only`.", .{directory});
+    }
     const microtex_root = b.path(".deps/src/MicroTex");
     const microtex_lib = b.addLibrary(.{ .name = "microtex", .root_module = b.createModule(.{
         .target = target,

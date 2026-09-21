@@ -7,19 +7,45 @@ const std = @import("std");
 const text = @import("../core/text.zig");
 const Allocator = std.mem.Allocator;
 
+/// Where a row of `width` should end when it would otherwise break inside a
+/// word: the last space that fits, or nowhere when the row is one long word.
+/// Returning null means "break at the column", which is what a word longer than
+/// the row needs.
+fn breakAt(bytes: []const u8, start: usize, pos: usize) ?usize {
+    var candidate: ?usize = null;
+    var index = start;
+    while (index < pos) {
+        if (bytes[index] == ' ') candidate = index;
+        index = text.next(bytes, index);
+    }
+    return candidate;
+}
+
 /// Break `bytes` into rows of at most `columns` characters, honouring the
-/// newlines that are already there. The spans borrow `bytes`; the list owns its
-/// own array and is the caller's to clear or release.
+/// newlines that are already there and preferring to break between words. The
+/// spans borrow `bytes`; the list owns its own array and is the caller's to
+/// clear or release.
 pub fn spans(a: Allocator, bytes: []const u8, columns: usize, out: *std.ArrayList([]const u8)) !void {
     const width = @max(1, columns);
     var start: usize = 0;
     var pos: usize = 0;
     var column: usize = 0;
     while (pos < bytes.len) {
-        if (bytes[pos] == '\n' or column >= width) {
+        // A newline is where the text itself says the row ends.
+        if (bytes[pos] == '\n') {
             try out.append(a, bytes[start..pos]);
-            if (bytes[pos] == '\n') pos += 1;
+            pos += 1;
             start = pos;
+            column = 0;
+            continue;
+        }
+        if (column >= width) {
+            // A break inside a word is the last resort: a reader notices a word
+            // cut in half far more than a slightly shorter row.
+            const cut = breakAt(bytes, start, pos) orelse pos;
+            try out.append(a, bytes[start..cut]);
+            start = if (cut < pos) cut + 1 else cut;
+            pos = start;
             column = 0;
             continue;
         }
@@ -34,18 +60,26 @@ pub fn spans(a: Allocator, bytes: []const u8, columns: usize, out: *std.ArrayLis
 pub fn rowCount(bytes: []const u8, columns: usize) usize {
     const width = @max(1, columns);
     var rows: usize = 1;
+    var start: usize = 0;
     var pos: usize = 0;
     var column: usize = 0;
     while (pos < bytes.len) {
         if (bytes[pos] == '\n') {
             rows += 1;
             pos += 1;
+            start = pos;
             column = 0;
             continue;
         }
         if (column >= width) {
+            // The same break the renderer takes, so a box is never sized for a
+            // different arrangement than the one it holds.
+            const cut = breakAt(bytes, start, pos) orelse pos;
             rows += 1;
+            start = if (cut < pos) cut + 1 else cut;
+            pos = start;
             column = 0;
+            continue;
         }
         pos = text.next(bytes, pos);
         column += 1;
@@ -81,6 +115,29 @@ test "text breaks on the column it is given and on its own newlines" {
     try std.testing.expectEqual(@as(usize, 2), list.items.len);
     try std.testing.expectEqualStrings("éé", list.items[0]);
     try std.testing.expectEqualStrings("é", list.items[1]);
+}
+
+test "rows break between words when there is a word boundary to use" {
+    const a = std.testing.allocator;
+    var list: std.ArrayList([]const u8) = .empty;
+    defer list.deinit(a);
+    try spans(a, "hello world", 8, &list);
+    try std.testing.expectEqual(@as(usize, 2), list.items.len);
+    try std.testing.expectEqualStrings("hello", list.items[0]);
+    try std.testing.expectEqualStrings("world", list.items[1]);
+
+    // A single word longer than the row still has to be placed.
+    list.clearRetainingCapacity();
+    try spans(a, "hello wonderful", 8, &list);
+    try std.testing.expectEqualStrings("hello", list.items[0]);
+    try std.testing.expectEqualStrings("wonderfu", list.items[1]);
+    try std.testing.expectEqualStrings("l", list.items[2]);
+
+    // Counting rows has to take the same breaks, or a box is sized for one
+    // arrangement and holds another.
+    try std.testing.expectEqual(@as(usize, 2), rowCount("hello world", 8));
+    try std.testing.expectEqual(@as(usize, 3), rowCount("hello wonderful", 8));
+    try std.testing.expectEqual(@as(usize, 2), rowCount("hello\nworld", 40));
 }
 
 test "a row can be counted before it is drawn" {

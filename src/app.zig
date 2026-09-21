@@ -865,7 +865,7 @@ pub const App = struct {
     /// is asked for its description on every frame it is drawn, so a panel that
     /// shows live state stays correct without an invalidation protocol, and a
     /// panel that throws simply contributes nothing.
-    fn drawPanel(self: *App, r: *Renderer, region: []const u8, bounds: Rect) !bool {
+    fn drawPanel(self: *App, r: *Renderer, frame: std.mem.Allocator, region: []const u8, bounds: Rect) !bool {
         const host = self.host orelse return false;
         const description = (host.panelDescription(region, bounds.w, bounds.h) catch |err| {
             std.log.err("panel {s}: {s}", .{ region, @errorName(err) });
@@ -891,7 +891,7 @@ pub const App = struct {
         const previous_clip = r.clip;
         r.clip = bounds;
         defer r.clip = previous_clip;
-        try self.panel_tree.render(r, bounds.x, bounds.y);
+        try self.panel_tree.render(r, frame, bounds.x, bounds.y);
         var targets: std.ArrayListUnmanaged(ext_ui.Tree.Target) = .empty;
         defer targets.deinit(self.allocator);
         try self.panel_tree.collectTargets(&targets, self.allocator, bounds.x, bounds.y);
@@ -1233,17 +1233,17 @@ pub const App = struct {
         try r.text(16, 11, "SEGGS", theme.accent);
         try r.text(116, 11, "/ agent-native workspace", theme.muted);
         try r.text(@max(400, r.width - 174), 11, "SDL3 GPU / ACP", theme.accent);
-        _ = try self.drawPanel(r, "activity", g.activity);
+        _ = try self.drawPanel(r, frame, "activity", g.activity);
         if (g.explorer.w > 0) {
             if (self.dock == .runs) {
                 try self.drawRuns(r, frame);
             } else {
-                _ = try self.drawPanel(r, "explorer", g.explorer);
+                _ = try self.drawPanel(r, frame, "explorer", g.explorer);
             }
             try self.drawDockSwitch(r);
         }
         switch (self.perspective) {
-            .code => try self.drawEditor(r),
+            .code => try self.drawEditor(r, frame),
             .review => try self.drawReview(r, frame),
             .compose => try self.drawCompose(r, frame),
         }
@@ -1251,7 +1251,7 @@ pub const App = struct {
         try self.drawInspector(r, frame);
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
         try r.rect(g.status, theme.selected);
-        _ = try self.drawPanel(r, "status", g.status);
+        _ = try self.drawPanel(r, frame, "status", g.status);
         if (self.overlay != .none) try self.drawOverlay(r);
     }
 
@@ -1275,15 +1275,15 @@ pub const App = struct {
         self.selection_anchor = null;
     }
 
-    fn drawEditor(self: *App, r: *Renderer) !void {
+    fn drawEditor(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
         const bounds = self.geometry.editor;
         r.clip = bounds;
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 36 }, theme.panel);
         // Tabs and the line below them are panels an extension fills; the editor
         // itself keeps drawing the text, because that is the document rather
         // than chrome around it.
-        _ = try self.drawPanel(r, "tabs", .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 36 });
-        _ = try self.drawPanel(r, "header", .{ .x = bounds.x, .y = bounds.y + 36, .w = bounds.w, .h = 30 });
+        _ = try self.drawPanel(r, frame, "tabs", .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 36 });
+        _ = try self.drawPanel(r, frame, "header", .{ .x = bounds.x, .y = bounds.y + 36, .w = bounds.w, .h = 30 });
         const loc = self.cursorLocation();
         const viewport = self.editorRect();
         r.clip = viewport;
@@ -2320,7 +2320,7 @@ pub const App = struct {
         }
         r.clip = bounds;
         const run: Rect = .{ .x = bounds.x + 14, .y = run_y + 18 + steps_height, .w = bounds.w - 28, .h = @max(0, run_bottom - run_y - 18 - steps_height) };
-        if (client.transcript.items.len == 0 and try self.drawPanel(r, "transcript", run)) {
+        if (client.transcript.items.len == 0 and try self.drawPanel(r, frame, "transcript", run)) {
             // A registered panel owns this space, so the interface does not
             // carry a copy of what an extension would say.
         } else {

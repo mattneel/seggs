@@ -1,4 +1,5 @@
 const std = @import("std");
+const wrap = @import("../ui/wrap.zig");
 const yoga = @import("yoga");
 const Renderer = @import("../gpu/renderer.zig").Renderer;
 const Color = @import("../ui/theme.zig").Color;
@@ -106,8 +107,8 @@ pub const Tree = struct {
 
     /// Draw the laid-out tree through the same quad path as the rest of the
     /// interface, offset by the panel's origin.
-    pub fn render(self: *Tree, r: *Renderer, origin_x: f32, origin_y: f32) !void {
-        try renderNode(&self.root, r, origin_x, origin_y);
+    pub fn render(self: *Tree, r: *Renderer, a: std.mem.Allocator, origin_x: f32, origin_y: f32) !void {
+        try renderNode(&self.root, r, a, origin_x, origin_y);
     }
 
     /// Deepest node containing a point, or null. Used to tell an extension which
@@ -323,12 +324,23 @@ fn justifyValue(justify: Node.Justify) yoga.YGJustify {
 /// A text leaf reports the grid it occupies: one cell per codepoint, one line
 /// per newline. Yoga passes the available space, which a wrapping leaf would use.
 fn measureText(node: yoga.YGNodeConstRef, width: f32, width_mode: yoga.YGMeasureMode, height: f32, height_mode: yoga.YGMeasureMode) callconv(.c) yoga.YGSize {
-    _ = .{ width, width_mode, height, height_mode };
+    _ = .{ height, height_mode };
     const context = yoga.YGNodeGetContext(node) orelse return .{ .width = 0, .height = 0 };
     const payload: *const Node = @ptrCast(@alignCast(context));
+    const full = @as(f32, @floatFromInt(cellsIn(payload.text))) * payload.metrics.cell_width;
+    // A text node that reports its unwrapped width gets that width from the
+    // layout, and then spills out of whatever contains it. It is measured
+    // against the room it was offered, and its height is how many rows the text
+    // becomes at that width - the same question the renderer asks before drawing
+    // it, so the box and the text agree.
+    // Yoga reports an unconstrained measure as mode zero, which is the one case
+    // where a text node may take all the room its content wants.
+    const unconstrained: yoga.YGMeasureMode = @intCast(yoga.YGMeasureModeUndefined);
+    const room = if (width_mode == unconstrained) full else @min(full, width);
+    const columns: usize = @intFromFloat(@max(1, room / payload.metrics.cell_width));
     return .{
-        .width = @as(f32, @floatFromInt(cellsIn(payload.text))) * payload.metrics.cell_width,
-        .height = @as(f32, @floatFromInt(linesIn(payload.text))) * payload.metrics.line_height,
+        .width = room,
+        .height = @as(f32, @floatFromInt(wrap.rowCount(payload.text, columns))) * payload.metrics.line_height,
     };
 }
 
@@ -357,7 +369,7 @@ fn nextCodepoint(text: []const u8, index: usize) usize {
 
 /// Yoga reports each node relative to its parent, so the parent's resolved
 /// position is the origin for its children.
-fn renderNode(node: *const Node, r: *Renderer, origin_x: f32, origin_y: f32) !void {
+fn renderNode(node: *const Node, r: *Renderer, a: std.mem.Allocator, origin_x: f32, origin_y: f32) !void {
     const ref = node.yoga_node orelse return;
     const x = origin_x + yoga.YGNodeLayoutGetLeft(ref);
     const y = origin_y + yoga.YGNodeLayoutGetTop(ref);
@@ -366,10 +378,19 @@ fn renderNode(node: *const Node, r: *Renderer, origin_x: f32, origin_y: f32) !vo
     if (node.background) |fill| try r.rect(.{ .x = x, .y = y, .w = width, .h = height }, fill);
     switch (node.kind) {
         .box => try r.rect(.{ .x = x, .y = y, .w = width, .h = height }, node.color),
-        .text => try r.text(x, y, node.text, node.color),
+        .text => {
+            // Wrapped at the width the layout gave it, which is the width it
+            // was measured against.
+            const columns: usize = @intFromFloat(@max(1, width / node.metrics.cell_width));
+            var spans: std.ArrayList([]const u8) = .empty;
+            try wrap.spans(a, node.text, columns, &spans);
+            for (spans.items, 0..) |span, index| {
+                try r.text(x, y + @as(f32, @floatFromInt(index)) * node.metrics.line_height, span, node.color);
+            }
+        },
         .row, .column => {},
     }
-    for (node.children) |*child| try renderNode(child, r, x, y);
+    for (node.children) |*child| try renderNode(child, r, a, x, y);
 }
 
 fn findNode(node: *const Node, x: f32, y: f32, origin_x: f32, origin_y: f32) ?*const Node {

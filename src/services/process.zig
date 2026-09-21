@@ -4,6 +4,7 @@
 //! output are kept together: a caller downstream has to be able to tell a real
 //! result from a hopeful one, and an agent's summary is not a substitute.
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("native");
 const Allocator = std.mem.Allocator;
 
@@ -91,7 +92,14 @@ pub fn run(a: Allocator, cwd: []const u8, argv: []const []const u8) !Outcome {
     return .{ .exit = exit_code, .stdout = try stdout.toOwnedSlice(a), .stderr = try stderr.toOwnedSlice(a) };
 }
 
+// These run a shell to produce output on both streams and a non-zero status.
+// Windows has no /bin/sh, and the runner is otherwise covered by the platforms
+// where the pipeline itself runs, so the shell cases are skipped there rather
+// than rewritten around a different command processor.
+const shell_missing = builtin.os.tag == .windows;
+
 test "a command's exit status and output are kept together" {
+    if (shell_missing) return error.SkipZigTest;
     const a = std.testing.allocator;
     var outcome = try run(a, ".", &.{ "/bin/sh", "-c", "echo out; echo err >&2; exit 3" });
     defer outcome.deinit(a);
@@ -102,6 +110,7 @@ test "a command's exit status and output are kept together" {
 }
 
 test "a command that succeeds says so by its status" {
+    if (shell_missing) return error.SkipZigTest;
     const a = std.testing.allocator;
     var outcome = try run(a, ".", &.{ "/bin/sh", "-c", "echo done" });
     defer outcome.deinit(a);

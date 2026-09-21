@@ -43,6 +43,8 @@ fn run(init: std.process.Init) !void {
     var exercise_run = false;
     var exercise_compose = false;
     var exercise_tabs = false;
+    var exercise_markdown = false;
+    var exercise_transcript = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -74,6 +76,10 @@ fn run(init: std.process.Init) !void {
             exercise_compose = true;
         } else if (std.mem.eql(u8, arg, "--exercise-tabs")) {
             exercise_tabs = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-markdown")) {
+            exercise_markdown = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-transcript")) {
+            exercise_transcript = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -233,6 +239,8 @@ fn run(init: std.process.Init) !void {
         if (exercise_run) exerciseRun(&app, frames, frame_arena.allocator());
         if (exercise_compose) exerciseCompose(&app, frames);
         if (exercise_tabs) exerciseTabs(&app, frames);
+        if (exercise_markdown) exerciseMarkdown(&app, frames);
+        if (exercise_transcript) exerciseTranscript(&app, frames);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -605,6 +613,153 @@ fn exerciseCompose(app: *App, frame: usize) void {
             std.log.info("compose {s}: {d} steps, {s}", .{ active.name, active.steps.len, names[0..written] });
         },
         else => {},
+    }
+}
+
+/// The transcript as prose: a heading, a paragraph with inline runs, a list, a
+/// quotation, a rule, a fenced code block, and a fenced diff. It is sent to the
+/// mock harness, which echoes it back a few bytes at a time, so what the panel
+/// draws is what came over the wire rather than bytes written into the
+/// transcript by a fixture.
+const markdown_sample =
+    \\
+    \\# Transcript, as markdown
+    \\
+    \\An agent's message with **bold**, *italic*, and `inline code`, wrapped at
+    \\the panel's column rather than at the one the agent happened to choose.
+    \\
+    \\- a bullet, whose marker is not part of its words
+    \\- a bullet long enough that the panel has to wrap it, so the continuation
+    \\  line starts where the text above it does
+    \\
+    \\> a quotation, marked down its left edge
+    \\
+    \\---
+    \\
+    \\```zig
+    \\// code takes the theme's scopes, as the editor's does
+    \\const answer = 42;
+    \\pub fn main() void {}
+    \\```
+    \\
+    \\```diff
+    \\--- a/src/app.zig
+    \\+++ b/src/app.zig
+    \\@@ -3101,7 +3101,8 @@
+    \\         } else {
+    \\             const bytes = if (client.transcript.items.len == 0) default_help else client.transcript.items;
+    \\-            try wrappedTail(r, frame, run, bytes, self.transcript_scroll, theme.text);
+    \\+            try self.drawTranscript(r, frame, run, bytes);
+    \\         }
+    \\```
+;
+
+/// Whether the sample has been sent, and whether the harness stopped echoing.
+var markdown_sent = false;
+var markdown_reported = false;
+
+/// Put a markdown message in the transcript by having a harness say it: the
+/// lane is started, the sample is sent as a prompt, and the frames after that
+/// wait for the echo instead of assuming how fast a machine runs a mock.
+fn exerciseMarkdown(app: *App, frame: usize) void {
+    const mock = app.agentIndex("Local mock") orelse {
+        std.log.err("markdown: no local mock profile", .{});
+        return;
+    };
+    if (frame == 6) {
+        app.active = mock;
+        app.startAgent() catch |err| std.log.err("markdown: {s}", .{@errorName(err)});
+        return;
+    }
+    if (!markdown_sent) {
+        if (!app.agentReady(mock)) {
+            if (frame > 400) std.log.err("markdown: the harness never came up", .{});
+            return;
+        }
+        markdown_sent = true;
+        app.prompt_text.clearRetainingCapacity();
+        app.prompt_text.appendSlice(app.allocator, markdown_sample) catch |err| {
+            std.log.err("markdown: {s}", .{@errorName(err)});
+            return;
+        };
+        app.pipeTo(mock) catch |err| std.log.err("markdown: {s}", .{@errorName(err)});
+        return;
+    }
+    if (markdown_reported) return;
+    // The transcript is complete when the harness is idle again and the last
+    // line of the sample is in it: an echo still arriving is not a transcript.
+    const words = app.agentWords(mock);
+    if (app.agentState(mock) == .ready and std.mem.indexOf(u8, words, "drawTranscript") != null) {
+        markdown_reported = true;
+        std.log.info("markdown: the harness echoed {d} bytes; the sample is in the transcript", .{words.len});
+    } else if (frame > 600) {
+        std.log.err("markdown: the echo never finished; {d} bytes so far", .{words.len});
+    }
+}
+
+/// Whether the transcript panel has been asked the two things it can get wrong.
+var transcript_scrolled = false;
+var transcript_oversize = false;
+
+/// The transcript panel under strain, with no harness in the way: the markdown
+/// sample is written straight into the lane's buffer with enough filler after
+/// it to overflow the panel, then the wheel asks for more rows than there are,
+/// and finally the transcript is made longer than the reader will take. Every
+/// step is on a fixed frame, so the probe does not depend on how fast a harness
+/// starts.
+fn exerciseTranscript(app: *App, frame: usize) void {
+    const mock = app.agentIndex("Local mock") orelse return;
+    switch (frame) {
+        6 => {
+            app.active = mock;
+            app.startAgent() catch |err| std.log.err("transcript: {s}", .{@errorName(err)});
+            return;
+        },
+        8 => {
+            const transcript = &app.clients[mock].transcript;
+            transcript.clearRetainingCapacity();
+            transcript.appendSlice(app.allocator, markdown_sample) catch return;
+            for (0..40) |index| {
+                var line: [64]u8 = undefined;
+                const filler = std.fmt.bufPrint(&line, "\n- filler line {d}\n", .{index}) catch return;
+                transcript.appendSlice(app.allocator, filler) catch return;
+            }
+            return;
+        },
+        else => {},
+    }
+    if (!transcript_scrolled and frame >= 20 and app.agentsOpen()) {
+        transcript_scrolled = true;
+        var ev = std.mem.zeroes(c.SDL_Event);
+        ev.type = c.SDL_EVENT_MOUSE_WHEEL;
+        // Sixty notches is a hundred and eighty rows, which is more than the
+        // transcript has: the panel has to stop at its first row rather than
+        // count past it into empty surface.
+        ev.wheel.y = 60;
+        ev.wheel.mouse_x = app.geometry.agents.x + app.geometry.agents.w / 2;
+        ev.wheel.mouse_y = app.geometry.agents.y + app.geometry.agents.h / 2;
+        if (!c.SDL_PushEvent(&ev)) std.log.err("transcript: the wheel event was not delivered", .{});
+        return;
+    }
+    if (transcript_scrolled and !transcript_oversize and frame >= 30) {
+        transcript_oversize = true;
+        std.log.info("transcript: the wheel asked for 180 rows; the panel stopped at {d} of {d}", .{ app.transcript_scroll, app.transcript_max_scroll });
+        return;
+    }
+    if (transcript_oversize and frame == 40) {
+        // Past the reader's bound, so the panel has to fall back to the plain
+        // wrapped text it drew before markdown, and say so, rather than draw
+        // nothing or take the frame down with it.
+        const bytes = app.allocator.alloc(u8, (1 << 20) + 1) catch return;
+        defer app.allocator.free(bytes);
+        @memset(bytes, 'x');
+        const transcript = &app.clients[mock].transcript;
+        transcript.clearRetainingCapacity();
+        transcript.appendSlice(app.allocator, bytes) catch |err| std.log.err("transcript: {s}", .{@errorName(err)});
+        return;
+    }
+    if (transcript_oversize and frame == 60) {
+        std.log.info("transcript: an oversize transcript says: {s}", .{app.statusText()});
     }
 }
 

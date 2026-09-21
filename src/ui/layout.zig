@@ -64,10 +64,10 @@ pub const Layout = struct {
     /// the width this layout would choose, which is what keeps a window resize
     /// working after a drag.
     pub const Resize = struct {
-    /// Whether the agent dock is on screen at all. There is no agent panel
-    /// with no agents in it, the way there is no terminal dock with no shells:
-    /// an empty column of chrome is room taken from the editor to say nothing.
-    agents_open: bool = true,
+        /// Whether the agent dock is on screen at all. There is no agent panel
+        /// with no agents in it, the way there is no terminal dock with no shells:
+        /// an empty column of chrome is room taken from the editor to say nothing.
+        agents_open: bool = true,
 
         explorer: ?f32 = null,
         agents: ?f32 = null,

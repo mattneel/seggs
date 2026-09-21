@@ -25,6 +25,8 @@ const Divider = enum { explorer, agents, terminal };
 
 const review = @import("editor/review.zig");
 const wrap = @import("ui/wrap.zig");
+const markdown = @import("ui/markdown.zig");
+const diff = @import("ui/diff.zig");
 const shell_integration = @import("services/shell.zig");
 const terminals = @import("services/terminals.zig");
 const tree_widget = @import("ui/tree.zig");
@@ -180,6 +182,14 @@ pub const App = struct {
     first_column: usize = 0,
     explorer_first: usize = 0,
     transcript_scroll: usize = 0,
+    /// How far the transcript could be scrolled the last time it was drawn, in
+    /// display rows. The wheel clamps against it so the panel cannot be
+    /// scrolled past its own content into a page of empty surface.
+    transcript_max_scroll: usize = 0,
+    /// Whether the last transcript draw fell back to plain wrapping because the
+    /// markdown did not parse. A transcript that cannot be styled is still read;
+    /// saying so once is a report, saying it every frame is noise.
+    transcript_plain: bool = false,
     selection_anchor: ?usize = null,
     drag: bool = false,
     follow_cursor: bool = true,
@@ -590,7 +600,10 @@ pub const App = struct {
                 } else if (self.geometry.explorer.contains(x, y)) {
                     self.explorer_first = adjust(self.explorer_first, delta, self.workspace.explorer.entries.items.len);
                 } else if (self.geometry.agents.contains(x, y)) {
-                    self.transcript_scroll = adjust(self.transcript_scroll, -delta, 50_000);
+                    // The bound is what the last frame drew, because the wheel
+                    // is answered before the next one is: the transcript's rows
+                    // are markdown's, not the byte length's.
+                    self.transcript_scroll = adjust(self.transcript_scroll, -delta, self.transcript_max_scroll);
                 } else {
                     const last = countLines(self.cached) - 1;
                     self.first_line = adjust(self.first_line, delta, last);
@@ -3090,7 +3103,7 @@ pub const App = struct {
             // carry a copy of what an extension would say.
         } else {
             const bytes = if (client.transcript.items.len == 0) default_help else client.transcript.items;
-            try wrappedTail(r, frame, run, bytes, self.transcript_scroll, theme.text);
+            try self.drawTranscript(r, frame, run, bytes);
         }
 
         r.clip = bounds;
@@ -3118,6 +3131,62 @@ pub const App = struct {
         var hint: [128]u8 = undefined;
         const room: usize = @intFromFloat(@max(4, (bounds.w - 28) / r.atlas.advance));
         try r.text(bounds.x + 14, bounds.y + bounds.h - 27, wrap.elide(&hint, "click to type · Ctrl+Shift+Enter picks a destination", room), theme.muted);
+    }
+
+    /// The transcript, as markdown.
+    ///
+    /// What an agent says is prose, so it is read as prose rather than as a
+    /// terminal's output: a heading is a heading, a list is a list, and a
+    /// fenced diff is drawn in the colours a diff is read in. The bytes are
+    /// still the bytes - when the parse fails the panel falls back to the plain
+    /// wrapped text it drew before, because a transcript that cannot be styled
+    /// is still a transcript.
+    fn drawTranscript(self: *App, r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8) !void {
+        if (rect.h < self.line_height or rect.w <= 0) return;
+        const outer = r.clip;
+        defer r.clip = outer;
+        r.clip = rect;
+        // Body text sits on the editor's background and a code block on the
+        // panel colour, which is what makes a block read as a block: on a
+        // panel-coloured surface, a panel-coloured block is the same rectangle
+        // as the space around it.
+        try r.rect(rect, theme.background);
+        const blocks = markdown.parse(frame, bytes) catch |err| {
+            // A transcript that cannot be parsed is said once rather than once
+            // a frame: the frame after it is the same transcript.
+            if (!self.transcript_plain) {
+                self.transcript_plain = true;
+                self.status("Transcript: markdown ({s}); showing it plainly.", .{@errorName(err)});
+            }
+            return wrappedTail(r, frame, rect, bytes, self.transcript_scroll, theme.text);
+        };
+        self.transcript_plain = false;
+        const columns: usize = @intFromFloat(@max(1, rect.w / self.char_width));
+        const rows = try transcriptRows(frame, blocks, columns, self.char_width);
+        try self.drawRows(r, rect, rows);
+    }
+
+    /// Draw the transcript's rows, scrolled the way the panel has always
+    /// scrolled: `transcript_scroll` counts display rows back from the end, so
+    /// zero shows the newest lines and the top of the content is the end of
+    /// the scroll.
+    fn drawRows(self: *App, r: *Renderer, rect: Rect, rows: []const Row) !void {
+        const viewport: usize = @intFromFloat(@max(1, rect.h / self.line_height));
+        const limit = rows.len -| viewport;
+        // The wheel clamps against this: it is the one number that says how
+        // much transcript there is to scroll, and it is only known here.
+        self.transcript_max_scroll = limit;
+        const scroll = @min(self.transcript_scroll, limit);
+        const end = rows.len -| scroll;
+        const begin = end -| viewport;
+        for (rows[begin..end], 0..) |row, index| {
+            const y = rect.y + @as(f32, @floatFromInt(index)) * self.line_height;
+            if (row.background) |colour| try r.rect(.{ .x = rect.x, .y = y, .w = rect.w, .h = self.line_height }, colour);
+            if (row.rule) try r.rect(.{ .x = rect.x, .y = y + self.line_height / 2, .w = rect.w, .h = 1 }, theme.border);
+            if (row.bar) try r.rect(.{ .x = rect.x + self.char_width / 2, .y = y, .w = 2, .h = self.line_height }, theme.border);
+            var pen = rect.x + row.indent;
+            for (row.spans) |span| pen = try drawSpan(r, pen, y, span.text, span.fg);
+        }
     }
 
     /// The strip along the top of the dock: a tab per lane, the one showing
@@ -3222,4 +3291,390 @@ fn wrappedTail(r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []cons
     const end = spans.items.len -| @min(scroll, spans.items.len -| 1);
     const begin = end -| rows;
     for (spans.items[begin..end], 0..) |span, row| try r.text(rect.x, rect.y + @as(f32, @floatFromInt(row)) * r.atlas.line_height, span, color);
+}
+
+// ---- the transcript's own surface ------------------------------------------
+//
+// Everything below turns a parsed message into rows. It is deliberately pure:
+// the markdown reader and the diff reader decide what the bytes mean, and this
+// decides what a reader sees - where a line starts, what is behind it, and what
+// colour it is. Nothing here draws.
+
+/// One run of characters and the colour it is drawn in. A paragraph reaches the
+/// panel as runs rather than as one string, because inline code is marked
+/// differently from the sentence around it; a row is a sequence of these.
+const Span = struct { text: []const u8, fg: theme.Color };
+
+/// A row of the transcript panel: what it says, where it starts, and what is
+/// drawn behind it. An indent and a background are most of the difference
+/// between a paragraph, a list item, a quotation, and a line of code.
+const Row = struct {
+    spans: []const Span = &.{},
+    /// Where the first run starts, measured from the panel's left edge.
+    indent: f32 = 0,
+    /// Filled behind the row. Every row of a code block carries the same
+    /// colour, so the block reads as one panel rather than as body text.
+    background: ?theme.Color = null,
+    /// A hairline across the row instead of text, for a horizontal rule.
+    rule: bool = false,
+    /// A mark down the left edge, for a quotation.
+    bar: bool = false,
+};
+
+/// A place in a block's runs: which run, and where in it. Wrapping counts
+/// characters across runs, so a break has to be named the same way - a byte
+/// offset into one run would not survive the next run starting.
+const Place = struct { run: usize, at: usize };
+
+/// A block's own marker, as the agent wrote it: how much of the line it takes
+/// up, and the token a list draws in its margin.
+///
+/// The reader keeps the marker in the block's text - `- item`, `> quoted`, and
+/// `## heading` are the line as written - so the interface takes it back off,
+/// rather than showing the reader the syntax and then a marker of its own.
+const Marker = struct { after: usize, token: []const u8 };
+
+/// The shape of the rows one block produces: the column its text wraps at,
+/// where a line starts, how far a wrapped line's continuation steps in, and
+/// what is filled behind it.
+///
+/// The indents are counted in cells rather than in pixels, because a column is
+/// what the wrapping is counted in and the advance is what turns one into the
+/// other.
+const Shape = struct {
+    /// The cells the panel has for this block.
+    columns: usize,
+    /// The width of a cell.
+    advance: f32,
+    /// Where a line's text starts, in cells.
+    indent: usize = 0,
+    /// The extra indent a continuation of a wrapped line gets, in cells: a
+    /// wrapped code line that steps in still reads as one line rather than as
+    /// several, which is what a diff's colour alone cannot say.
+    hang: usize = 0,
+    /// The fill behind every row, for a block that has one.
+    background: ?theme.Color = null,
+
+    /// One row of this block: `continuation` for a row that wraps a line the
+    /// row above it began.
+    fn row(self: Shape, spans: []const Span, continuation: bool) Row {
+        const start = self.indent + if (continuation) self.hang else 0;
+        return .{
+            .spans = spans,
+            .indent = @as(f32, @floatFromInt(start)) * self.advance,
+            .background = self.background,
+        };
+    }
+};
+
+/// Turn parsed blocks into the rows the panel draws.
+///
+/// The column a block wraps at is the panel's, less whatever its own marker
+/// takes, so a continuation line starts where the text above it does.
+fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32) ![]const Row {
+    var rows: std.ArrayList(Row) = .empty;
+    for (blocks) |block| {
+        const shape = Shape{ .columns = columns, .advance = advance };
+        switch (block.kind) {
+            // A heading is one line at any column: a wrapped heading would not
+            // be read as a heading. Past the panel's edge it is clipped, which
+            // is what the row's clip is for.
+            .heading => try rows.append(a, .{ .spans = try spansOf(a, headingText(block), theme.accent) }),
+            .paragraph => try wrappedRows(a, try inlineSpans(a, block.inlines, theme.text, 0), shape, &rows),
+            .bullet => {
+                const marker = bulletMarker(block.text);
+                // A number the agent wrote is part of the item, so it stays; an
+                // unordered marker becomes a bullet, because that is the one the
+                // panel draws.
+                const token = if (marker.token.len > 0 and std.ascii.isDigit(marker.token[0])) marker.token else "•";
+                const width = countCells(token) + 1;
+                const first = rows.items.len;
+                try wrappedRows(a, try inlineSpans(a, block.inlines, theme.text, marker.after), .{ .columns = columns, .advance = advance, .indent = width }, &rows);
+                if (rows.items.len > first) {
+                    const label = try std.fmt.allocPrint(a, "{s} ", .{token});
+                    rows.items[first].spans = try withMarker(a, rows.items[first].spans, label, theme.muted);
+                }
+            },
+            .quote => {
+                // The bar down the left is the quotation's mark, so the `>`
+                // the agent wrote is taken off the text rather than drawn next
+                // to it.
+                const first = rows.items.len;
+                try wrappedRows(a, try inlineSpans(a, block.inlines, theme.muted, afterQuote(block.text)), .{ .columns = columns, .advance = advance, .indent = 2 }, &rows);
+                for (rows.items[first..]) |*row| row.bar = true;
+            },
+            .rule => try rows.append(a, .{ .rule = true }),
+            .code => try codeRows(a, block, columns, advance, &rows),
+        }
+    }
+    return rows.toOwnedSlice(a);
+}
+
+/// Wrap coloured runs the way `wrap.spans` wraps one string, and append one row
+/// per display line, each shaped the way the block's rows are.
+fn wrappedRows(a: std.mem.Allocator, spans: []const Span, shape: Shape, out: *std.ArrayList(Row)) !void {
+    var lines: std.ArrayList([]const Span) = .empty;
+    try wrapRuns(a, spans, shape.columns -| shape.indent -| shape.hang, &lines);
+    for (lines.items, 0..) |line, index| try out.append(a, shape.row(line, index > 0));
+}
+
+/// Break coloured runs into rows of at most `columns` cells, the way
+/// `wrap.spans` breaks one string: a newline ends a row, a row ends at the last
+/// space that fits, and a word longer than the whole row is broken at the
+/// column, because the alternative is drawing nothing.
+///
+/// The runs are wrapped together rather than one at a time - a row is a
+/// sequence of runs, and where it ends is a property of the sentence, not of
+/// the colour it happens to be written in.
+fn wrapRuns(a: std.mem.Allocator, spans: []const Span, columns: usize, out: *std.ArrayList([]const Span)) !void {
+    const width = @max(1, columns);
+    var start = Place{ .run = 0, .at = 0 };
+    var run: usize = 0;
+    var at: usize = 0;
+    var column: usize = 0;
+    var space: ?Place = null;
+    while (run < spans.len) {
+        if (at >= spans[run].text.len) {
+            run += 1;
+            at = 0;
+            continue;
+        }
+        if (spans[run].text[at] == '\n') {
+            try emitRow(a, spans, start, .{ .run = run, .at = at }, out);
+            at += 1;
+            start = .{ .run = run, .at = at };
+            column = 0;
+            space = null;
+            continue;
+        }
+        if (column >= width) {
+            // A break inside a word is the last resort, exactly as it is for a
+            // single-coloured run: a reader notices a word cut in half far more
+            // than a slightly shorter row.
+            const cut = space orelse Place{ .run = run, .at = at };
+            try emitRow(a, spans, start, cut, out);
+            start = if (space != null) .{ .run = cut.run, .at = cut.at + 1 } else cut;
+            column = 0;
+            space = null;
+            continue;
+        }
+        if (spans[run].text[at] == ' ') space = .{ .run = run, .at = at };
+        at = text.next(spans[run].text, at);
+        column += 1;
+    }
+    try emitRow(a, spans, start, .{ .run = spans.len, .at = 0 }, out);
+}
+
+/// The runs between two places in a block, as one row. A run a break falls
+/// inside is cut in two, which is why a row keeps its own slice of runs rather
+/// than pointing at the parser's.
+fn emitRow(a: std.mem.Allocator, spans: []const Span, start: Place, end: Place, out: *std.ArrayList([]const Span)) !void {
+    var row: std.ArrayList(Span) = .empty;
+    var run = start.run;
+    while (run < spans.len and run <= end.run) : (run += 1) {
+        const from = if (run == start.run) start.at else 0;
+        const to = if (run == end.run) end.at else spans[run].text.len;
+        if (to > from) try row.append(a, .{ .text = spans[run].text[from..to], .fg = spans[run].fg });
+    }
+    try out.append(a, try row.toOwnedSlice(a));
+}
+
+/// The reader's runs, as the panel draws them, with `skip` characters of the
+/// block's own marker left off the front.
+///
+/// The atlas holds one face, so bold and italic have no weight or slant to be
+/// drawn with, and colour is not a weight - a bold word is not a different kind
+/// of token, and painting it like one would say something false about the text.
+/// What the reader buys from the parser here is that the markers are gone and
+/// the words are what is drawn; when a face with real weights arrives, this is
+/// the one place that learns about it. Inline code takes the accent, which is a
+/// distinction the reader can actually see.
+fn inlineSpans(a: std.mem.Allocator, inlines: []const markdown.Inline, base: theme.Color, skip: usize) ![]const Span {
+    var spans: std.ArrayList(Span) = .empty;
+    var left = skip;
+    for (inlines) |run| {
+        var bytes = run.text;
+        if (left > 0) {
+            // A marker sits inside the first run - the reader names characters,
+            // not blocks - so it shortens that run rather than dropping it.
+            if (bytes.len <= left) {
+                left -= bytes.len;
+                continue;
+            }
+            bytes = bytes[left..];
+            left = 0;
+        }
+        if (bytes.len == 0) continue;
+        try spans.append(a, .{ .text = bytes, .fg = switch (run.kind) {
+            .code => theme.accent,
+            .plain, .bold, .italic => base,
+        } });
+    }
+    return spans.toOwnedSlice(a);
+}
+
+/// One coloured run covering the whole of `bytes`.
+fn spansOf(a: std.mem.Allocator, bytes: []const u8, fg: theme.Color) ![]const Span {
+    const spans = try a.alloc(Span, 1);
+    spans[0] = .{ .text = bytes, .fg = fg };
+    return spans;
+}
+
+/// A row's runs with the list's marker in front of them.
+fn withMarker(a: std.mem.Allocator, spans: []const Span, marker: []const u8, fg: theme.Color) ![]const Span {
+    const marked = try a.alloc(Span, spans.len + 1);
+    marked[0] = .{ .text = marker, .fg = fg };
+    @memcpy(marked[1..], spans);
+    return marked;
+}
+
+/// A heading's words: the line without the hashes and space that made it one.
+fn headingText(block: markdown.Block) []const u8 {
+    var at: usize = 0;
+    while (at < block.text.len and (block.text[at] == ' ' or block.text[at] == '\t')) at += 1;
+    var hashes: usize = 0;
+    while (at < block.text.len and block.text[at] == '#' and hashes < block.level) : (hashes += 1) at += 1;
+    if (at < block.text.len and (block.text[at] == ' ' or block.text[at] == '\t')) at += 1;
+    return block.text[at..];
+}
+
+/// Where a list item's marker ends, and the token the margin draws.
+fn bulletMarker(line: []const u8) Marker {
+    var at: usize = 0;
+    while (at < line.len and (line[at] == ' ' or line[at] == '\t')) at += 1;
+    const start = at;
+    while (at < line.len and line[at] != ' ' and line[at] != '\t') at += 1;
+    const token = line[start..at];
+    while (at < line.len and (line[at] == ' ' or line[at] == '\t')) at += 1;
+    return .{ .after = at, .token = token };
+}
+
+/// How much of a quoted line the `>` marks take up. A nested quotation keeps
+/// one level, which is what the bar down the left is: the depth is not drawn,
+/// so the marks that said it are not either.
+fn afterQuote(line: []const u8) usize {
+    var at: usize = 0;
+    while (at < line.len and (line[at] == ' ' or line[at] == '\t')) at += 1;
+    while (at < line.len and line[at] == '>') at += 1;
+    if (at < line.len and line[at] == ' ') at += 1;
+    return at;
+}
+
+/// How many cells a run takes at the panel's column, which is how wide a
+/// marker's column is.
+fn countCells(bytes: []const u8) usize {
+    var count: usize = 0;
+    var at: usize = 0;
+    while (at < bytes.len) : (at = text.next(bytes, at)) count += 1;
+    return count;
+}
+
+/// One fenced block: a diff in the colours a diff is read in, or code in the
+/// theme's syntax colours. Either way every row carries the panel colour, so
+/// the rows together read as a block on the page; the blank rows above and
+/// below are that colour with nothing written on it.
+fn codeRows(a: std.mem.Allocator, block: markdown.Block, columns: usize, advance: f32, out: *std.ArrayList(Row)) !void {
+    // One cell of breathing room inside the fill, so the block is not edged by
+    // its own text, and two for a wrapped line's continuation.
+    const shape = Shape{ .columns = columns, .advance = advance, .indent = 1, .hang = 2, .background = theme.panel };
+    try out.append(a, .{ .background = theme.panel });
+    if (diff.looksLikeDiff(block.text)) {
+        // A fence that looks like a diff but will not read as one is drawn as
+        // code rather than taking the frame down with it: the bytes are still
+        // the agent's words, and a reader wants them either way.
+        const parsed = diff.parse(a, block.text) catch null;
+        if (parsed) |sections| {
+            for (sections) |file| try diffRows(a, file, shape, out);
+            try out.append(a, .{ .background = theme.panel });
+            return;
+        }
+    }
+    // The fence names a language and the scanner is the one the editor colours
+    // a file with, so a theme's rules land on a transcript's code the way they
+    // land on the editor's: both ask for the same TextMate scopes. A tag we do
+    // not know is plain text, which is a colour that is always right.
+    var scanner: highlight.Scanner = .{ .language = fenceLanguage(block.language) };
+    var lines = std.mem.splitScalar(u8, block.text, '\n');
+    while (lines.next()) |line| try wrappedRows(a, try codeSpans(a, &scanner, line), shape, out);
+    try out.append(a, .{ .background = theme.panel });
+}
+
+/// One file of a diff: what it is, then its hunks and their lines.
+fn diffRows(a: std.mem.Allocator, file: diff.File, shape: Shape, out: *std.ArrayList(Row)) !void {
+    // A fragment with no header has no name, and an empty name is not a line.
+    if (file.path.len > 0) try out.append(a, shape.row(try spansOf(a, file.path, theme.muted), false));
+    for (file.hunks) |hunk| {
+        try wrappedRows(a, try spansOf(a, hunk.header, theme.accent), shape, out);
+        for (hunk.lines) |line| try wrappedRows(a, try spansOf(a, line.text, diffColor(line.kind)), shape, out);
+    }
+}
+
+/// The colour a diff line is read in. The two that matter are its own roles: an
+/// added line is not a keyword and a removed one is not an error message, so
+/// neither borrows the accent or the warning colour.
+fn diffColor(kind: diff.LineKind) theme.Color {
+    return switch (kind) {
+        .added => theme.added,
+        .removed => theme.removed,
+        .hunk => theme.accent,
+        .meta => theme.muted,
+        .context => theme.text,
+    };
+}
+
+/// The fence's language tag in the scanner's vocabulary. A tag that names
+/// nothing we scan is plain, which tints nothing and lies about nothing.
+fn fenceLanguage(tag: []const u8) highlight.Language {
+    if (std.ascii.eqlIgnoreCase(tag, "zig")) return .zig;
+    if (std.ascii.eqlIgnoreCase(tag, "c") or std.ascii.eqlIgnoreCase(tag, "h") or
+        std.ascii.eqlIgnoreCase(tag, "cpp") or std.ascii.eqlIgnoreCase(tag, "c++") or
+        std.ascii.eqlIgnoreCase(tag, "cc")) return .c;
+    if (std.ascii.eqlIgnoreCase(tag, "python") or std.ascii.eqlIgnoreCase(tag, "py")) return .python;
+    if (std.ascii.eqlIgnoreCase(tag, "javascript") or std.ascii.eqlIgnoreCase(tag, "js") or
+        std.ascii.eqlIgnoreCase(tag, "typescript") or std.ascii.eqlIgnoreCase(tag, "ts")) return .javascript;
+    return .plain;
+}
+
+/// One line of code as coloured runs. The scanner is carried across the lines
+/// of the block, because a block comment or an open string spans them.
+fn codeSpans(a: std.mem.Allocator, scanner: *highlight.Scanner, line: []const u8) ![]const Span {
+    var spans: std.ArrayList(Span) = .empty;
+    var start: usize = 0;
+    var colour: ?theme.Color = null;
+    var at: usize = 0;
+    while (at < line.len) {
+        const found = scanner.color(line, at);
+        if (colour) |current| {
+            if (!std.meta.eql(current, found)) {
+                try spans.append(a, .{ .text = line[start..at], .fg = current });
+                start = at;
+                colour = found;
+            }
+        } else colour = found;
+        at = text.next(line, at);
+    }
+    if (colour) |current| try spans.append(a, .{ .text = line[start..], .fg = current });
+    scanner.endLine();
+    return spans.toOwnedSlice(a);
+}
+
+/// Draw one coloured run and return the pen position after it. `Renderer.text`
+/// draws a run but does not say where it ended, and a row is a sequence of runs
+/// that have to follow one another.
+fn drawSpan(r: *Renderer, x: f32, y: f32, bytes: []const u8, color: theme.Color) !f32 {
+    var pen = x;
+    var at: usize = 0;
+    while (at < bytes.len) {
+        const cp = text.decode(bytes, at);
+        if (cp == '\r') {
+            // The carriage return of a CRLF transcript is a separator, not a
+            // glyph to draw.
+        } else if (cp == '\t') {
+            pen += r.atlas.advance * 4;
+        } else if (cp != '\n') {
+            pen += try r.glyphAt(pen, y + r.atlas.ascent, cp, color);
+        }
+        at = text.next(bytes, at);
+    }
+    return pen;
 }

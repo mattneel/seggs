@@ -47,13 +47,15 @@ const pill_inset: f32 = 3;
 const hang_cells: usize = 2;
 
 /// The fraction of the panel a field's label may take. Labels are words like
-/// "path" and "query"; one that is not is cut rather than leaving its value no
-/// column at all.
-const label_share: usize = 3;
+/// "path" and "command"; one that is not is cut rather than leaving its value no
+/// column at all, and half the panel is the most a label may have of it.
+const label_share: usize = 2;
 
 /// How many display rows the call takes at this width: the chip's own row, and,
-/// when it is open, its fields and its diff. The allocator is only used to read
-/// a diff the call carries, and a frame's arena is the right one.
+/// when it is open, its fields and its diff. A caller that lays out rows asks
+/// this; the height in pixels is this times the line height. The allocator is
+/// only used to read a diff the call carries, and a frame's arena is the right
+/// one.
 pub fn rows(a: Allocator, call: acp.ToolCall, width: f32, expanded: bool, metrics: Metrics) !usize {
     var count: usize = 1;
     if (!expanded) return count;
@@ -71,12 +73,6 @@ pub fn rows(a: Allocator, call: acp.ToolCall, width: f32, expanded: bool, metric
         if (lines > 0) count += 1 + lines;
     }
     return count;
-}
-
-/// The height the block takes in pixels, which is what a caller laying out rows
-/// asks for.
-pub fn height(a: Allocator, call: acp.ToolCall, width: f32, line_height: f32, expanded: bool, metrics: Metrics) !f32 {
-    return @as(f32, @floatFromInt(try rows(a, call, width, expanded, metrics))) * line_height;
 }
 
 /// Draw the block at `origin`. The caller owns the clip; the block starts on the

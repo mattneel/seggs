@@ -14,7 +14,9 @@ Agents that require unsupported client capabilities need additional client imple
 
 The project contains no model API client and no provider credentials.
 A harness owns its model selection and authentication.
-The scaffold does not implement `authenticate`, session resume, model selection, or mode selection through ACP.
+The scaffold implements `authenticate`: a preset may name its method in `auth`, and a harness that needs a login without one has the methods it offers reported.
+Model and mode selection go through session config options, which the client sets with `session/set_config_option`.
+Session resume is not implemented: no `session/load` or `session/resume` request is sent.
 The [source references](SOURCES.md) distinguish protocol and adapter interfaces.
 
 ## Oh-My-Pi
@@ -32,7 +34,7 @@ bun install -g @oh-my-pi/pi-coding-agent
 Complete the harness's authentication setup before the Seggs session.
 
 The upstream command line and package installation can change.
-The repository records the reference URL rather than claim a tested provider version.
+The install instructions leave the version external; the version a live turn ran against is recorded under [validation](VALIDATION.md).
 
 ## Codex
 
@@ -68,7 +70,7 @@ npm install -g @agentclientprotocol/claude-agent-acp
 Complete the adapter's documented authentication setup outside Seggs.
 
 The referenced package requires Node.js 22 or later.
-The Oh-My-Pi and Claude Code live turns are verified; the Codex adapter remains untested.
+The Oh-My-Pi and Claude Code live turns are verified. The Codex adapter is not: `codex-acp` exits silently on startup in this environment, and no smoke target runs it.
 
 ## Explicit configuration
 

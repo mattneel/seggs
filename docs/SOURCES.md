@@ -4,7 +4,9 @@ The scaffold used these primary references on September 19, 2026.
 These links describe upstream interfaces, not proof of local compilation or live-agent tests.
 The repository does not bundle third-party source or font files. Its one vendored
 collection is theme data, and its origin, licence, and commit are recorded under
-[Theme provenance](#theme-provenance).
+[Theme provenance](#theme-provenance); the one derived table it carries,
+`src/core/grapheme_data.zig`, is generated from Unicode's
+`GraphemeBreakProperty.txt` (Unicode 18.0.0).
 
 | Reference | Design use |
 | --- | --- |
@@ -12,11 +14,12 @@ collection is theme data, and its origin, licence, and commit are recorded under
 | [Official Zig download manifest](https://ziglang.org/download/index.json) | Exact release archive and SHA-256 lookup |
 | [SDL 3.4.4 source](https://github.com/libsdl-org/SDL/tree/release-3.4.4) | Fixed native library baseline |
 | [SDL_ttf 3.2.2 source](https://github.com/libsdl-org/SDL_ttf/tree/release-3.2.2) | Fixed glyph rasterization baseline |
-| [zignal](https://github.com/arrufat/zignal) | TrueType parsing, glyph indices, kerning, and text layout for `src/gpu/shaper.zig` |
+| [zignal](https://github.com/arrufat/zignal) | TrueType parsing and glyph indices for `src/gpu/shaper.zig`, and the png, jpeg, bmp, and gif codecs behind `src/gpu/image.zig` and `Renderer.capture` |
 | [Ghostty](https://github.com/ghostty-org/ghostty) | libghostty-vt: terminal parsing, screen state, and the input encoders behind `src/services/vt.zig` |
 | [Yoga](https://github.com/facebook/yoga) | Flexbox layout for interface an extension describes, behind `src/ui/yoga.h` |
 | [MicroTex](https://github.com/NanoMichael/MicroTex) | The TeX engine behind display math: layout of atoms, boxes and glue, reached through `src/ui/microtex.h` |
-| [tinyxml2](https://github.com/leethomason/tinyxml2) | MicroTex reads its resource mappings from XML, and this is the parser it uses. A system package, like FreeType for SDL_ttf |
+| [tinyxml2](https://github.com/leethomason/tinyxml2) | MicroTex reads its resource mappings from XML, and this is the parser it uses. Fetched and compiled with it rather than required from the system: it is one C++ source file, and the gate builds on three platforms where no package for it exists |
+| [glslang](https://github.com/KhronosGroup/glslang) | `glslangValidator` compiles `shaders/ui.vert.glsl` and `shaders/ui.frag.glsl` to the SPIR-V SDL's shader contract takes, as part of the build; `-Dshader-dir` takes precompiled SPIR-V where it cannot run, and the macOS path embeds Metal source instead |
 | [zig-quickjs-ng](https://github.com/mattneel/zig-quickjs-ng) | Zig bindings to QuickJS-NG, the engine the SeggsC host embeds |
 | [SDL GPU device](https://wiki.libsdl.org/SDL3/SDL_CreateGPUDevice) | Backend selection and device ownership |
 | [SDL GPU shader](https://wiki.libsdl.org/SDL3/SDL_CreateGPUShader) | Shader formats and resource bindings |
@@ -41,11 +44,18 @@ alone, and the drawing comes from the editor through the library's own abstract
 is the backing that answers that interface, so no desktop toolkit reaches a
 headless build.
 
-**Its fonts are not font files.** The thirty-five faces the engine sets
-mathematics in are C++ source - `src/res/font/*.def.cpp` - compiled in with the
-rest, so committing a build of it would still not put a font binary in the
-repository. They are not committed here either way: the sources are fetched into
-`.deps/`, which is ignored, the way the SDL and libghostty pins are.
+**Its faces are metrics in C++, not font files.** The thirty-five font
+definitions the engine sets mathematics in are C++ source -
+`src/res/font/*.def.cpp`, compiled in with the rest - and each carries that
+face's metrics and names the file its outlines come from, `DEF_FONT(bi10,
+fonts/latin/bi10.ttf, 0)`. Those outlines are font binaries under MicroTex's
+own `res/`, and its CMake copies the whole resource directory into a build
+tree, so a build of the engine does carry font files. None of them is opened
+here: this repository's `src/ui/microtex_shim.cpp` supplies `Font::create` and
+ignores the path it is handed, because the renderer owns the face and
+rasterizes every glyph itself, so `res/` is read for its mappings and never
+for glyphs. They are not committed here either way: the sources are fetched
+into `.deps/`, which is ignored, the way the SDL and libghostty pins are.
 
 The install commands intentionally leave provider adapter versions external.
 A downstream release needs tested adapter version pins and compatibility results.

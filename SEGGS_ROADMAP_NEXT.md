@@ -409,7 +409,8 @@ A retry never blindly repeats an external side effect.
 
 The renderer remains Zig plus SDL3 GPU.
 The redesign does not require Electron or a browser surface.
-The renderer wakes for input, invalidation, or intentional animation rather than continuous idle redraw.
+The renderer redraws under vertical synchronization.
+Event-driven idle rendering arrives with the damage tracking.
 
 The core owns execution identity and document transactions.
 It also owns policy enforcement and durable run records.
@@ -453,8 +454,8 @@ The command system uses the same identities as the composer and navigator.
 
 A native component gallery establishes the new visual direction.
 It includes focus behavior and accessible semantics.
-The build contract resolves the recorded Zig 0.16.0/0.17.0 mismatch.
-The original 0.16.0 requirement remains the default unless an explicit project decision changes it.
+The build contract keeps one toolchain for the editor: Zig 0.17.0, pinned by `.zigversion` and `minimum_zig_version`.
+The only 0.16.0 in the tree is the release that builds libghostty-vt, and the C ABI keeps that requirement from reaching the editor.
 
 **Exit gate:** The ninth agent behaves like the first.
 A 1,000-profile fixture restores without 1,000 process launches.

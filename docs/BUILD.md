@@ -19,7 +19,7 @@ Install the packages on an Ubuntu or Debian development system.
 sudo apt-get update
 sudo apt-get install -y \
   build-essential cmake git pkg-config python3 \
-  libfreetype6-dev libtinyxml2-dev libx11-dev libxext-dev libxrandr-dev \
+  libfreetype6-dev libx11-dev libxext-dev libxrandr-dev \
   libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxrender-dev \
   libxtst-dev glslang-tools libvulkan-dev mesa-vulkan-drivers \
   vulkan-validationlayers fonts-dejavu-core fonts-wqy-zenhei
@@ -48,7 +48,7 @@ xcode-select --install
 Install the build dependencies through Homebrew.
 
 ```sh
-brew install cmake pkg-config freetype tinyxml2
+brew install cmake pkg-config freetype
 ```
 
 The macOS path embeds Metal source and does not need glslangValidator.
@@ -71,8 +71,8 @@ zig build verify
 zig build run
 ```
 
-The Zig installer checks the archive against the official HTTPS manifest's SHA-256 value.
-That manifest and the archive share the upstream trust source.
+The Zig installer checks a development build against the sha256 recorded in
+`tools/zig-checksums.json`, and a released version against Zig's own HTTPS manifest.
 The installer does not provide an independent signature check.
 The installer refuses to replace an existing destination.
 
@@ -81,11 +81,12 @@ It refuses a modified tracked source checkout.
 MicroTex, the TeX engine display math is drawn with, is fetched by the bootstrap
 and compiled by `build.zig` rather than built by its own CMake: that CMake
 requires gtkmm or Qt on Linux, and the library requires neither. It is not a
-submodule and not a vendored copy - `.deps/MicroTex` is ignored, like the other
-pins - so a bootstrap run is what puts it there. Its one system dependency is
-tinyxml2, alongside the C++17 compiler.
+submodule and not a vendored copy - `.deps/src/MicroTex` is ignored, like the other
+pins - so a bootstrap run is what puts it there. It is compiled with its one
+dependency alongside it: tinyxml2, fetched the same way, because a system package
+does not exist on all three platforms the gate builds on.
 
-The build still depends on system FreeType, tinyxml2, and driver versions.
+The build still depends on system FreeType and driver versions.
 It is not a hermetic dependency lock.
 
 ## Existing SDL installation
@@ -97,7 +98,7 @@ zig build verify -Dsdl-prefix=/absolute/path/to/sdk
 zig build run -Dsdl-prefix=/absolute/path/to/sdk -- --windowed
 ```
 
-The SDK must expose `include/SDL3`, `include/SDL3_ttf`, and shared libraries under `lib` or `lib64`.
+The SDK must expose `include/SDL3`, `include/SDL3_ttf`, and shared libraries under `lib`.
 The build also uses the platform's normal library search paths.
 It does not discover separate SDL and SDL_ttf prefixes through pkg-config.
 
@@ -136,12 +137,14 @@ passes them to the build with `-Dshader-dir`.
 2. Prepare matching SDL3 and SDL3_ttf development libraries in one SDK prefix.
 3. Add the SDK's DLL directory to PATH.
 4. Add glslangValidator to PATH.
-5. Run the native build with that SDK prefix.
+5. Build libghostty-vt into `.deps/install` with `python tools/bootstrap_ghostty.py`; it is built by its own Zig release, not the one in `.zigversion`.
+6. Run the native build with that SDK prefix.
 
 ```powershell
 $env:Path = "C:\sdk\bin;C:\tools\glslang\bin;$env:Path"
-zig build verify -Dsdl-prefix=C:/sdk -Dpython=python
-zig build run -Dsdl-prefix=C:/sdk -- --windowed
+python tools/bootstrap_ghostty.py
+zig build verify -Dsdl-prefix=C:/sdk -Dghostty-prefix=.deps/install -Dpython=python
+zig build run -Dsdl-prefix=C:/sdk -Dghostty-prefix=.deps/install -- --windowed
 ```
 
 The compiler target and the SDK libraries must use compatible ABIs.
@@ -171,8 +174,9 @@ The temporary-file save path also needs Windows path-encoding validation.
 TrueType parsing for glyph selection),
 [quickjs-ng bindings](https://github.com/mattneel/zig-quickjs-ng) (the extension
 host), and [Yoga](https://github.com/facebook/yoga) (layout for interface an
-extension describes). Each is pinned to a commit archive with a checksum, so a
-clean checkout builds without any local setup.
+extension describes). Each is pinned to a commit archive with a checksum, so Zig
+fetches them without a local checkout. SDL, SDL_ttf, libghostty-vt and MicroTex
+still come from `tools/bootstrap.py`, and FreeType and tinyxml2 from the system.
 
 The Zig toolchain is pinned separately: `.zigversion` and
 `minimum_zig_version` name the version, and `dependencies.json` names it

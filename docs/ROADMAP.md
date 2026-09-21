@@ -11,7 +11,7 @@ close it. A capability counts as landed only when a check can fail on it;
 | --- | --- |
 | Native acceptance | `core`, `native-linux`, `macos`, and `windows` jobs in `.github/workflows/ci.yml`; the screenshot gate runs on Linux and macOS with the Khronos validation layer enabled |
 | Editor foundation | `zig build test` and the screenshot gate's text, baseline, composition, and fallback checks |
-| Agent workspace | `zig build integration` against the mock, plus the live Oh-My-Pi and Claude Code turns |
+| Agent workspace | `zig build integration` against the mock, plus the live Oh-My-Pi and Claude Code turns, and the screenshot gate's run and compose checks |
 | IDE services | `zig build test-native`, `zig build integration`, and the mock LSP and DAP fixtures |
 
 Two landed items are covered by the nearest check rather than one named for
@@ -38,8 +38,11 @@ frames.
 
 **Landed:** multiple documents with one active buffer, an incremental line
 index, grapheme-aware movement, shaping through zignal with a fallback chain for
-scripts the primary face lacks, inline IME composition, and a lexical scanner
-that carries block-comment state across lines.
+scripts the primary face lacks, inline IME composition, a lexical scanner that
+carries block-comment state across lines, display mathematics typeset through
+MicroTex, falling back to the source when the engine cannot lay a formula out,
+and frame capture written in the format the path asks for - png, bmp, gif, jpg,
+or ppm.
 
 **Open:** a parse tree, because colouring is lexical and a theme rule for a scope
 the scanner never produces is silently unused; a real workspace watcher, since
@@ -51,8 +54,11 @@ still use the metrics SDL_ttf rasterizes with so text keeps its columns.
 **Landed:** authentication when a preset names a method, session configuration,
 a capability broker for editor-backed files and client-owned terminals, a review
 queue that applies a proposed edit only at the revision it was proposed for, a
-worktree manager that creates linked worktrees and reports conflicts, and prompts
-that carry the selection and the active file's diagnostics.
+worktree manager that creates linked worktrees and reports conflicts, prompts
+that carry the selection and the active file's diagnostics, and a run engine that
+carries a workflow of agent, command, and approval steps and keeps every artifact
+each produced, with a Compose perspective that reads the sequence left to
+right.
 
 **Open:** routing agent edits into the review queue (the surface exists, and
 nothing in the ACP path proposes to it yet), worktrees wired into startup,
@@ -66,6 +72,6 @@ name more than one destination.
 adapter for breakpoints and stopped sessions, a PTY for terminals with explicit
 process ownership, and a Git service for worktree status and change diff.
 
-**Open:** wiring the worktree and Git services into the interface, and the async
+**Open:** wiring the worktree and Git services into the interface, and the
 language-service and debug-service interfaces declared in
 `src/services/contracts.zig`, which have no implementations.

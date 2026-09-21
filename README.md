@@ -73,9 +73,10 @@ Required tools and libraries:
 - Zig 0.17.0 (a development build) and Python 3.12 or later.
 - Yoga for layout, pinned like the other dependencies and kept behind a `yoga` translate-c module.
 - libghostty-vt for the terminal, built by the bootstrap from the pinned Ghostty commit and reached through its C API.
-- No font or text libraries beyond SDL_ttf: glyph selection uses the vendored-pinned zignal package, and the extension host uses quickjs-ng.
+- No font or text libraries beyond SDL_ttf and MicroTex: glyph selection uses the vendored-pinned zignal package, display math is typeset by MicroTex, and the extension host uses quickjs-ng.
 - Extensions are written in **SeggsC**, a TypeScript-shaped DSL for the editor ([contract](docs/EXTENSIONS.md)): interface described as data, events, and requests, in a context of its own, reloadable while the editor runs.
 - Git, CMake, a C compiler, and pkg-config.
+- tinyxml2 development files, which MicroTex reads its resource files with, and a C++17 compiler.
 - SDL 3.4.4 and SDL_ttf 3.2.2, or compatible development libraries.
 - FreeType development files and an installed monospace font.
 - A Vulkan driver and glslangValidator on Linux or Windows.
@@ -122,9 +123,9 @@ behind.
 
 The app takes `--workspace PATH`, `--file PATH`, `--config PATH`, `--font PATH`,
 `--theme PATH`, `--windowed` or `--fullscreen`, `--window-size WIDTHxHEIGHT`,
-`--frames N`, and `--screenshot PATH`, which writes the last frame as a PPM.
-`--help` prints the same list. The `--exercise-*` flags drive the editor through
-a scripted session for the screenshot gate.
+`--frames N`, and `--screenshot PATH`, which writes the last frame in the format
+the extension names. `--help` prints the same list. The `--exercise-*` flags
+drive the editor through a scripted session for the screenshot gate.
 
 The app starts no agent automatically.
 The default mock uses an absolute script path that is independent of the selected workspace.
@@ -277,11 +278,11 @@ src/agents/                Presets and config validation
 src/platform/              SDL C declarations and file operations
 src/services/              Language server, debug adapter, Git, worktree, terminal sessions, shell and theme importers, PTY
 src/ext/                   SeggsC host and the interface description it lays out
-src/ui/                    Rect helpers, layout, theme, markdown, menus, and the Yoga boundary
+src/ui/                    Rect helpers, layout, theme and the theme catalog, display math through MicroTex, markdown, cards, menus, and the Yoga boundary
 src/core/                  Grapheme tables, text helpers, and IME composition
 shaders/                   GLSL and Metal source
 config/                    Presets, schema, mock, and worktree examples
-themes/                    Native theme documents, including the Monokai example
+themes/                    Native theme documents, including the Monokai example, and the catalog the theme switcher lists
 tools/                     Dependency setup, doctor, mock, repository checks
 extensions/                SeggsC bundles and their TypeScript sources
 tests/                     Python subprocess tests and the theme import fixtures
@@ -290,9 +291,12 @@ docs/                      Build, design, integration, limits, and validation
 
 Dependencies are pinned by hash in `build.zig.zon`: zignal for glyph selection
 from TrueType tables, quickjs-ng for the SeggsC host, and Yoga for layout. SDL3,
-SDL3_ttf, and libghostty-vt — the terminal emulator — are built from pinned
-sources into `.deps/install` by `tools/bootstrap.py`, which records the commits
-it resolved in `.deps/resolved.json`.
+SDL3_ttf, libghostty-vt — the terminal emulator — and MicroTex, the TeX engine
+display math is drawn with, are fetched from pinned sources by
+`tools/bootstrap.py`, which records the commits it resolved in
+`.deps/resolved.json`. SDL3, SDL3_ttf and libghostty-vt are built into
+`.deps/install`; MicroTex is compiled by the build from `.deps/src/MicroTex`,
+because its own CMake asks for a GUI toolkit it does not need.
 
 The documentation under `docs/` is also a book. Read it in the repository, or
 build it and browse the same chapters with search:

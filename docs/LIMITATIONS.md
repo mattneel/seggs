@@ -89,24 +89,18 @@ and C++, Python, JavaScript and TypeScript); any other language draws as plain
 text rather than wrongly. A message over a megabyte, or one that would produce
 more than 4096 blocks, is refused by name and shown wrapped instead of styled.
 
-Three of those are read and not fully drawn, and that is a deliberate floor
-rather than an oversight. **Display math is typeset and inline math is not**: a
-formula on lines of its own is laid out by the TeX engine and drawn as the
-mathematics it is, while a formula inside a sentence draws as the LaTeX that was
-written. The reference's inline conversion is a table of some six hundred
-commands, and the inline case is where a half-converted formula would show. A
-display formula the engine declines to lay out falls back to the same source, so
-mathematics never costs the reader the text. A formula is set at the size of the
-surrounding text rather than at a size the engine chose, because the glyphs come
-from the atlas; and a filled shape wider than its panel is dropped only when it
-falls wholly outside it, so the drawing primitives reject at the clip edge where
-the glyph path clips exactly. **A link's address is shown but is not
-clickable** - the pointer is wired for chips and folds, not for prose runs, so
-the address is drawn beside its words and left as text. **A strikethrough is
-carried by colour and not by a line through the words**, because the atlas has
-one face and nothing to draw a rule with; a struck run is drawn in the muted
-role, which is honest about it not being body text without pretending to be a
-decoration.
+Of those, what is read and not fully drawn is a deliberate floor rather than an
+oversight. **Display math is typeset and inline math is not**: a formula on lines
+of its own is laid out by the TeX engine and drawn as the mathematics it is,
+while a formula inside a sentence draws as the LaTeX that was written. The
+reference's inline conversion is a table of some six hundred commands, and the
+inline case is where a half-converted formula would show. A display formula the
+engine declines to lay out falls back to the same source, so mathematics never
+costs the reader the text. A formula is set at the size of the surrounding text
+rather than at a size the engine chose, because the glyphs come from the atlas;
+and a filled shape wider than its panel is dropped only when it falls wholly
+outside it, so the drawing primitives reject at the clip edge where the glyph
+path clips exactly.
 
 A call's chip is one line: its title and subject are bounded and elided, so a
 chip says what the call was rather than everything it carried - the fields
@@ -135,7 +129,7 @@ Missing ACP features include:
 - Session resume, and choosing an authentication method from the interface: a
   preset may name the method to use, and a harness that needs a login has the
   methods it offers reported rather than a prompt that asks which one.
-- Content types the panel does not draw. Of ACP's six - `text`, `image`,
+- Content types the panel does not draw. Of ACP's five - `text`, `image`,
   `audio`, `resource`, `resource_link` - `text` is drawn as prose and `image` is
   drawn as a picture; audio, embedded resources and resource links are not read
   as such. Only `image` is advertised as a prompt capability, so a prompt
@@ -272,7 +266,10 @@ any other name draws nothing, and the shipped bundles still register `explorer`,
 `--theme <path>` loads a theme in the native format described in
 `src/ui/theme.zig`, or a TextMate `.tmTheme` or VS Code colour theme, which are
 recognised by their contents rather than their extension. Import is one-way:
-nothing writes either format back, and no format is read at runtime. A theme
+nothing writes either format back. A theme is read where it is loaded -
+`--theme <path>` at startup, or a row of `themes/catalog` through the switcher
+(Ctrl+T), which loads the file that row names - and nothing watches the file
+afterwards: a theme on disk changes nothing until it is loaded again. A theme
 changes the editor's colours, the terminal palette, and syntax colouring.
 
 What is not covered:
@@ -283,13 +280,14 @@ What is not covered:
   keyed by a semantic tokenizer's kinds and this editor classifies lexically.
   Vim, Emacs, Sublime, and the terminal formats (`.itermcolors`, Windows
   Terminal, ghostty) have no importer.
-- **A theme without a terminal palette still sends the placeholder one.** The
-  push into a live shell is skipped only when no theme was loaded at all, so a
-  `.tmTheme`, or a VS Code theme that sets no `terminal.background` or
-  `terminal.foreground`, hands the terminal the document default: sixteen ANSI
-  entries that are all the background colour. A program that prints in colour -
-  a prompt, `ls`, a diff - then prints in the colour of the paper. With no theme
-  loaded the emulator keeps its own palette, which is a real one.
+- **A theme without a terminal palette leaves the shell's alone.** A document
+  that is loaded and says nothing about a terminal - a `.tmTheme`, or a VS Code
+  theme that sets no `terminal.background` or `terminal.foreground` - carries the
+  placeholder palette, and the placeholder is never pushed: a live shell keeps
+  the palette it already had rather than being handed sixteen ANSI entries that
+  are all the background colour. Only a document that really carries a palette
+  hands one over, and with no theme loaded the emulator keeps its own, which is
+  a real one.
 - **Bold and italic are parsed and not drawn.** The atlas has one face, so a
   theme's `fontStyle` reaches the scope list and stops there. What a reader
   gains from inline markup is that the markers are stripped; weight and slant

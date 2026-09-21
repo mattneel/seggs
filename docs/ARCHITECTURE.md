@@ -36,10 +36,10 @@ wordmark, because the space a bar takes is worth more than the name of the
 program that is already on screen.
 
 Every dock resizes by dragging the divider between it and its neighbour. The hit
-test is a four-pixel band on the boundary, since a one-pixel divider is one
-nobody can hit, and the drag does no more than record what the reader asked for:
-the layout decides what that means, which is why a drag past a limit lands on the
-limit without the drag handler knowing any of the limits.
+test is a four-pixel band either side of the boundary, since a one-pixel divider
+is one nobody can hit, and the drag does no more than record what the reader
+asked for: the layout decides what that means, which is why a drag past a limit
+lands on the limit without the drag handler knowing any of the limits.
 
 Those limits exist because two docks dragged independently would take the window
 between them. The left dock is clamped against the width the agent dock wants
@@ -62,7 +62,8 @@ can be sent to, and the shells this machine offers are one widget
 how they behave. The widget has two placements, and the difference is where the
 list came from. A list opened by a control hangs under that control and is at
 least as wide as it; a list opened by a key is centred over the window, because
-there is no control to hang from. `Ctrl+Shift+A` opens the agent templates,
+there is no control to hang from. `Ctrl+Shift+A` opens the agent templates - or
+answers the step of a run that is waiting for a person, which takes precedence -
 `Ctrl+Shift+Enter` the destinations, and the `+` at the end of the agent strip
 opens the same template list placed under itself.
 
@@ -99,8 +100,12 @@ The fragment sampler occupies set 2, binding 0, as SDL's Vulkan shader contract 
 macOS uses the corresponding Metal source.
 SDL owns the swapchain and the native graphics backend.
 
-The renderer clips geometry and texture coordinates on the CPU.
-It uses logical window coordinates, which map to the swapchain through normalized coordinates.
+The renderer clips geometry and texture coordinates on the CPU; the four-corner
+primitive rejects a quad that falls wholly outside the clip rather than clipping
+it, which is visible only for a shape straddling the clip edge - a case its
+callers avoid.
+It uses the drawable's coordinates in device pixels, which map to the swapchain
+through normalized coordinates.
 The atlas uses a fixed 2x raster scale.
 It is not a complete display-scale or font-shaping system.
 
@@ -180,8 +185,9 @@ theme that fails to parse leaves the last good one in place and says why - and
 
 `themes/catalog/` is the Shiki collection vendored whole: 65 files at a pinned
 commit, each checked byte-for-byte against the upstream blob hash rather than by
-name, with the licences recorded in [SOURCES](SOURCES.md) - a catalog is other
-people's work and the repository should say whose. It is read by
+name when it was vendored, with that comparison and the licences recorded in
+[SOURCES](SOURCES.md) - a catalog is other people's work and the repository
+should say whose. It is read by
 `src/ui/theme_catalog.zig`, which scans the directory into rows **without parsing
 anything**: the cost of the list is 65 stats and 65 head reads rather than 65
 parses, and a row's label comes from the file name for exactly that reason, with
@@ -253,8 +259,9 @@ and closing one stops the lane and moves the dock to whatever is still running.
 
 The ACP layer knows what arrived and deliberately knows nothing about when. The
 client keeps counters - the transcript's length, the number of tool events, the
-number of updates it has processed, and its own state - and never reads a clock;
-the App samples those counters once a frame instead, and the timing lives there.
+number of updates it has processed, and its own state - and stamps nothing with a
+clock, its clocks being request deadlines rather than event times; the App samples
+those counters once a frame instead, and the timing lives there.
 A turn is in flight exactly while the lane reports one of its working states, so
 the two edges of a turn are the state's edges: the App does not need anyone to
 tell it that a prompt went out or came back, which matters because a prompt
@@ -290,8 +297,9 @@ Three things are read and deliberately not drawn in full, because the alternativ
 is a lie rather than a layout. A table whose columns together ask for more than
 the panel has is drawn as the source it was written as - the agent's own pipes,
 wrapped - because a table shredded across a forty-column dock is not a table. A
-formula is drawn as the LaTeX that was written, in a role of its own: we do not
-typeset it, and a half-converted formula is worse than the source. A struck run
+display formula the engine will lay out is typeset and drawn as the mathematics
+it is, and one it will not is drawn as the LaTeX that was written, in a role of
+its own: a half-converted formula is worse than the source. A struck run
 carries a rule through it, because the atlas has one face and no decoration to
 draw one with, and a retraction a reader has to read twice is one they will miss.
 A link records where its words landed so a click can open it: the pointer here is
@@ -524,8 +532,8 @@ function keys - are encoded by the library from the terminal's own modes and
 written to the shell, so application cursor mode and the Kitty protocol mean what
 the program asked them to mean. The editor's own shortcut table is consulted
 first, so the Ctrl keys remain the editor's; the ones that make sense in a
-terminal are the dock's own: `Ctrl+` opens or hides it and `Ctrl+Shift+T` opens
-another tab. Selection, copy, and paste belong to the editor: the emulator
+terminal are the dock's own: `` Ctrl+` `` opens or hides it and `Ctrl+Shift+T`
+opens another tab. Selection, copy, and paste belong to the editor: the emulator
 reports the cell a point is on and the editor draws the run between two of them,
 copy is `Ctrl+Shift+C`, and a paste goes through the emulator's encoder so the
 program sees what it asked for - bracketed wrapping when it enabled it, and

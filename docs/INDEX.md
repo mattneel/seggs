@@ -4,17 +4,20 @@ Seggs is a GPU editor and a concurrent ACP client: one window that edits files,
 runs up to eight agent harnesses beside them, and can be extended while it runs.
 
 The editor is Zig over SDL3's GPU API, with one pipeline, one glyph atlas, and
-one draw call per frame. Interface is described as data by extensions written in
-[SeggsC](EXTENSIONS.md), a TypeScript-shaped DSL, and laid out with Yoga. Agents
-reach the editor over newline-delimited JSON-RPC on stdio, and the editor answers
-with the files and terminals they ask for.
+one draw call per frame while every quad on it samples the atlas; a picture is
+its own texture, and so its own draw. Interface is described as data by
+extensions written in [SeggsC](EXTENSIONS.md), a TypeScript-shaped DSL, and laid
+out with Yoga. Agents reach the editor over newline-delimited JSON-RPC on stdio,
+and the editor answers with the files and terminals they ask for.
 
 ## What it does
 
 - Edits UTF-8 files with a gap buffer, multiple documents, undo, selection, and
   grapheme-aware movement.
-- Runs independent agent sessions with their own transcripts, a review queue for
-  proposed edits, and permission requests that are explicit and one-shot.
+- Runs independent agent sessions with their own transcripts and permission
+  requests that are explicit and one-shot. A review surface holds proposed edits
+  until accepted; only the self-driving `--exercise-run` driver proposes to it,
+  and an agent's own write goes straight to disk.
 - Renders the transcript as Markdown, with a fenced diff drawn as a diff and tool
   calls drawn as chips where they happened, each opening to its fields and diff.
 - Draws a displayed formula as the mathematics it is, typeset by a TeX engine
@@ -26,8 +29,9 @@ with the files and terminals they ask for.
   document, a TextMate `.tmTheme`, or a VS Code colour theme.
 - Serves agent requests through a capability broker: editor-backed file reads and
   writes, and client-owned terminals with bounded output.
-- Speaks to a language server for diagnostics and navigation, a debug adapter for
-  breakpoints, and Git for status and diffs.
+- Speaks to a language server for diagnostics and navigation; the debug adapter
+  and Git clients are proven by the native tests, and nothing in the editor
+  starts them.
 - Draws its own interface, which extensions replace region by region without a
   restart.
 - Writes a frame to a file in any of five image formats, and can drive itself to

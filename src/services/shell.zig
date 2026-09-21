@@ -7,6 +7,7 @@
 //!
 //! A shell that is not one of these is run exactly as it was.
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("native");
 const files = @import("../platform/files.zig");
 const Allocator = std.mem.Allocator;
@@ -118,6 +119,9 @@ pub fn integrate(a: Allocator, shell_path: []const u8) !?Plan {
 }
 
 test "a shell the integration knows is given its markers, and another is not" {
+    // These are the paths a POSIX shell lives at; a platform without them has
+    // no shell to integrate, and nothing here claims otherwise.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
     // A shell nobody integrated is left alone: the terminal runs it as before
     // and reads its screen as text.

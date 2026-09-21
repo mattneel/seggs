@@ -1370,10 +1370,10 @@ pub const App = struct {
             return;
         }
         if (self.shell == null) {
-            // libc's getenv, not a shim: this is the same call the rest of the
-            // platform layer makes, and the one that actually reads the
-            // environment the process was started with.
-            const shell_path: []const u8 = if (c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
+            // The same call the rest of the platform layer makes. Where SHELL is
+            // not exported - which is not unusual - the terminal has a shell
+            // anyway and says nothing about markers it cannot ask for.
+            const shell_path: []const u8 = if (std.c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
             // The shell is asked to mark its own commands, so a command result
             // is read from the emulator rather than inferred from the shape of
             // the screen. A shell the integration does not know is run as it is.

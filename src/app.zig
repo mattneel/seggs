@@ -13,6 +13,7 @@ const vt = @import("services/vt.zig");
 const pty = @import("services/pty.zig");
 const ghostty = @import("ghostty");
 const theme = @import("ui/theme.zig");
+const runs = @import("editor/runs.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
@@ -34,7 +35,7 @@ const Rect = layout.Rect;
 pub const App = struct {
     const Focus = enum { editor, prompt, panels, terminal };
     const Overlay = enum { none, files, commands, quit };
-    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn" };
+    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review" };
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
     workspace: Workspace,
@@ -66,6 +67,10 @@ pub const App = struct {
 
     /// Scratch for the inspector's own labels, so drawing does not allocate.
     inspector_scratch: [3][64]u8 = undefined,
+
+    /// The run the inspector is showing, if any. A run is the work: it does not
+    /// belong to a panel, and closing one does not end it.
+    run: ?runs.Run = null,
 
     /// Position in `focus_order` while the panels own the keyboard.
     panel_focus: usize = 0,
@@ -137,6 +142,7 @@ pub const App = struct {
         self.query.deinit(self.allocator);
         self.prompt_text.deinit(self.allocator);
         self.preedit.deinit(self.allocator);
+        if (self.run) |*run| run.deinit();
         self.panel_tree.deinit();
         self.panel_rects.deinit(self.allocator);
         for (self.panel_nodes.items) |node| self.allocator.free(node.id);
@@ -1068,6 +1074,7 @@ pub const App = struct {
                         4 => try self.toggleFullscreen(),
                         5 => try self.workspace.save(),
                         6 => try self.clients[self.active].cancel(),
+                        7 => try self.startRun(),
                         else => unreachable,
                     }
                     return;
@@ -1570,6 +1577,30 @@ pub const App = struct {
         return .{ .x = bounds.x + 60, .y = y + 10 };
     }
 
+    /// The starter workflow. Starting a run needs no harness to be up, because
+    /// a run is the task rather than the tool that happens to do it.
+    pub fn startRun(self: *App) !void {
+        const steps = [_]runs.Step{
+            .{ .name = "plan", .produces = .plan, .harness = 0 },
+            .{ .name = "implement", .produces = .implementation, .harness = 1 },
+            .{ .name = "review", .produces = .review, .harness = 2 },
+        };
+        if (self.run) |*existing| existing.deinit();
+        var run = try runs.Run.init(self.allocator, std.fs.path.basename(self.workspace.activePath() orelse "workspace"), &steps);
+        errdefer run.deinit();
+        // What the run starts from is the code that was on screen, kept as the
+        // artifact every later step can be traced back to.
+        const bytes = try self.workspace.activeDocument().snapshot(self.allocator);
+        defer self.allocator.free(bytes);
+        try run.artifacts.append(self.allocator, .{
+            .kind = .context,
+            .source = try self.allocator.dupe(u8, "workspace"),
+            .body = try self.allocator.dupe(u8, bytes),
+        });
+        self.run = run;
+        self.status("Run {s}: {d} steps.", .{ run.name, run.steps.len });
+    }
+
     /// The signature action: send what the composer holds, with the context
     /// the inspector shows, to one harness. Choosing the destination is the
     /// whole gesture; the interface names it before anything is sent.
@@ -1625,7 +1656,32 @@ pub const App = struct {
         const permission = if (client.permission != null) self.permissionRect() else null;
         const run_bottom = if (permission) |rect| rect.y - 8 else bounds.y + bounds.h - 110;
         try r.text(bounds.x + 14, run_y, "RUN", theme.muted);
-        const run: Rect = .{ .x = bounds.x + 14, .y = run_y + 18, .w = bounds.w - 28, .h = @max(0, run_bottom - run_y - 18) };
+        // A run shows its steps first: the question a run answers is which step
+        // is holding it, and the transcript is the evidence underneath.
+        var steps_height: f32 = 0;
+        if (self.run) |*active| {
+            for (active.steps, 0..) |*step, index| {
+                const y = run_y + 18 + @as(f32, @floatFromInt(index)) * 22;
+                if (y + 18 > run_bottom) break;
+                const mark = switch (step.state) {
+                    .waiting => "○",
+                    .running => "●",
+                    .done => "✓",
+                    .failed => "✗",
+                };
+                const colour = switch (step.state) {
+                    .waiting => theme.muted,
+                    .running => theme.accent,
+                    .done => theme.text,
+                    .failed => theme.red,
+                };
+                try r.text(bounds.x + 14, y, mark, colour);
+                try r.text(bounds.x + 34, y, step.name, colour);
+                try r.text(bounds.x + 150, y, step.produces.label(), theme.muted);
+            }
+            steps_height = @min(@as(f32, @floatFromInt(active.steps.len)) * 22 + 10, @max(0, run_bottom - run_y - 18));
+        }
+        const run: Rect = .{ .x = bounds.x + 14, .y = run_y + 18 + steps_height, .w = bounds.w - 28, .h = @max(0, run_bottom - run_y - 18 - steps_height) };
         if (client.transcript.items.len == 0 and try self.drawPanel(r, "transcript", run)) {
             // A registered panel owns this space, so the interface does not
             // carry a copy of what an extension would say.

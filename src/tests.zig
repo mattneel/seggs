@@ -7,6 +7,7 @@ test {
     _ = @import("editor/highlight.zig");
     _ = @import("editor/review.zig");
     _ = @import("editor/prompt.zig");
+    _ = @import("editor/runs.zig");
     _ = @import("acp/framing.zig");
     _ = @import("acp/protocol.zig");
     _ = @import("agents/registry.zig");

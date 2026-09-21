@@ -38,6 +38,7 @@ fn run(init: std.process.Init) !void {
     var exercise_ime = false;
     var exercise_click = false;
     var exercise_terminal = false;
+    var exercise_run = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -63,6 +64,8 @@ fn run(init: std.process.Init) !void {
             exercise_click = true;
         } else if (std.mem.eql(u8, arg, "--exercise-terminal")) {
             exercise_terminal = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-run")) {
+            exercise_run = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -200,6 +203,7 @@ fn run(init: std.process.Init) !void {
         if (exercise_ime) exerciseIme(&app, frames);
         if (exercise_click) exerciseClick(&app, frames);
         if (exercise_terminal) exerciseTerminal(&app, frames, frame_arena.allocator());
+        if (exercise_run) exerciseRun(&app, frames);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -268,6 +272,28 @@ const terminal_first_read = 120;
 const terminal_last_read = 480;
 
 var terminal_answered = false;
+
+/// A run starts from what is on screen, and its steps are the report: this
+/// exercise starts one and says what the inspector would show.
+fn exerciseRun(app: *App, frame: usize) void {
+    switch (frame) {
+        6 => app.startRun() catch |err| std.log.err("run: {s}", .{@errorName(err)}),
+        20 => {
+            const active = if (app.run) |*value| value else {
+                std.log.err("run: never started", .{});
+                return;
+            };
+            const current = active.current();
+            std.log.info("run {s}: {d} steps, {d} artifacts, current={s}", .{
+                active.name,
+                active.steps.len,
+                active.artifacts.items.len,
+                if (current) |step| step.name else "none",
+            });
+        },
+        else => {},
+    }
+}
 
 fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
     switch (frame) {

@@ -38,6 +38,8 @@ SCALE_LINE = re.compile(r"logical (\d+)x(\d+), pixels (\d+)x(\d+), scale (\d+\.\
 METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
+RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
+
 INSPECTOR_LINE = re.compile(r"inspector: selection=false")
 
 HOVER_LINE = re.compile(r"hover (\S+) (\S+)")
@@ -651,6 +653,28 @@ def check_terminal(binary: str) -> None:
     print(f"terminal: a real shell ran in the dock, its answer reached the screen, and the dock drew {dock} lit pixels")
 
 
+def check_run(binary: str) -> None:
+    """A run exists without a panel being open.
+
+    The engine's vocabulary - a workflow, a run, a step, an artifact - is the
+    product model, so the fixture starts one and reports what it holds: the
+    steps it will execute and the artifact it started from.
+    """
+    command = display_command([binary, "--windowed", "--frames", "24", "--exercise-run"], app_env())
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+    started = RUN_LINE.search(output)
+    if started is None:
+        print("run output:")
+        for line in output.splitlines()[-8:]:
+            print(f"  {line}")
+    require(started is not None, "starting a run reported nothing")
+    require(int(started.group(2)) == 3, f"the run holds {started.group(2)} steps, expected the three the starter workflow defines")
+    require(int(started.group(3)) >= 1, "the run started without the artifact it is supposed to carry")
+    require(started.group(4) == "plan", f"the run's current step is {started.group(4)}, expected the first one")
+    print(f"run: {started.group(1)} started with {started.group(2)} steps, {started.group(3)} artifact(s), current {started.group(4)}")
+
+
 def check_density(binary: str) -> None:
     """A display reporting a scale other than one must still render.
 
@@ -698,6 +722,7 @@ def main() -> int:
         check_window_transitions(binary)
         check_density(binary)
         check_terminal(binary)
+        check_run(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1

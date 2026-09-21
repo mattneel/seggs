@@ -274,6 +274,7 @@ const terminal_last_read = 480;
 var terminal_answered = false;
 var run_reported = false;
 var fixture_step_sent = false;
+var approval_sent = false;
 
 /// A run starts from what is on screen, and its steps are the report: this
 /// exercise starts one and says what the inspector would show.
@@ -320,6 +321,17 @@ fn exerciseRun(app: *App, frame: usize) void {
                 }
             }
         }
+        // The person in the fixture presses the key a person would press,
+        // rather than calling the approval directly: the binding is part of
+        // what has to work.
+        if (app.runWaiting() and !approval_sent) {
+            approval_sent = true;
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_KEY_DOWN;
+            ev.key.key = c.SDLK_A;
+            ev.key.mod = c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT;
+            if (!c.SDL_PushEvent(&ev)) std.log.err("run: approval key not delivered", .{});
+        }
     }
     if (!fixture_step_sent and frame >= 10) {
         if (app.agentReady(app.active)) {
@@ -327,6 +339,9 @@ fn exerciseRun(app: *App, frame: usize) void {
             const steps = [_]runs.Step{
                 .{ .name = "ask", .produces = .plan, .action = .{ .agent = .{ .harness = app.active, .request = "Say hello" } } },
                 .{ .name = "git --version", .produces = .checks, .action = .{ .command = &.{ "git", "--version" } } },
+                // A person decides before anything downstream runs: the gate is
+                // what separates a workflow's progress from its acceptance.
+                .{ .name = "approve", .produces = .review, .action = .approval },
             };
             app.run = runs.Run.init(app.allocator, "fixture", &steps) catch |err| {
                 std.log.err("run: fixture {s}", .{@errorName(err)});
@@ -343,9 +358,9 @@ fn exerciseRun(app: *App, frame: usize) void {
     const active = if (app.run) |*value| value else return;
     // The fixture has one step and starts from nothing, so a single artifact is
     // the answer: the record that a step ran and a harness replied.
-    // Both steps have to have produced something: an agent's answer and a
-    // command's output with its exit status.
-    if (active.artifacts.items.len < 2) {
+    // Every step has to have produced something: an agent's answer, a command's
+    // output with its exit status, and a person's decision.
+    if (active.artifacts.items.len < 3) {
         if (frame == 240) {
             std.log.err("run {s}: {d} steps, no answer recorded", .{ active.name, active.steps.len });
         }

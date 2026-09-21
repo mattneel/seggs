@@ -676,12 +676,12 @@ def check_run(binary: str) -> None:
     require(int(started.group(3)) >= 1, "the run started without the artifact it is supposed to carry")
     require(started.group(4) == "plan", f"the run's current step is {started.group(4)}, expected the first one")
     require(answered is not None, "a step was sent and nothing was recorded")
-    require(int(answered.group(2)) == 2, f"the run recorded {answered.group(2)} steps, expected the two it has")
-    require(int(answered.group(3)) == 2, f"the run holds {answered.group(3)} artifact(s), expected one per step")
-    # The last step is a command, so its artifact carries what a command says:
-    # the exit status is the evidence an agent's summary cannot replace.
-    require(answered.group(4) == "checks", f"the last artifact is a {answered.group(4)}, expected a command's checks")
-    require(answered.group(5).startswith("git"), f"the artifact came from {answered.group(5)}, expected the command step")
+    require(int(answered.group(2)) == 3, f"the run recorded {answered.group(2)} steps, expected the three it has")
+    require(int(answered.group(3)) == 3, f"the run holds {answered.group(3)} artifact(s), expected one per step")
+    # The last step is a person's decision, and it is recorded like any other
+    # artifact: a run's progress is not its acceptance.
+    require(answered.group(4) == "review", f"the last artifact is a {answered.group(4)}, expected the approval's review")
+    require(answered.group(5) == "approve", f"the artifact came from {answered.group(5)}, expected the approval step")
     require(int(answered.group(6)) > 0, "the recorded artifact is empty: a step that says nothing did not run")
     print(
         f"run: {started.group(1)} started with {started.group(2)} steps and {started.group(3)} artifact(s) at {started.group(4)}, "

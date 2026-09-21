@@ -541,10 +541,17 @@ pub const App = struct {
                     self.selection_anchor = null;
                     self.follow_cursor = true;
                 },
-                c.SDLK_A => if (self.focus == .editor) {
-                    self.selection_anchor = 0;
-                    self.workspace.activeDocument().cursor = self.workspace.activeDocument().buffer.len();
-                    self.follow_cursor = true;
+                c.SDLK_A => {
+                    // A run waiting for a person takes precedence over the
+                    // editor's own shortcut: it is the only thing here that
+                    // another outcome depends on.
+                    if (shift and self.runWaiting()) {
+                        try self.approveStep();
+                    } else if (self.focus == .editor) {
+                        self.selection_anchor = 0;
+                        self.workspace.activeDocument().cursor = self.workspace.activeDocument().buffer.len();
+                        self.follow_cursor = true;
+                    }
                 },
                 c.SDLK_TAB => self.switchBuffer(!shift),
                 c.SDLK_R => {
@@ -1687,7 +1694,7 @@ pub const App = struct {
             .approval => {
                 step.state = .running;
                 run.state = .waiting_for_approval;
-                self.status("Run {s}: {s} waits for you.", .{ run.name, step.name });
+                self.status("Run {s}: {s} waits for you. Ctrl+Shift+A approves.", .{ run.name, step.name });
             },
         }
     }
@@ -1731,6 +1738,26 @@ pub const App = struct {
         self.status("Run {s}: {s} finished.", .{ run.name, step.name });
     }
 
+    /// Whether the run is waiting for a person to decide something.
+    pub fn runWaiting(self: *const App) bool {
+        const run = if (self.run) |value| &value else return false;
+        return run.state == .waiting_for_approval;
+    }
+
+    /// Approve the step the run is waiting on. The decision is an artifact like
+    /// any other: the run records that a person accepted what came before it,
+    /// which is what separates a workflow's progress from its acceptance.
+    pub fn approveStep(self: *App) !void {
+        const run = if (self.run) |*value| value else return error.NoRun;
+        const step = run.current() orelse return error.RunFinished;
+        if (step.action != .approval) return error.NotAnApproval;
+        var body: [256]u8 = undefined;
+        const words = try std.fmt.bufPrint(&body, "approved by the developer; {d} artifact(s) preceded it", .{run.artifacts.items.len});
+        try run.record(step, words);
+        run.state = .running;
+        self.status("Run {s}: {s} approved.", .{ run.name, step.name });
+    }
+
     /// The signature action: send what the composer holds, with the context
     /// the inspector shows, to one harness. Choosing the destination is the
     /// whole gesture; the interface names it before anything is sent.
@@ -1754,6 +1781,9 @@ pub const App = struct {
         const line = self.workspace.activeDocument().lineOf(self.workspace.activeDocument().cursor) + 1;
         const label = try std.fmt.bufPrint(&subject, "{s} · line {d}", .{ path, line });
         try r.text(bounds.x + 14, bounds.y + 31, label, theme.accent);
+        if (self.runWaiting()) {
+            try r.text(bounds.x + bounds.w - 108, bounds.y + 31, "1 decision", theme.amber);
+        }
 
         const rows = [_][]const u8{ "Selection", "Current file", "Terminal output" };
         const context_y = bounds.y + 46;

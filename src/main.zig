@@ -619,6 +619,8 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
 }
 
 /// The terminal's tabs: a strip a reader can add to, move around, and close.
+var tabs_copied = false;
+
 fn exerciseTabs(app: *App, frame: usize) void {
     switch (frame) {
         4 => app.toggleTerminal() catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
@@ -653,19 +655,28 @@ fn exerciseTabs(app: *App, frame: usize) void {
         },
         50 => {
             // A drag over the screen, then the copy key: what a reader does with
-            // a terminal's output before sending it somewhere. The shells have
-            // had time to print a prompt by now, so there is text to take.
+            // a terminal's output before sending it somewhere.
             app.terminal_selection = .{ .anchor = .{ .x = 0, .y = 0 }, .cursor = .{ .x = 12, .y = 0 } };
-            app.copyTerminalSelection() catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
         },
-        60 => {
-            std.log.info("tabs: {d} open, showing {d} of {d}", .{
+        51...61, 65...68 => {
+            if (frame == 60) std.log.info("tabs: {d} open, showing {d} of {d}", .{
                 app.shells.count(),
                 app.shells.active + 1,
                 app.shells.count(),
             });
-            std.log.info("tabs: copy reported {s}", .{app.statusText()});
+            // A prompt arrives when the shell is ready rather than at a frame
+            // number, and a shell that has printed nothing has nothing to copy.
+            // So the copy is tried again each frame until it finds text, and the
+            // line is reported when it does - which is what the gate reads.
+            if (tabs_copied) return;
+            if (std.mem.indexOf(u8, app.statusText(), "Copied") != null) {
+                tabs_copied = true;
+                std.log.info("tabs: copy reported {s}", .{app.statusText()});
+                return;
+            }
+            app.copyTerminalSelection() catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
         },
+        69 => if (!tabs_copied) std.log.err("tabs: nothing was selected in the terminal", .{}),
         // The shell list: what this machine can run in a tab, rather than
         // whatever SHELL happens to name. It comes after the report at sixty,
         // so that report is still the arithmetic the move and the close left

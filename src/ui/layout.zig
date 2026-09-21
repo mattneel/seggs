@@ -92,7 +92,7 @@ pub const Layout = struct {
         const status_h = @round(metrics.line_height * 1.25);
         const body_h = @max(0, height - status_h);
         const rail = @round(metrics.char_width * 4.5);
-        // The navigator and the inspector are docks, not proportions: a column
+        // The navigator and the agent dock are docks, not proportions: a column
         // of filenames and a column of labels read the same at any window size,
         // and the editor takes what is left.
         // Each dock is bounded by what the other one has already taken: a drag
@@ -197,8 +197,8 @@ test "a dragged dock stops where the editor would be squeezed out" {
 }
 
 test "the docks stay readable and the editor takes the rest" {
-    // A navigator and an inspector are columns, not proportions: widening the
-    // window past their bounds hands the room to the editor.
+    // A navigator and a dock of labels are columns, not proportions: widening
+    // the window past their bounds hands the room to the editor.
     const metrics: Layout.Metrics = .{ .line_height = 22, .char_width = 9.5 };
     const wide = Layout.calculate(1920, 900, true, metrics, 0);
     const wider = Layout.calculate(2560, 900, true, metrics, 0);

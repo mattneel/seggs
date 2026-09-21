@@ -14,4 +14,5 @@ test {
     _ = @import("ui/layout.zig");
     _ = @import("ui/wrap.zig");
     _ = @import("ui/tree.zig");
+    _ = @import("ui/menu.zig");
 }

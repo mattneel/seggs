@@ -51,7 +51,12 @@ COMMAND_LINE = re.compile(r"terminal: (the shell marked its command: (.+)|this s
 REVIEW_LINE = re.compile(r"review: (\d+) change\(s\) waiting, accepted=(true|false)")
 ANSWER_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, (\S+) from (.+?), (\d+) bytes")
 
-INSPECTOR_LINE = re.compile(r"inspector: selection=false")
+AGENT_TAB_LINE = re.compile(r"agent tab: clicked (.+), F5: (.+)")
+AGENT_JUMP_LINE = re.compile(r"agents: jump list: (.+)")
+AGENT_KEY_LINE = re.compile(r"agents: jump key: (.+)")
+AGENT_SEND_LINE = re.compile(r"agents: send to: (.+)")
+AGENT_CLOSE_LINE = re.compile(r"agents: close: (.+)")
+BUFFER_CLOSE_LINE = re.compile(r"agents: close buffer: (.+)")
 
 HOVER_LINE = re.compile(r"hover (\S+) (\S+)")
 APP_ACTION = re.compile(r"app action: (\S+)")
@@ -500,7 +505,7 @@ def check_panel(binary: str) -> None:
     call. None of that shows up in a pixel comparison, so the round trip is
     driven and its result read from the log.
     """
-    command = display_command([binary, "--windowed", "--frames", "22", "--exercise-click"], app_env())
+    command = display_command([binary, "--windowed", "--frames", "40", "--exercise-click"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     loaded = EXTENSION_LINE.search(app_output(result))
     require(loaded is not None, "the extension host reported no extensions")
@@ -512,17 +517,45 @@ def check_panel(binary: str) -> None:
     # one the editor applies to the document, one it applies to an agent.
     opened = EDITOR_OPEN.search(app_output(result))
     require(opened is not None, "an explorer row did not open a file")
-    # The inspector carries context rather than a roster: a click on a context
-    # row switches what the next prompt will send, and says so.
-    inspector = INSPECTOR_LINE.search(app_output(result))
-    require(inspector is not None, "an inspector row click did not change what the next prompt carries")
+    # The agent dock's strip is its navigation: a click on a lane's tab makes
+    # that lane the one the interface works on, and F5 then starts it. The
+    # status line names the lane, so a click that landed on the wrong tab is
+    # visible rather than silent.
+    tab = AGENT_TAB_LINE.search(app_output(result))
+    require(tab is not None, "a click on an agent tab was not reported")
+    require(
+        tab.group(2).startswith("Started") and tab.group(1) in tab.group(2),
+        f"the tab click selected {tab.group(1)}, but F5 then said {tab.group(2)!r}",
+    )
+    # Both jump lists come off the same rows and the same keys. The template
+    # list is opened with Ctrl+Shift+A, filtered by typing, and chosen with
+    # Return; the destination list is opened with Ctrl+Shift+Enter and chosen
+    # the same way, and the status line names what each one did.
+    jump = AGENT_JUMP_LINE.search(app_output(result))
+    require(jump is not None, "the template jump list reported nothing")
+    require("Local mock" in jump.group(1), f"the jump list chose {jump.group(1)!r}, not the lane that was filtered for")
+    key = AGENT_KEY_LINE.search(app_output(result))
+    require(key is not None, "the same list opened by a key reported nothing")
+    require("Local mock" in key.group(1), f"the key-opened list chose {key.group(1)!r}")
+    sent = AGENT_SEND_LINE.search(app_output(result))
+    require(sent is not None, "the destination list reported nothing")
+    require("Prompt sent to Local mock" in sent.group(1), f"the destination list said {sent.group(1)!r}")
+    # Ctrl+W closes what has focus. In the dock that is the lane, and in the
+    # editor it is the file behind the one on screen.
+    close = AGENT_CLOSE_LINE.search(app_output(result))
+    require(close is not None, "the close key reported nothing for the dock")
+    require("Closed Local mock" in close.group(1), f"the close key said {close.group(1)!r} with the dock focused")
+    buffer = BUFFER_CLOSE_LINE.search(app_output(result))
+    require(buffer is not None, "the close key reported nothing for the editor")
+    require(buffer.group(1).startswith("Closed "), f"the close key said {buffer.group(1)!r} with the editor focused")
     # And a pointer moving over a row, which panels use to respond before a
     # click. It is dispatched only when the node under the pointer changes.
     hover = HOVER_LINE.search(app_output(result))
     require(hover is not None, "moving the pointer over a panel reached no handler")
     print(
         f"panel: {loaded.group(1)} extension(s) loaded, click reached panel {click.group(1)}, "
-        f"explorer row opened {opened.group(1)}, inspector row clicked, "
+        f"explorer row opened {opened.group(1)}, agent tab clicked {tab.group(1)}, "
+        f"jump lists chose and sent to {tab.group(1)}, "
         f"hover reported on {hover.group(1)}"
     )
 

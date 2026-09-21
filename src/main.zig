@@ -15,8 +15,8 @@ const help =
     \\Defaults: current directory, fullscreen, no automatic agent launch.
     \\Config files execute programs. Only load a config that you trust.
     \\F5 starts the selected agent. Ctrl+L focuses the prompt.
-    \\Ctrl+Enter sends to one agent. Ctrl+Shift+Enter sends to ready agents.
-    \\F11 toggles fullscreen. Ctrl+P opens a file. Ctrl+Q quits.
+    \\Ctrl+Enter sends to that agent. Ctrl+Shift+Enter picks a destination.
+    \\Ctrl+Shift+A opens an agent. F11 toggles fullscreen. Ctrl+Q quits.
 ;
 
 pub fn main(init: std.process.Init) !void {
@@ -347,7 +347,7 @@ fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
 }
 
 /// A run starts from what is on screen, and its steps are the report: this
-/// exercise starts one and says what the inspector would show.
+/// exercise starts one and reports what it produced.
 fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
     switch (frame) {
         6 => {
@@ -586,6 +586,11 @@ fn exerciseCompose(app: *App, frame: usize) void {
     }
 }
 
+/// What the agent strip reported: the lane a tab click selected, so the frame
+/// that says what F5 did can name the same lane the click did.
+var tab_clicked = false;
+var tab_name: []const u8 = "";
+
 fn exerciseClick(app: *App, frame: usize) void {
     switch (frame) {
         6 => {
@@ -658,22 +663,85 @@ fn exerciseClick(app: *App, frame: usize) void {
             if (!c.SDL_PushEvent(&ev)) std.log.warn("hover not delivered: {s}", .{c.SDL_GetError()});
         },
         15 => {
-            // And an inspector row. The inspector carries context rather than
-            // a roster, so the click toggles what the next prompt will send,
-            // and the status line is where that is observable.
-            const rect = app.inspectorRowPoint(0) orelse {
-                std.log.warn("inspector: no context row to click", .{});
+            // The agent dock's strip is the dock's navigation: the click lands
+            // on a lane's tab, and the lane is what the interface then works
+            // on. F5 two frames later starts that lane, which is how the click
+            // is observable from outside: the status names the lane it started.
+            const mock = app.agentIndex("Local mock") orelse {
+                std.log.warn("tabs: no local mock profile", .{});
+                return;
+            };
+            const point = app.agentTabPoint(mock) orelse {
+                std.log.warn("tabs: no agent tab was drawn", .{});
+                return;
+            };
+            tab_clicked = true;
+            tab_name = app.agentName(mock);
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+            ev.button.button = c.SDL_BUTTON_LEFT;
+            ev.button.clicks = 1;
+            ev.button.x = point.x;
+            ev.button.y = point.y;
+            if (!c.SDL_PushEvent(&ev)) std.log.warn("tab click not delivered: {s}", .{c.SDL_GetError()});
+        },
+        17 => {
+            // Only when the click landed: a window too narrow for the dock has
+            // no tab to click, and starting whatever lane happened to be
+            // selected would be exercising something else.
+            if (tab_clicked) pushKey(c.SDLK_F5);
+        },
+        19 => std.log.info("agent tab: clicked {s}, F5: {s}", .{ tab_name, app.statusText() }),
+        20 => {
+            // Both ways in, and the same list either way. The `+` at the end of
+            // the strip opens the templates as a dropdown under itself; the
+            // filter line and the rows are the same rows the key opens.
+            const point = app.agentPlusPoint() orelse {
+                std.log.warn("agents: no control to open one was drawn", .{});
                 return;
             };
             var ev = std.mem.zeroes(c.SDL_Event);
             ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
             ev.button.button = c.SDL_BUTTON_LEFT;
             ev.button.clicks = 1;
-            ev.button.x = rect.x;
-            ev.button.y = rect.y;
-            if (!c.SDL_PushEvent(&ev)) std.log.warn("inspector click not delivered: {s}", .{c.SDL_GetError()});
+            ev.button.x = point.x;
+            ev.button.y = point.y;
+            if (!c.SDL_PushEvent(&ev)) std.log.warn("templates click not delivered: {s}", .{c.SDL_GetError()});
         },
-        17 => std.log.info("inspector: selection={} status={s}", .{ app.inspectorContext(0), app.statusText() }),
+        21 => pushInput("mock"),
+        22 => pushKey(c.SDLK_RETURN),
+        23 => std.log.info("agents: jump list: {s}", .{app.statusText()}),
+        24 => {
+            // And the key that opens the same rows over the window instead of
+            // under the control.
+            pushKeyMod(c.SDLK_A, c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT);
+        },
+        25 => pushInput("mock"),
+        26 => pushKey(c.SDLK_RETURN),
+        27 => std.log.info("agents: jump key: {s}", .{app.statusText()}),
+        30 => {
+            // And the destination list, with something to send: a request that
+            // is a selection does not need words, and the lane started at frame
+            // seventeen has had the frames since to finish its handshake.
+            app.workspace.activeDocument().cursor = 8;
+            app.selection_anchor = 0;
+            pushKeyMod(c.SDLK_RETURN, c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT);
+        },
+        31 => pushKey(c.SDLK_RETURN),
+        32 => std.log.info("agents: send to: {s}", .{app.statusText()}),
+        34 => {
+            // Ctrl+W closes what has focus, and the dock is what has it: the
+            // lane goes the way its own tab's box closes it.
+            pushKeyMod(c.SDLK_W, c.SDL_KMOD_CTRL);
+        },
+        35 => std.log.info("agents: close: {s}", .{app.statusText()}),
+        36 => pushKey(c.SDLK_ESCAPE),
+        37 => {
+            // With the keyboard back in the editor the same key closes the file
+            // it was showing, and the last buffer is left alone.
+            pushKeyMod(c.SDLK_W, c.SDL_KMOD_CTRL);
+        },
+        39 => std.log.info("agents: close buffer: {s}", .{app.statusText()}),
         else => {},
     }
 }
@@ -681,10 +749,15 @@ fn exerciseClick(app: *App, frame: usize) void {
 /// Deliver a key the way a keyboard would, so key routing is exercised through
 /// the real event queue.
 fn pushKey(keycode: c.SDL_Keycode) void {
+    pushKeyMod(keycode, 0);
+}
+
+/// The same, with the modifiers a binding is only itself with.
+fn pushKeyMod(keycode: c.SDL_Keycode, mod: c.SDL_Keymod) void {
     var ev = std.mem.zeroes(c.SDL_Event);
     ev.type = c.SDL_EVENT_KEY_DOWN;
     ev.key.key = keycode;
-    ev.key.mod = 0;
+    ev.key.mod = mod;
     if (!c.SDL_PushEvent(&ev)) std.log.warn("key not delivered: {s}", .{c.SDL_GetError()});
 }
 

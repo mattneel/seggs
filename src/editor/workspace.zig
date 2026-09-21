@@ -99,6 +99,20 @@ pub const Workspace = struct {
         self.active = @min(i, self.buffers.items.len - 1);
     }
 
+    /// Close a buffer and let the one before it take its place, which is where
+    /// a reader who closed the tab they were on expects to land.
+    ///
+    /// The last buffer is not closed here: an editor closed to nothing has
+    /// nowhere to type, and that is the caller's decision rather than this
+    /// one's.
+    pub fn close(self: *Workspace, index: usize) void {
+        if (index >= self.buffers.items.len or self.buffers.items.len < 2) return;
+        var removed = self.buffers.orderedRemove(index);
+        removed.deinit(self.allocator);
+        if (self.active > index) self.active -= 1;
+        if (self.active >= self.buffers.items.len) self.active = self.buffers.items.len - 1;
+    }
+
     pub fn cycle(self: *Workspace, forward: bool) void {
         const n = self.buffers.items.len;
         if (n < 2) return;

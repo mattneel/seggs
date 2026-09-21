@@ -20,22 +20,16 @@ const runs = @import("editor/runs.zig");
 /// The dividers between docks, which is what a reader drags to resize one.
 const Divider = enum { explorer, agents, terminal };
 
-/// A context row in the inspector is its name and, under it, what it would
-/// carry. The height follows the line metrics rather than a number chosen for
-/// one font size, because the interface does not get to decide how tall a line
-/// of text is.
-fn inspectorRowHeight(line_height: f32) f32 {
-    return line_height * 2 + 8;
-}
 const review = @import("editor/review.zig");
 const wrap = @import("ui/wrap.zig");
 const shell_integration = @import("services/shell.zig");
 const terminals = @import("services/terminals.zig");
 const tree_widget = @import("ui/tree.zig");
+const menu_widget = @import("ui/menu.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
-const default_help = "No agent starts automatically.\n\nF5 starts this agent.\nCtrl+L focuses the prompt.\nCtrl+Enter sends to this agent.\nCtrl+Shift+Enter sends to ready agents.";
+const default_help = "No agent starts automatically.\n\nClick a tab, or press Ctrl+Shift+A, to open one.\nCtrl+L focuses the prompt.\nCtrl+Enter sends to this agent.\nCtrl+Shift+Enter picks the destination.\nCtrl+W closes what has focus.";
 
 /// A panel and the box it occupied, recorded while drawing.
 const PanelRect = struct { name: []const u8, bounds: Rect };
@@ -61,7 +55,45 @@ pub const App = struct {
     /// What the left dock navigates. The roadmap's rail is the long version of
     /// this; two things to look at is where it starts.
     const Dock = enum { files, runs };
-    const Overlay = enum { none, files, commands, quit };
+    /// The lists the interface opens over the editor. They differ in what they
+    /// name and not in how they behave: each is drawn by the one list widget,
+    /// and the keys that walk it are the same keys for all of them.
+    const Overlay = enum {
+        none,
+        quit,
+        files,
+        commands,
+        templates,
+        destinations,
+
+        /// Whether this overlay is a list the menu draws. Quitting is a question
+        /// with three answers, not a list of rows.
+        fn listed(self: Overlay) bool {
+            return switch (self) {
+                .none, .quit => false,
+                else => true,
+            };
+        }
+
+        fn title(self: Overlay) []const u8 {
+            return switch (self) {
+                .files => "QUICK OPEN",
+                .commands => "COMMANDS",
+                .templates => "AGENTS",
+                .destinations => "SEND TO",
+                else => "",
+            };
+        }
+    };
+    /// The depth of the agent dock's tab strip: a tab per lane, and the control
+    /// that opens one. The list under it starts below the strip rather than
+    /// under a heading of its own.
+    const agent_strip_height: f32 = 26;
+    /// The least a tab is worth drawing, and the most one tab may take. A name
+    /// narrower than this is not a name, and one lane does not get to own the
+    /// whole strip.
+    const agent_tab_min: f32 = 44;
+    const agent_tab_max: f32 = 150;
     const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes", "Show runs", "Compose the run" };
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
@@ -70,8 +102,15 @@ pub const App = struct {
     active: usize = 0,
     focus: Focus = .editor,
     overlay: Overlay = .none,
-    query: std.ArrayList(u8) = .empty,
-    query_selected: usize = 0,
+    /// What opened the open list, when a control did: the box hangs under it. A
+    /// list opened by a key is centred on the window instead - the same rows and
+    /// the same keys in a different place.
+    overlay_trigger: ?Rect = null,
+    /// The one list widget, and the rows the open list is showing. The rows are
+    /// gathered when a list opens, because nothing that fills them can change
+    /// while it is up: every other key belongs to the list.
+    menu: menu_widget.Menu = .{},
+    menu_items: std.ArrayListUnmanaged(menu_widget.Item) = .empty,
     prompt_text: std.ArrayList(u8) = .empty,
     preedit: Preedit = .{},
     /// Extension host, when one is attached. Panels come from it.
@@ -87,10 +126,6 @@ pub const App = struct {
     panel_nodes: std.ArrayListUnmanaged(PanelNode) = .empty,
     /// Which of those take part in Tab order, as indices into `panel_nodes`.
     focus_order: std.ArrayListUnmanaged(usize) = .empty,
-    /// What the inspector will carry with the next prompt: a selection, the
-    /// file it came from, and what the terminal last printed. Nothing travels
-    /// that the developer did not switch on.
-    inspector_context: [3]bool = .{ true, false, false },
 
     /// What the review surface is about: changes proposed by an extension, by
     /// a language server, or by the person, none of which are applied until
@@ -102,16 +137,13 @@ pub const App = struct {
     review_selected: usize = 0,
     compose_selected: usize = 0,
 
-    /// Scratch for the inspector's own labels, so drawing does not allocate.
-    inspector_scratch: [3][64]u8 = undefined,
-
     /// Runs this session knows about, oldest first. A run is the work rather
     /// than a panel: it keeps its identity, its steps, and its artifacts
     /// whether or not anything is looking at it, and starting another one does
     /// not throw the first away.
     runs: std.ArrayList(runs.Run) = .empty,
 
-    /// Which run the inspector and the navigator are about.
+    /// Which run the navigator is about.
     run_index: usize = 0,
 
     /// Which way the left dock is looking.
@@ -206,7 +238,7 @@ pub const App = struct {
         self.allocator.free(self.clients);
         self.workspace.deinit();
         self.allocator.free(self.cached);
-        self.query.deinit(self.allocator);
+        self.menu_items.deinit(self.allocator);
         self.prompt_text.deinit(self.allocator);
         self.preedit.deinit(self.allocator);
         for (self.runs.items) |*run| run.deinit();
@@ -386,91 +418,58 @@ pub const App = struct {
         }
     }
 
-    fn submit(self: *App, broadcast: bool) !void {
-        // A request does not need words when it carries context. Selecting code
-        // and sending it is a complete ask - the code is what is being asked
-        // about - and requiring a sentence as well is how a selection ends up
-        // being impossible to send.
-        if (self.prompt_text.items.len == 0 and !self.carriesContext()) return;
+    /// Send what the composer holds to one lane. Wherever the destination came
+    /// from - typed at the composer, picked out of the destination list, named
+    /// by an extension - this is the one way a request leaves the editor, so the
+    /// message is built the same way every time.
+    ///
+    /// A request does not need words when it carries context: selecting code and
+    /// sending it is a complete ask - the code is what is being asked about -
+    /// and requiring a sentence as well is how a selection ends up being
+    /// impossible to send.
+    fn sendTo(self: *App, index: usize) !void {
+        if (index >= self.clients.len) return error.NoSuchAgent;
+        if (self.prompt_text.items.len == 0 and !self.carriesContext()) {
+            self.status("Nothing to send: type a request or select something.", .{});
+            return;
+        }
         const message = try self.promptWithContext();
         defer self.allocator.free(message);
-        var sent: usize = 0;
-        if (broadcast) {
-            for (self.clients) |*client| {
-                if (client.state == .ready) {
-                    // Failure in one lane does not suppress delivery to another lane.
-                    client.prompt(message) catch |err| {
-                        self.status("{s}: {s}", .{ client.preset.name, @errorName(err) });
-                        continue;
-                    };
-                    sent += 1;
-                }
-            }
-            if (sent == 0) return error.NoReadyAgents;
-        } else {
-            try self.clients[self.active].prompt(message);
-            sent = 1;
-        }
+        self.clients[index].prompt(message) catch |err| {
+            // A lane that is up but busy refuses a second request. Naming the
+            // lane that refused is more use than a key that appears to do
+            // nothing, and it is not a failure of the editor.
+            self.status("{s}: {s}", .{ self.clients[index].preset.name, @errorName(err) });
+            return;
+        };
         self.prompt_text.clearRetainingCapacity();
         self.transcript_scroll = 0;
-        self.status("Prompt sent to {d} agent(s).", .{sent});
+        self.status("Prompt sent to {s}.", .{self.clients[index].preset.name});
     }
 
-    /// Whether the inspector has anything switched on that a request could
-    /// carry. Someone who switched it on meant to send it.
+    /// Whether the editor is holding something a request could carry. The
+    /// selection is what travels, and having one is the whole permission: it is
+    /// in front of the reader, and they selected it.
     pub fn carriesContext(self: *App) bool {
-        if (self.inspector_context[0] and self.selectedRange() != null) return true;
-        if (self.inspector_context[1]) return true;
-        if (self.inspector_context[2] and self.activeTerminal() != null) return true;
-        return false;
+        return self.selectedRange() != null;
     }
 
-    /// Build the outgoing prompt: the current selection plus the language
+    /// Build the outgoing prompt: the current selection, plus the language
     /// server's diagnostics for the active file.
     fn promptWithContext(self: *App) ![]u8 {
         const document = self.workspace.activeDocument();
         var label: [48]u8 = undefined;
         var range_label: ?[]const u8 = null;
         var selection: ?[]u8 = null;
-        if (self.inspector_context[0]) {
-            if (self.selectedRange()) |span| {
-                const bytes = try document.snapshot(self.allocator);
-                defer self.allocator.free(bytes);
-                selection = try self.allocator.dupe(u8, bytes[span.start..span.end]);
-                range_label = std.fmt.bufPrint(&label, "{d}-{d}", .{
-                    document.lineOf(span.start) + 1, document.lineOf(span.end) + 1,
-                }) catch null;
-            }
+        if (self.selectedRange()) |span| {
+            const bytes = try document.snapshot(self.allocator);
+            defer self.allocator.free(bytes);
+            selection = try self.allocator.dupe(u8, bytes[span.start..span.end]);
+            range_label = std.fmt.bufPrint(&label, "{d}-{d}", .{
+                document.lineOf(span.start) + 1, document.lineOf(span.end) + 1,
+            }) catch null;
         }
         defer if (selection) |sel| self.allocator.free(sel);
-
-        // A whole buffer is a large attachment, so it travels only when it was
-        // switched on, and the inspector says how large.
-        var file: ?[]u8 = null;
-        if (self.inspector_context[1]) file = try document.snapshot(self.allocator);
-        defer if (file) |body| self.allocator.free(body);
-
-        // The terminal's last command is a result with a command line, when the
-        // shell reported one. A screen with no markers attached as a command
-        // would be a claim about what ran that nothing supports, so it is
-        // attached as what it is: the screen.
-        var command: ?[]u8 = null;
-        var output: ?[]u8 = null;
-        if (self.inspector_context[2]) {
-            if (self.activeTerminal()) |terminal| {
-                if (terminal.lastCommand(self.allocator) catch null) |result| {
-                    var owned = result;
-                    command = owned.command;
-                    output = owned.output;
-                    owned.command = &.{};
-                    owned.output = &.{};
-                } else {
-                    output = self.terminalScreen(self.allocator) catch null;
-                }
-            }
-        }
-        defer if (command) |body| self.allocator.free(body);
-        defer if (output) |body| self.allocator.free(body);
 
         const diagnostics = try self.diagnosticContext();
         defer self.allocator.free(diagnostics);
@@ -478,10 +477,7 @@ pub const App = struct {
             .path = self.workspace.activePath(),
             .range = range_label,
             .selection = selection,
-            .file = file,
             .diagnostics = diagnostics,
-            .command = command,
-            .output = output,
         }, self.prompt_text.items);
     }
 
@@ -538,9 +534,8 @@ pub const App = struct {
             c.SDL_EVENT_TEXT_INPUT => {
                 self.preedit.clear();
                 const bytes = std.mem.span(ev.text.text);
-                if (self.overlay == .files or self.overlay == .commands) {
-                    if (self.query.items.len + bytes.len <= 256) try self.query.appendSlice(self.allocator, bytes);
-                    self.query_selected = 0;
+                if (self.overlay.listed()) {
+                    self.menu.typeBytes(bytes);
                 } else if (self.perspective == .review) {
                     // The review surface takes keys, not text.
                 } else if (self.focus == .terminal) {
@@ -600,12 +595,9 @@ pub const App = struct {
         if (self.overlay != .none) {
             switch (keycode) {
                 c.SDLK_ESCAPE => self.overlay = .none,
-                c.SDLK_BACKSPACE => {
-                    self.query.items.len = text.previous(self.query.items, self.query.items.len);
-                    self.query_selected = 0;
-                },
-                c.SDLK_DOWN => self.query_selected = @min(self.query_selected + 1, self.matchCount() -| 1),
-                c.SDLK_UP => self.query_selected -|= 1,
+                c.SDLK_BACKSPACE => self.menu.backspace(),
+                c.SDLK_DOWN => self.menu.move(true),
+                c.SDLK_UP => self.menu.move(false),
                 c.SDLK_RETURN => try self.chooseOverlay(),
                 else => {},
             }
@@ -655,12 +647,10 @@ pub const App = struct {
                 c.SDLK_B => self.sidebar = !self.sidebar,
                 c.SDLK_I => try self.showHover(),
                 c.SDLK_L => self.focus = .prompt,
-                c.SDLK_P => {
-                    self.overlay = if (shift) .commands else .files;
-                    self.query.clearRetainingCapacity();
-                    self.query_selected = 0;
-                },
-                c.SDLK_RETURN => try self.submit(shift),
+                c.SDLK_P => try self.openOverlay(if (shift) .commands else .files, null),
+                // Ctrl+Enter sends to the lane the panel is on; Ctrl+Shift+Enter
+                // asks which lane first, out of the lanes that are up.
+                c.SDLK_RETURN => if (shift) try self.openDestinations() else try self.sendTo(self.active),
                 c.SDLK_X => {
                     if (shift) {
                         try self.clients[self.active].cancel();
@@ -686,9 +676,10 @@ pub const App = struct {
                     if (shift) {
                         self.perspective = if (self.perspective == .compose) .code else .compose;
                     } else {
-                        // The tab a reader is looking at is the one they mean to
-                        // close, and closing the last one puts the dock away.
-                        self.closeTerminalTab();
+                        // The close key means whatever is in front of the
+                        // reader, and the one thing it never means is the
+                        // shell's own word delete.
+                        try self.closeFocused();
                     }
                 },
                 c.SDLK_T => if (shift) try self.newTerminalTab(),
@@ -700,6 +691,8 @@ pub const App = struct {
                     // another outcome depends on.
                     if (shift and self.runWaiting()) {
                         try self.approveStep();
+                    } else if (shift) {
+                        try self.openOverlay(.templates, null);
                     } else if (self.focus == .editor) {
                         self.selection_anchor = 0;
                         self.workspace.activeDocument().cursor = self.workspace.activeDocument().buffer.len();
@@ -889,11 +882,7 @@ pub const App = struct {
                     switch (action.op) {
                         .sidebar => self.sidebar = !self.sidebar,
                         .prompt => self.focus = .prompt,
-                        else => {
-                            self.overlay = .files;
-                            self.query.clearRetainingCapacity();
-                            self.query_selected = 0;
-                        },
+                        else => self.openOverlay(.files, null) catch |err| self.status("Quick open failed: {s}", .{@errorName(err)}),
                     }
                 },
                 .activate, .start, .stop => {
@@ -948,11 +937,12 @@ pub const App = struct {
 
     /// Draw the panel an extension registered for a named region.
     ///
-    /// The interface offers rectangles and the extension fills them: the `lanes`
-    /// region is the agent list and `transcript` is the space below it. A panel
-    /// is asked for its description on every frame it is drawn, so a panel that
-    /// shows live state stays correct without an invalidation protocol, and a
-    /// panel that throws simply contributes nothing.
+    /// The interface offers rectangles and the extension fills them: the
+    /// `transcript` region is the space a lane's conversation would take, and
+    /// `activity` is the rail. A panel is asked for its description on every
+    /// frame it is drawn, so a panel that shows live state stays correct without
+    /// an invalidation protocol, and a panel that throws simply contributes
+    /// nothing.
     fn drawPanel(self: *App, r: *Renderer, frame: std.mem.Allocator, region: []const u8, bounds: Rect) !bool {
         const host = self.host orelse return false;
         const description = (host.panelDescription(region, bounds.w, bounds.h) catch |err| {
@@ -1239,14 +1229,17 @@ pub const App = struct {
         if (g.activity.contains(x, y)) {
             if (y < 105) self.sidebar = !self.sidebar else self.focus = .prompt;
         } else if (g.agents.contains(x, y)) {
-            try self.inspectorClick(x, y);
-            const lanes_y = g.agents.y + 44;
-            const lanes_end = lanes_y + @as(f32, @floatFromInt(self.clients.len)) * 38;
-            if (y >= lanes_y and y < lanes_end) {
-                self.active = @intFromFloat((y - lanes_y) / 38);
-                self.transcript_scroll = 0;
-                if (x > g.agents.x + g.agents.w - 76) {
-                    if (self.clients[self.active].transport == null) try self.startAgent() else self.clients[self.active].stop();
+            // The strip is the dock's navigation rather than a request: a tab
+            // shows a lane, its `x` stops that lane, and the `+` at the end
+            // opens the list of templates.
+            if (self.agentTabAt(x, y)) |hit| {
+                switch (hit) {
+                    .select => |index| {
+                        self.active = index;
+                        self.transcript_scroll = 0;
+                    },
+                    .close => |index| self.clients[index].stop(),
+                    .new_tab => try self.openOverlay(.templates, self.agentPlusRect()),
                 }
             } else if (self.clients[self.active].permission != null and self.permissionRect().contains(x, y)) {
                 if (y >= self.permissionRect().y + 34) {
@@ -1286,63 +1279,116 @@ pub const App = struct {
         return pos;
     }
 
-    fn match(self: *const App, candidate: []const u8) bool {
-        const query = self.query.items;
-        if (query.len > candidate.len) return false;
-        if (query.len == 0) return true;
-        for (0..candidate.len - query.len + 1) |start| if (std.ascii.eqlIgnoreCase(candidate[start .. start + query.len], query)) return true;
-        return false;
+    /// Gather the rows for a list, and open it. The rows are built once, when
+    /// the list opens, because nothing that fills them can change while it is
+    /// up: every other key belongs to the list.
+    ///
+    /// `trigger` is the control that opened it, when a click did: the box hangs
+    /// under it. A list opened by a key is centred instead.
+    fn openOverlay(self: *App, which: Overlay, trigger: ?Rect) !void {
+        self.menu_items.clearRetainingCapacity();
+        switch (which) {
+            // The navigator's own list, as the explorer shows it: a file's path
+            // is its name relative to the root, which is the part that tells
+            // two files apart.
+            .files => for (self.workspace.explorer.entries.items, 0..) |path, index| {
+                try self.menu_items.append(self.allocator, .{ .label = self.relativePath(path), .key = index });
+            },
+            .commands => for (commands, 0..) |command, index| {
+                try self.menu_items.append(self.allocator, .{ .label = command, .key = index });
+            },
+            // Every lane, with what it is doing: opening one is what puts it
+            // online, so the state is what the reader needs to see.
+            .templates => for (self.clients, 0..) |client, index| {
+                try self.menu_items.append(self.allocator, .{ .label = client.preset.name, .detail = client.state.label(), .key = index });
+            },
+            .destinations => for (self.clients, 0..) |client, index| {
+                if (!client.state.up()) continue;
+                try self.menu_items.append(self.allocator, .{ .label = client.preset.name, .detail = client.state.label(), .key = index });
+            },
+            else => return error.NotAList,
+        }
+        self.menu.setItems(self.menu_items.items, &.{});
+        self.menu.open(which.title());
+        self.overlay_trigger = trigger;
+        self.overlay = which;
     }
 
-    fn matchCount(self: *const App) usize {
-        var count: usize = 0;
-        if (self.overlay == .commands) {
-            for (commands) |command| {
-                if (self.match(command)) count += 1;
-            }
-        } else {
-            for (self.workspace.explorer.entries.items) |path| {
-                if (self.match(path)) count += 1;
-            }
+    /// The destination list: where the composer's request can go. A list with no
+    /// lane in it is not a question worth asking, so an editor with nothing up
+    /// says so instead of opening one.
+    fn openDestinations(self: *App) !void {
+        var any_up = false;
+        for (self.clients) |client| any_up = any_up or client.state.up();
+        if (!any_up) {
+            self.status("No agent is up. Ctrl+Shift+A opens one.", .{});
+            return;
         }
-        return count;
+        try self.openOverlay(.destinations, null);
+    }
+
+    /// Choosing a template opens that lane and puts the composer in front of
+    /// it. There is no separate start step: opening an agent is what puts it
+    /// online, and a lane that is already up is one to switch to.
+    fn openAgent(self: *App, index: usize) !void {
+        if (index >= self.clients.len) return error.NoSuchAgent;
+        self.active = index;
+        self.transcript_scroll = 0;
+        if (self.clients[index].transport != null) {
+            self.focus = .prompt;
+            self.status("{s} is {s}.", .{ self.clients[index].preset.name, self.clients[index].state.label() });
+            return;
+        }
+        self.startAgent() catch |err| {
+            self.status("{s}: {s}", .{ self.clients[index].preset.name, @errorName(err) });
+            return;
+        };
     }
 
     fn chooseOverlay(self: *App) !void {
-        var index: usize = 0;
-        if (self.overlay == .commands) {
-            for (commands, 0..) |command, action| {
-                if (!self.match(command)) continue;
-                if (index == self.query_selected) {
-                    self.overlay = .none;
-                    switch (action) {
-                        0 => self.sidebar = !self.sidebar,
-                        1 => self.focus = .prompt,
-                        2 => try self.startAgent(),
-                        3 => self.clients[self.active].stop(),
-                        4 => try self.toggleFullscreen(),
-                        5 => try self.workspace.save(),
-                        6 => try self.clients[self.active].cancel(),
-                        7 => try self.startRun(),
-                        8 => self.perspective = if (self.perspective == .review) .code else .review,
-                        9 => self.dock = if (self.dock == .runs) .files else .runs,
-                        10 => self.perspective = if (self.perspective == .compose) .code else .compose,
-                        else => unreachable,
-                    }
-                    return;
-                }
-                index += 1;
+        const chosen = self.menu.chosen() orelse {
+            // A key that appears to do nothing is the worst answer, so the two
+            // reasons the list has nothing to choose from are said out loud.
+            if (self.menu.shownCount() == 0) {
+                self.status("Nothing matched.", .{});
+            } else {
+                self.status("That row cannot be chosen right now.", .{});
             }
-        } else {
-            for (self.workspace.explorer.entries.items) |path| {
-                if (!self.match(path)) continue;
-                if (index == self.query_selected) {
-                    try self.openFile(path);
-                    self.overlay = .none;
-                    return;
+            return;
+        };
+        const item = self.menu.items[chosen];
+        switch (self.overlay) {
+            .files => {
+                self.overlay = .none;
+                const entries = self.workspace.explorer.entries.items;
+                if (item.key < entries.len) try self.openFile(entries[item.key]);
+            },
+            .commands => {
+                self.overlay = .none;
+                switch (item.key) {
+                    0 => self.sidebar = !self.sidebar,
+                    1 => self.focus = .prompt,
+                    2 => try self.startAgent(),
+                    3 => self.clients[self.active].stop(),
+                    4 => try self.toggleFullscreen(),
+                    5 => try self.workspace.save(),
+                    6 => try self.clients[self.active].cancel(),
+                    7 => try self.startRun(),
+                    8 => self.perspective = if (self.perspective == .review) .code else .review,
+                    9 => self.dock = if (self.dock == .runs) .files else .runs,
+                    10 => self.perspective = if (self.perspective == .compose) .code else .compose,
+                    else => unreachable,
                 }
-                index += 1;
-            }
+            },
+            .templates => {
+                self.overlay = .none;
+                try self.openAgent(item.key);
+            },
+            .destinations => {
+                self.overlay = .none;
+                try self.pipeTo(item.key);
+            },
+            else => self.overlay = .none,
         }
     }
 
@@ -1387,7 +1433,7 @@ pub const App = struct {
         }
         if (self.terminalOpen()) try self.drawTerminal(r);
         if (self.terminalOpen()) try self.drawTerminalTabs(r);
-        try self.drawInspector(r, frame);
+        try self.drawAgents(r, frame);
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
         try r.rect(g.status, theme.selected);
         _ = try self.drawPanel(r, frame, "status", g.status);
@@ -1579,6 +1625,60 @@ pub const App = struct {
         self.status("Terminal {d} of {d}.", .{ self.shells.active + 1, self.shells.count() });
     }
 
+    /// Ctrl+W closes whatever has focus, and there is one answer to what that
+    /// is: the most transient thing on screen first, which is the order a
+    /// reader would close them in themselves.
+    ///
+    /// The shell is the one thing the key does not reach. With the terminal
+    /// focused it closes the tab rather than the program's word, so a shell in
+    /// this dock has no readline delete-word-backward: that is the price of a
+    /// close key that always means close, and it is said out loud rather than
+    /// worked around with a second binding.
+    fn closeFocused(self: *App) !void {
+        // 1. A list, which is what Esc closes and the most transient thing
+        //    there is.
+        if (self.overlay != .none) {
+            self.overlay = .none;
+            return;
+        }
+        // 2. The terminal's tab, when the dock has the keyboard.
+        if (self.focus == .terminal and self.shells.count() > 0) {
+            self.closeTerminalTab();
+            return;
+        }
+        // 3. The lane the dock is showing, which is what its own tab's `x`
+        //    does.
+        if (self.focus == .prompt and self.clients[self.active].state.up()) {
+            self.clients[self.active].stop();
+            self.status("Closed {s}.", .{self.clients[self.active].preset.name});
+            return;
+        }
+        // 4. The file the editor is showing, when another one is behind it.
+        //    The last buffer stays, and unsaved work is not something a close
+        //    key may throw away without a word.
+        if (self.workspace.bufferCount() > 1) {
+            const closing = self.workspace.activeIndex();
+            if (self.workspace.bufferDirty(closing)) {
+                self.status("{s} has unsaved changes. Ctrl+S saves.", .{self.workspace.bufferName(closing)});
+                return;
+            }
+            // The name belongs to the buffer that is about to be freed, so it
+            // is copied out before the close rather than read after it.
+            var label: [96]u8 = undefined;
+            const open = self.workspace.bufferName(closing);
+            const name = label[0..@min(label.len, open.len)];
+            @memcpy(name, open[0..name.len]);
+            self.workspace.close(closing);
+            self.cached_revision = null;
+            self.first_line = 0;
+            self.first_column = 0;
+            self.selection_anchor = null;
+            self.status("Closed {s}.", .{name});
+            return;
+        }
+        self.status("Nothing to close.", .{});
+    }
+
     /// Move the current tab one place along the strip.
     pub fn moveTerminalTab(self: *App, forward: bool) void {
         const count = self.shells.count();
@@ -1736,7 +1836,14 @@ pub const App = struct {
             if (count == 0) break;
             self.terminal_read.items.len += count;
         }
-        if (self.terminal_read.items.len != 0) terminal.write(self.terminal_read.items);
+        if (self.terminal_read.items.len != 0) {
+            terminal.write(self.terminal_read.items);
+            // A title arrives in the same bytes as everything else, and it can
+            // only have changed on a frame that wrote to the emulator, so this
+            // is read once per write rather than once per frame. The session
+            // keeps the name it was opened with until the program sets one.
+            self.syncTerminalTitle(terminal);
+        }
         // The program can end while the dock is open: the reader typed `exit`,
         // or it crashed, or its input closed. A tab whose program is gone
         // cannot run anything, so it closes itself - and the last one takes the
@@ -1761,6 +1868,20 @@ pub const App = struct {
             }
         }
         terminal.update() catch {};
+    }
+
+    /// Point the active tab's label at the title the program in it has set. The
+    /// session's own name is what the tab shows until a program says otherwise,
+    /// and the write happens only when the title has changed: the library lends
+    /// the title rather than handing out a copy, so comparing costs nothing and
+    /// a title changes maybe once.
+    fn syncTerminalTitle(self: *App, terminal: *vt.Terminal) void {
+        const title = terminal.title();
+        if (title.len == 0) return;
+        const index = self.shells.active;
+        const current = self.shells.titleAt(index) orelse return;
+        if (std.mem.eql(u8, current, title)) return;
+        self.shells.setTitle(index, title) catch {};
     }
 
     /// Draw the grid the shell produced: each cell's background, then its
@@ -2009,49 +2130,6 @@ pub const App = struct {
         };
     }
 
-    /// Rows the inspector offers: three kinds of context, then one destination
-    /// per harness. A click toggles the first and pipes through the second,
-    /// which is the whole interaction: select, switch on, pipe.
-    const InspectorRow = union(enum) {
-        context: usize,
-        destination: usize,
-    };
-
-    fn inspectorRowAt(self: *App, y: f32) ?InspectorRow {
-        const bounds = self.geometry.agents;
-        const context_y = bounds.y + 46;
-        const row_height = inspectorRowHeight(self.line_height);
-        for (0..3) |index| {
-            const row_y = context_y + @as(f32, @floatFromInt(index)) * row_height;
-            if (y >= row_y and y < row_y + row_height) return .{ .context = index };
-        }
-        const pipe_y = context_y + 3 * row_height + 20;
-        for (0..self.clients.len) |index| {
-            const row_y = pipe_y + @as(f32, @floatFromInt(index)) * 26;
-            if (y >= row_y and y < row_y + 26) return .{ .destination = index };
-        }
-        return null;
-    }
-
-    fn inspectorClick(self: *App, x: f32, y: f32) !void {
-        _ = x;
-        const row = self.inspectorRowAt(y) orelse return;
-        switch (row) {
-            .context => |index| {
-                self.inspector_context[index] = !self.inspector_context[index];
-                self.status("Context {s}.", .{if (self.inspector_context[index]) "attached" else "removed"});
-            },
-            .destination => |index| try self.pipeTo(index),
-        }
-    }
-
-    /// Whether the inspector will carry one of its context rows. The click path
-    /// and the prompt path both go through this, so a click that did not land
-    /// is visible from outside.
-    pub fn inspectorContext(self: *const App, index: usize) bool {
-        return if (index < self.inspector_context.len and self.inspector_context[index]) true else false;
-    }
-
     /// The drawn row of the first file in the navigator, so a caller outside the
     /// interface can exercise opening one without knowing how the tree is built.
     pub fn explorerFirstFileRow(self: *const App) ?usize {
@@ -2078,17 +2156,79 @@ pub const App = struct {
         return .{ .x = bounds.x + bounds.w - 20, .y = bounds.y + 42 + offset };
     }
 
-    /// The clickable point of a context row, for callers outside the interface
-    /// that need to exercise the inspector without a pointer device.
-    pub fn inspectorRowPoint(self: *const App, index: usize) ?struct { x: f32, y: f32 } {
-        if (index >= self.inspector_context.len) return null;
-        const bounds = self.geometry.agents;
-        if (bounds.w <= 0) return null;
-        const y = bounds.y + 46 + @as(f32, @floatFromInt(index)) * 26;
-        return .{ .x = bounds.x + 60, .y = y + 10 };
+    /// Where a lane's tab is drawn, or null when the strip has no room for it.
+    /// The draw and the click both come through here, so the tab a point lands
+    /// on is the tab that was drawn.
+    fn agentTabRect(self: *const App, index: usize) ?Rect {
+        const strip = self.agentStrip();
+        if (strip.w <= 0 or index >= self.clients.len) return null;
+        const count = self.clients.len;
+        const gap: f32 = 4;
+        // Tabs share the strip, so every lane is reachable in a dock that fits
+        // four of them at their widest. Below the least a name can be read in,
+        // the strip stops rather than drawing stubs.
+        const room = strip.w - 12 - gap - agentPlusWidth - gap;
+        const share = (room - gap * @as(f32, @floatFromInt(count - 1))) / @as(f32, @floatFromInt(count));
+        const width = @min(agent_tab_max, share);
+        if (width < agent_tab_min) return null;
+        const x = strip.x + 6 + @as(f32, @floatFromInt(index)) * (width + gap);
+        if (x + width > strip.x + strip.w - 6 - agentPlusWidth - gap) return null;
+        return .{ .x = x, .y = strip.y + 3, .w = width, .h = strip.h - 6 };
     }
 
-    /// The run the inspector is about, if this session has started any.
+    /// The control at the end of the strip. It sits at the far end rather than
+    /// after the last tab, so a strip full of tabs cannot push it off.
+    fn agentPlusRect(self: *const App) Rect {
+        const strip = self.agentStrip();
+        return .{ .x = strip.x + strip.w - 6 - agentPlusWidth, .y = strip.y + 3, .w = agentPlusWidth, .h = strip.h - 6 };
+    }
+
+    fn agentStrip(self: *const App) Rect {
+        const bounds = self.geometry.agents;
+        return .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = agent_strip_height };
+    }
+
+    /// Which tab, close box, or new-agent control a point in the strip is on.
+    /// Null when the point is in the strip but on none of them.
+    pub fn agentTabAt(self: *const App, x: f32, y: f32) ?AgentTabHit {
+        const strip = self.agentStrip();
+        if (!strip.contains(x, y)) return null;
+        for (0..self.clients.len) |index| {
+            const tab = self.agentTabRect(index) orelse break;
+            if (!tab.contains(x, y)) continue;
+            // The close box is the last of a tab, which is where a reader looks
+            // for it, and it takes the click before the tab does.
+            if (x >= tab.x + tab.w - 18) return .{ .close = index };
+            return .{ .select = index };
+        }
+        if (self.agentPlusRect().contains(x, y)) return .new_tab;
+        return null;
+    }
+
+    pub const AgentTabHit = union(enum) {
+        select: usize,
+        close: usize,
+        new_tab,
+    };
+
+    const agentPlusWidth: f32 = 24;
+
+    /// A point inside a lane's tab, for callers outside the interface that need
+    /// to exercise the strip without a pointer device.
+    pub fn agentTabPoint(self: *const App, index: usize) ?struct { x: f32, y: f32 } {
+        const tab = self.agentTabRect(index) orelse return null;
+        return .{ .x = tab.x + tab.w / 2, .y = tab.y + tab.h / 2 };
+    }
+
+    /// The same for the control that opens a lane.
+    pub fn agentPlusPoint(self: *const App) ?struct { x: f32, y: f32 } {
+        const strip = self.agentStrip();
+        if (strip.w <= 0) return null;
+        const plus = self.agentPlusRect();
+        return .{ .x = plus.x + plus.w / 2, .y = plus.y + plus.h / 2 };
+    }
+
+    /// The run the navigator is about, if this session has started any.
     pub fn activeRun(self: *App) ?*runs.Run {
         if (self.runs.items.len == 0) return null;
         if (self.run_index >= self.runs.items.len) self.run_index = self.runs.items.len - 1;
@@ -2134,6 +2274,12 @@ pub const App = struct {
     /// The state of a harness, for callers that have to wait for it.
     pub fn agentState(self: *const App, index: usize) Client.State {
         return self.clients[index].state;
+    }
+
+    /// What a lane is called, for callers outside the interface.
+    pub fn agentName(self: *const App, index: usize) []const u8 {
+        if (index >= self.clients.len) return "";
+        return self.clients[index].preset.name;
     }
 
     /// How much a harness has said so far.
@@ -2638,84 +2784,43 @@ pub const App = struct {
         self.status("Run {s}: {s} approved.", .{ run.name, step.name });
     }
 
-    /// The signature action: send what the composer holds, with the context
-    /// the inspector shows, to one harness. Choosing the destination is the
-    /// whole gesture; the interface names it before anything is sent.
+    /// The signature action: send what the composer holds to one harness.
+    /// Choosing the destination is the whole gesture - the destination list is
+    /// how one is chosen - and the interface names it before anything is sent.
     pub fn pipeTo(self: *App, index: usize) !void {
         if (index >= self.clients.len) return error.NoSuchAgent;
         self.active = index;
-        self.transcript_scroll = 0;
-        try self.submit(false);
+        self.focus = .prompt;
+        try self.sendTo(index);
     }
 
-    fn drawInspector(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
+    /// The agent dock: which lanes are open, what the chosen one is doing, and
+    /// what it has said.
+    ///
+    /// It used to open with a subject line and a checklist of what a request
+    /// would carry, which was a second way of saying what the selection already
+    /// says: what travels with a request is the selection when there is one,
+    /// and it needs no panel to state it. Where the lanes were listed as
+    /// numbered rows, the strip across the top is the list, and it is the same
+    /// thing a terminal's tabs are: open, switch, close.
+    fn drawAgents(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
         const bounds = self.geometry.agents;
         r.clip = bounds;
         try r.rect(bounds, theme.panel);
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = 1, .h = bounds.h }, theme.border);
-        try r.text(bounds.x + 14, bounds.y + 13, "INSPECTOR", theme.text);
-
-        // What the inspector is about: the buffer the caret is in, and where.
-        // The name comes from the same place the tab strip gets it, because two
-        // names for one buffer is how an inspector ends up saying "no file"
-        // about the file that is on screen.
-        const path = self.workspace.bufferName(self.workspace.activeIndex());
-        var subject: [128]u8 = undefined;
-        const line = self.workspace.activeDocument().lineOf(self.workspace.activeDocument().cursor) + 1;
-        const label = try std.fmt.bufPrint(&subject, "{s} · line {d}", .{ path, line });
-        try r.text(bounds.x + 14, bounds.y + 31, label, theme.accent);
-        if (self.runWaiting()) {
-            try r.text(bounds.x + bounds.w - 108, bounds.y + 31, "1 decision", theme.amber);
-        }
-
-        const rows = [_][]const u8{ "Selection", "Current file", "Terminal output" };
-        const context_y = bounds.y + 46;
-        for (rows, 0..) |name, index| {
-            const y = context_y + @as(f32, @floatFromInt(index)) * inspectorRowHeight(r.atlas.line_height);
-            const on = self.inspector_context[index];
-            try r.text(bounds.x + 12, y + 4, if (on) "[x]" else "[ ]", if (on) theme.accent else theme.muted);
-            try r.text(bounds.x + 56, y + 4, name, if (on) theme.text else theme.muted);
-            // What a row would carry goes under it and wraps: a second column
-            // collides with the first at the narrow end of the dock, which is
-            // where an inspector is most often read.
-            const detail = self.inspectorDetail(index);
-            try wrapped(r, frame, .{
-                .x = bounds.x + 56,
-                .y = y + 4 + r.atlas.line_height,
-                .w = bounds.w - 70,
-                .h = r.atlas.line_height * 2,
-            }, detail, theme.muted);
-        }
-
-        // Wrapped text sets its own clip, so each section starts by taking the
-        // dock's back: a label drawn under the last row's rect is a label that
-        // gets cut in half.
-        r.clip = bounds;
-        const pipe_y = context_y + 3 * inspectorRowHeight(r.atlas.line_height) + 20;
-        try r.text(bounds.x + 14, pipe_y - 18, "PIPE TO", theme.muted);
-        for (self.clients, 0..) |client, index| {
-            const y = pipe_y + @as(f32, @floatFromInt(index)) * 26;
-            const chosen = index == self.active;
-            const up = client.state.up();
-            if (chosen) try r.rect(.{ .x = bounds.x + 6, .y = y - 1, .w = 3, .h = 20 }, theme.accent);
-            var name: [96]u8 = undefined;
-            const named = try std.fmt.bufPrint(&name, "{d}  {s}", .{ index + 1, client.preset.name });
-            try r.text(bounds.x + 14, y + 6, named, if (up) theme.text else theme.muted);
-            try r.text(bounds.x + bounds.w - 78, y + 6, client.state.label(), switch (client.state) {
-                .ready => theme.accent,
-                .busy, .cancelling, .initialize, .new_session => theme.amber,
-                .offline, .failed => theme.muted,
-            });
-        }
+        try self.drawAgentTabs(r);
 
         // The run is evidence, not the navigation: it gets the room that is
-        // left after the context, the destinations, and the composer.
-        const run_y = pipe_y + @as(f32, @floatFromInt(self.clients.len)) * 26 + 26;
+        // left after the strip and the composer.
+        const run_y = bounds.y + agent_strip_height + 14;
         const client = &self.clients[self.active];
         const permission = if (client.permission != null) self.permissionRect() else null;
         const run_bottom = if (permission) |rect| rect.y - 8 else bounds.y + bounds.h - 110;
         r.clip = bounds;
         try r.text(bounds.x + 14, run_y, "RUN", theme.muted);
+        // A run that is holding on a person says so where the run is, rather
+        // than on a heading the strip replaced.
+        if (self.runWaiting()) try r.text(bounds.x + 60, run_y, "1 decision", theme.amber);
         // A run shows its steps first: the question a run answers is which step
         // is holding it, and the transcript is the evidence underneath.
         var steps_height: f32 = 0;
@@ -2777,73 +2882,60 @@ pub const App = struct {
         // every other row in this panel.
         var hint: [128]u8 = undefined;
         const room: usize = @intFromFloat(@max(4, (bounds.w - 28) / r.atlas.advance));
-        try r.text(bounds.x + 14, bounds.y + bounds.h - 27, wrap.elide(&hint, "click to attach · click a name to pipe", room), theme.muted);
+        try r.text(bounds.x + 14, bounds.y + bounds.h - 27, wrap.elide(&hint, "click to type · Ctrl+Shift+Enter picks a destination", room), theme.muted);
     }
 
-    /// A short, honest description of what a context row would carry. The
-    /// numbers are the point: a row that says nothing is a row that sends
-    /// nothing surprising.
-    fn inspectorDetail(self: *App, index: usize) []const u8 {
-        switch (index) {
-            0 => {
-                const range = self.selectedRange() orelse return "nothing selected";
-                const document = self.workspace.activeDocument();
-                const first = document.lineOf(range.start) + 1;
-                const last = document.lineOf(range.end) + 1;
-                return std.fmt.bufPrint(&self.inspector_scratch[0], "{s} · lines {d}-{d}", .{
-                    self.workspace.bufferName(self.workspace.activeIndex()), first, last,
-                }) catch "selection";
-            },
-            1 => {
-                const lines = self.workspace.activeDocument().lineCount();
-                return std.fmt.bufPrint(&self.inspector_scratch[1], "{d} lines", .{lines}) catch "file";
-            },
-            else => {
-                const terminal = self.activeTerminal() orelse return "no terminal";
-                _ = terminal;
-                return "last command";
-            },
+    /// The strip along the top of the dock: a tab per lane, the one showing
+    /// marked, and the control that opens another. It is the terminal's strip
+    /// with lanes in it instead of shells, and it is read the same way: a name,
+    /// a mark, and a box to close it with.
+    fn drawAgentTabs(self: *App, r: *Renderer) !void {
+        const strip = self.agentStrip();
+        r.clip = strip;
+        try r.rect(strip, theme.background);
+        try r.rect(.{ .x = strip.x, .y = strip.y + strip.h - 1, .w = strip.w, .h = 1 }, theme.border);
+        var scratch: [128]u8 = undefined;
+        for (0..self.clients.len) |index| {
+            const tab = self.agentTabRect(index) orelse break;
+            const client = self.clients[index];
+            const active = index == self.active;
+            if (active) try r.rect(tab, theme.raised);
+            // A lane that is not up reads as not open: a hollow mark and a muted
+            // name, so a tab that is dead is visible without being loud.
+            const up = client.state.up();
+            try r.text(tab.x + 6, tab.y + 4, if (up) "●" else "○", if (up) theme.accent else theme.muted);
+            const room: usize = @intFromFloat(@max(2, (tab.w - 34) / r.atlas.advance));
+            // A name longer than the scratch is drawn as it is: the tab's own
+            // clip is what cuts it.
+            const label = if (client.preset.name.len + 3 > scratch.len) client.preset.name else wrap.elide(&scratch, client.preset.name, room);
+            try r.text(tab.x + 18, tab.y + 4, label, if (active) theme.accent else if (up) theme.text else theme.muted);
+            try r.text(tab.x + tab.w - 14, tab.y + 4, "×", if (active) theme.text else theme.muted);
         }
+        const plus = self.agentPlusRect();
+        try r.text(plus.x + 6, plus.y + 4, "+", theme.accent);
     }
 
     fn drawOverlay(self: *App, r: *Renderer) !void {
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
         try r.rect(r.clip, .{ 0, 0, 0, 0.65 });
-        const box: Rect = .{ .x = @max(20, (r.width - 720) / 2), .y = 96, .w = @min(720, r.width - 40), .h = if (self.overlay == .quit) 176 else 368 };
-        try r.rect(box, theme.raised);
-        r.clip = box.inset(14);
         if (self.overlay == .quit) {
+            // Quitting is a question with three answers rather than a list of
+            // rows, so it is drawn here rather than by the list widget.
+            const box: Rect = .{ .x = @max(20, (r.width - 720) / 2), .y = 96, .w = @min(720, r.width - 40), .h = 176 };
+            try r.rect(box, theme.raised);
+            r.clip = box.inset(14);
             try r.text(box.x + 20, box.y + 20, "Unsaved changes", theme.amber);
             try r.text(box.x + 20, box.y + 62, "S  Save and quit", theme.text);
             try r.text(box.x + 20, box.y + 90, "D  Discard and quit", theme.red);
             try r.text(box.x + 20, box.y + 118, "Esc  Return to the editor", theme.muted);
             return;
         }
-        try r.text(box.x + 20, box.y + 16, if (self.overlay == .commands) "COMMANDS" else "QUICK OPEN", theme.accent);
-        try r.text(box.x + 20, box.y + 46, if (self.query.items.len == 0) "Type to filter..." else self.query.items, theme.text);
-        const start = self.query_selected -| 8;
-        var index: usize = 0;
-        if (self.overlay == .commands) {
-            for (commands) |command| {
-                if (!self.match(command)) continue;
-                try self.overlayRow(r, box, command, index, start);
-                index += 1;
-            }
-        } else {
-            for (self.workspace.explorer.entries.items) |path| {
-                if (!self.match(path)) continue;
-                const relative = if (path.len > self.workspace.root.len + 1) path[self.workspace.root.len + 1 ..] else path;
-                try self.overlayRow(r, box, relative, index, start);
-                index += 1;
-            }
-        }
-    }
-
-    fn overlayRow(self: *App, r: *Renderer, box: Rect, label: []const u8, index: usize, start: usize) !void {
-        if (index < start or index > start + 8) return;
-        const y = box.y + 88 + @as(f32, @floatFromInt(index - start)) * 28;
-        if (index == self.query_selected) try r.rect(.{ .x = box.x + 12, .y = y - 3, .w = box.w - 24, .h = 28 }, theme.selected);
-        try r.text(box.x + 20, y, label, theme.text);
+        const screen: Rect = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
+        // The control a click landed on decides where the box goes: under it for
+        // a dropdown, centred for a jump list opened by a key.
+        const placement: menu_widget.Placement = if (self.overlay_trigger) |trigger| .{ .anchored = trigger } else .centered;
+        try self.menu.draw(r, placement, screen, .{ .line_height = r.atlas.line_height, .advance = r.atlas.advance });
+        r.clip = screen;
     }
 };
 

@@ -30,7 +30,9 @@ seggs.ui.panel("transcript", () => ({
     hint("start", "F5 starts this agent."),
     hint("focus", "Ctrl+L focuses the prompt."),
     hint("send", "Ctrl+Enter sends to this agent."),
-    hint("broadcast", "Ctrl+Shift+Enter sends to ready agents."),
+    hint("destination", "Ctrl+Shift+Enter picks a destination."),
+    hint("open", "Ctrl+Shift+A opens an agent."),
+    hint("close", "Ctrl+W closes what has focus."),
     hint("blank-2", " "),
     {
       type: "row",

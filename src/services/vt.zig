@@ -178,6 +178,20 @@ pub const Terminal = struct {
         return value;
     }
 
+    /// The title the program inside the terminal asked for, by writing OSC 0
+    /// or OSC 2 - which is how a shell says what it is running and how an
+    /// editor says which file. Borrowed, and valid until the next write.
+    ///
+    /// Empty means the program has not set one. That is the common case, and
+    /// it is not a title of no characters: a caller showing this in a tab
+    /// keeps its own name rather than replacing it with nothing.
+    pub fn title(self: *Terminal) []const u8 {
+        var value: g.GhosttyString = .{};
+        _ = g.ghostty_terminal_get(self.handle, g.GHOSTTY_TERMINAL_DATA_TITLE, @ptrCast(&value));
+        if (value.ptr == null or value.len == 0) return "";
+        return value.ptr[0..value.len];
+    }
+
     /// Walk the visible rows and their cells. The visitor sees one row at a
     /// time; the cell slice is only valid during the call.
     pub fn visitRows(self: *Terminal, context: anytype, comptime visit: fn (@TypeOf(context), u16, []const Cell) anyerror!void) !void {
@@ -623,6 +637,22 @@ test "a terminal echoes what it is fed" {
     try terminal.visitRows(&collector, Collector.visit);
     try std.testing.expect(std.mem.startsWith(u8, collector.text.items, "hello"));
     try std.testing.expect(std.mem.indexOf(u8, collector.text.items, "world") != null);
+}
+
+test "the title a program sets is the one the terminal reports" {
+    var terminal = try Terminal.init(std.testing.allocator, 20, 4);
+    defer terminal.deinit();
+    // A terminal nothing has written to has no title: a tab shows the name it
+    // was opened with until the program says otherwise, and this is what says
+    // the program has not.
+    try std.testing.expectEqualStrings("", terminal.title());
+    // OSC 0 sets both the icon name and the title, which is what a shell
+    // prompt function and an editor both write.
+    terminal.write("\x1b]0;nvim main.zig\x07");
+    try std.testing.expectEqualStrings("nvim main.zig", terminal.title());
+    // OSC 2 is the title alone, and it replaces what was there.
+    terminal.write("\x1b]2;zsh\x07");
+    try std.testing.expectEqualStrings("zsh", terminal.title());
 }
 
 test "input is encoded the way the program asked for it" {

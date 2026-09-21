@@ -15,6 +15,7 @@ const process = @import("services/process.zig");
 const ghostty = @import("ghostty");
 const theme = @import("ui/theme.zig");
 const runs = @import("editor/runs.zig");
+const review = @import("editor/review.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
@@ -35,8 +36,13 @@ const Rect = layout.Rect;
 
 pub const App = struct {
     const Focus = enum { editor, prompt, panels, terminal };
+
+    /// What the centre of the window is about. A perspective is a view of the
+    /// same workspace and run, not a separate application: switching keeps the
+    /// open file and the selected run.
+    const Perspective = enum { code, review };
     const Overlay = enum { none, files, commands, quit };
-    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review" };
+    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes" };
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
     workspace: Workspace,
@@ -65,6 +71,15 @@ pub const App = struct {
     /// file it came from, and what the terminal last printed. Nothing travels
     /// that the developer did not switch on.
     inspector_context: [3]bool = .{ true, false, false },
+
+    /// What the review surface is about: changes proposed by an extension, by
+    /// a language server, or by the person, none of which are applied until
+    /// somebody accepts them.
+    review: review.ReviewQueue,
+
+    /// Which surface the centre shows, and which change is selected in it.
+    perspective: Perspective = .code,
+    review_selected: usize = 0,
 
     /// Scratch for the inspector's own labels, so drawing does not allocate.
     inspector_scratch: [3][64]u8 = undefined,
@@ -124,7 +139,7 @@ pub const App = struct {
         errdefer a.free(clients);
         for (config.agents, clients) |preset, *client| client.* = Client.init(a, preset, root);
         const cached = try workspace.activeDocument().snapshot(a);
-        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a) };
+        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a) };
         self.status("F5 starts the selected agent. Ctrl+P opens files.", .{});
         return self;
     }
@@ -144,6 +159,7 @@ pub const App = struct {
         self.prompt_text.deinit(self.allocator);
         self.preedit.deinit(self.allocator);
         if (self.run) |*run| run.deinit();
+        self.review.deinit();
         self.panel_tree.deinit();
         self.panel_rects.deinit(self.allocator);
         for (self.panel_nodes.items) |node| self.allocator.free(node.id);
@@ -421,6 +437,8 @@ pub const App = struct {
                 if (self.overlay == .files or self.overlay == .commands) {
                     if (self.query.items.len + bytes.len <= 256) try self.query.appendSlice(self.allocator, bytes);
                     self.query_selected = 0;
+                } else if (self.perspective == .review) {
+                    // The review surface takes keys, not text.
                 } else if (self.focus == .terminal) {
                     try self.terminalText(bytes);
                 } else if (self.overlay == .none) try self.insert(bytes);
@@ -492,6 +510,19 @@ pub const App = struct {
         }
         if (alt and (keycode == c.SDLK_Y or keycode == c.SDLK_N)) {
             try self.clients[self.active].answerPermission(keycode == c.SDLK_Y);
+            return;
+        }
+        // The review perspective owns the plain keys while it is open: it
+        // is what is on screen, and nothing is being typed into the editor.
+        if (self.perspective == .review and !ctrl and !alt) {
+            switch (keycode) {
+                c.SDLK_UP => self.review_selected -|= 1,
+                c.SDLK_DOWN => self.selectNextReview(),
+                c.SDLK_A => try self.acceptReview(),
+                c.SDLK_R => self.rejectReview(),
+                c.SDLK_ESCAPE => self.perspective = .code,
+                else => {},
+            }
             return;
         }
         if (ctrl) {
@@ -1084,6 +1115,7 @@ pub const App = struct {
                         5 => try self.workspace.save(),
                         6 => try self.clients[self.active].cancel(),
                         7 => try self.startRun(),
+                        8 => self.perspective = if (self.perspective == .review) .code else .review,
                         else => unreachable,
                     }
                     return;
@@ -1127,7 +1159,11 @@ pub const App = struct {
         try r.text(@max(400, r.width - 174), 11, "SDL3 GPU / ACP", theme.accent);
         _ = try self.drawPanel(r, "activity", g.activity);
         if (g.explorer.w > 0) _ = try self.drawPanel(r, "explorer", g.explorer);
-        try self.drawEditor(r);
+        if (self.perspective == .review) {
+            try self.drawReview(r, frame);
+        } else {
+            try self.drawEditor(r);
+        }
         if (self.terminal_open) try self.drawTerminal(r);
         try self.drawInspector(r, frame);
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
@@ -1739,6 +1775,91 @@ pub const App = struct {
     }
 
     /// Whether the run is waiting for a person to decide something.
+    /// Why a change cannot be applied as it stands, or null when it can.
+    /// A review that hides a stale change is worse than one that shows none:
+    /// the developer is being asked to accept something that would not land.
+    pub fn reviewObstacle(self: *App, index: usize) ?[]const u8 {
+        const queue = &self.review;
+        if (index >= queue.count()) return "no such change";
+        const edit = queue.editAt(index);
+        const current = self.workspace.bufferMatches(edit.path, edit.expected_revision) orelse return "the file is not open";
+        if (!current) return "the file changed since this was proposed";
+        return null;
+    }
+
+    /// Move the review selection down one change, stopping at the last: the
+    /// list is what is waiting, and there is nothing past it.
+    fn selectNextReview(self: *App) void {
+        const count = self.review.count();
+        if (count > 0 and self.review_selected + 1 < count) self.review_selected += 1;
+    }
+
+    /// The review surface: what is waiting to be accepted, and what stands in
+    /// the way of accepting it. A change that cannot land is shown as such
+    /// rather than hidden, because the developer is being asked about it.
+    fn drawReview(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
+        _ = frame;
+        const bounds = self.geometry.editor;
+        r.clip = bounds;
+        try r.rect(bounds, theme.background);
+        const queue = &self.review;
+        var header: [160]u8 = undefined;
+        const link = if (self.run) |run| run.name else "no run";
+        const title = try std.fmt.bufPrint(&header, "REVIEW · {d} change(s) · {s}", .{ queue.count(), link });
+        try r.text(bounds.x + 24, bounds.y + 20, title, theme.text);
+        try r.text(bounds.x + 24, bounds.y + 44, "Up/Down choose · A accept · R reject · Esc back to the code", theme.muted);
+        if (queue.count() == 0) {
+            try r.text(bounds.x + 24, bounds.y + 84, "Nothing is waiting for you.", theme.muted);
+            return;
+        }
+        if (self.review_selected >= queue.count()) self.review_selected = queue.count() - 1;
+        var y = bounds.y + 84;
+        for (0..queue.count()) |index| {
+            if (y + 52 > bounds.y + bounds.h) break;
+            const edit = queue.editAt(index);
+            const selected = index == self.review_selected;
+            if (selected) try r.rect(.{ .x = bounds.x + 8, .y = y - 4, .w = bounds.w - 16, .h = 48 }, theme.raised);
+            try r.text(bounds.x + 24, y, edit.path, if (selected) theme.accent else theme.text);
+            var range: [48]u8 = undefined;
+            const where = try std.fmt.bufPrint(&range, "{d}..{d}", .{ edit.start_byte, edit.end_byte });
+            try r.text(bounds.x + bounds.w - 160, y, where, theme.muted);
+            // The first line of the replacement is what the developer is
+            // judging, and what is standing in the way of accepting it.
+            var line: usize = 0;
+            while (line < edit.replacement.len and edit.replacement[line] != '\n') : (line += 1) {}
+            try r.text(bounds.x + 44, y + 22, edit.replacement[0..line], theme.text);
+            const obstacle = self.reviewObstacle(index);
+            try r.text(bounds.x + bounds.w - 320, y + 22, obstacle orelse "ready to apply", if (obstacle != null) theme.amber else theme.accent);
+            y += 56;
+        }
+    }
+
+    /// Accept the selected change, or say why it could not be accepted.
+    pub fn acceptReview(self: *App) !void {
+        const queue = &self.review;
+        if (queue.count() == 0) return error.NothingToReview;
+        if (self.review_selected >= queue.count()) self.review_selected = queue.count() - 1;
+        const outcome = try self.workspace.applyReview(queue, self.review_selected);
+        switch (outcome) {
+            .applied => {
+                if (self.review_selected >= queue.count() and self.review_selected > 0) self.review_selected -= 1;
+                self.status("Review: change applied.", .{});
+            },
+            .conflict => self.status("Review: the file changed since this was proposed.", .{}),
+            .invalid => self.status("Review: that change does not fit the file.", .{}),
+        }
+    }
+
+    /// Reject the selected change.
+    pub fn rejectReview(self: *App) void {
+        const queue = &self.review;
+        if (queue.count() == 0) return;
+        if (self.review_selected >= queue.count()) self.review_selected = queue.count() - 1;
+        queue.discard(self.review_selected);
+        if (self.review_selected >= queue.count() and self.review_selected > 0) self.review_selected -= 1;
+        self.status("Review: change rejected.", .{});
+    }
+
     pub fn runWaiting(self: *const App) bool {
         const run = if (self.run) |value| &value else return false;
         return run.state == .waiting_for_approval;

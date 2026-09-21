@@ -204,7 +204,7 @@ fn run(init: std.process.Init) !void {
         if (exercise_ime) exerciseIme(&app, frames);
         if (exercise_click) exerciseClick(&app, frames);
         if (exercise_terminal) exerciseTerminal(&app, frames, frame_arena.allocator());
-        if (exercise_run) exerciseRun(&app, frames);
+        if (exercise_run) exerciseRun(&app, frames, frame_arena.allocator());
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -275,116 +275,13 @@ var terminal_answered = false;
 var run_reported = false;
 var fixture_step_sent = false;
 var approval_sent = false;
+var review_proposed = false;
+var review_reported = false;
+var review_held: usize = 0;
 
-/// A run starts from what is on screen, and its steps are the report: this
-/// exercise starts one and says what the inspector would show.
-fn exerciseRun(app: *App, frame: usize) void {
-    switch (frame) {
-        6 => {
-            app.startRun() catch |err| std.log.err("run: {s}", .{@errorName(err)});
-            // And a run whose step a harness can actually answer, so the
-            // round trip is exercised rather than described.
-            const mock = app.agentIndex("Local mock") orelse {
-                std.log.err("run: no local mock profile", .{});
-                return;
-            };
-            app.active = mock;
-            app.startAgent() catch |err| std.log.err("run: mock {s}", .{@errorName(err)});
-        },
-        8 => {
-            // The starter workflow is described before the fixture replaces it,
-            // so both the shape of a workflow and the round trip are reported.
-            if (app.run) |*starter| {
-                const current = starter.current();
-                std.log.info("run {s}: {d} steps, {d} artifacts, current={s}", .{
-                    starter.name,
-                    starter.steps.len,
-                    starter.artifacts.items.len,
-                    if (current) |step| step.name else "none",
-                });
-            }
-        },
-
-        else => {},
-    }
-    // The harness has to be up before a step can be sent to it, and its answer
-    // arrives when it arrives: both are polled for rather than assumed, so this
-    // does not depend on how fast a machine starts a process.
-    // The run is driven one step at a time, and each step is sent when the one
-    // before it is no longer running: a pipeline that fired everything at once
-    // would not be a pipeline.
-    if (fixture_step_sent and !run_reported) {
-        if (app.run) |*active| {
-            if (active.current()) |step| {
-                if (step.state == .waiting) {
-                    app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
-                }
-            }
-        }
-        // The person in the fixture presses the key a person would press,
-        // rather than calling the approval directly: the binding is part of
-        // what has to work.
-        if (app.runWaiting() and !approval_sent) {
-            approval_sent = true;
-            var ev = std.mem.zeroes(c.SDL_Event);
-            ev.type = c.SDL_EVENT_KEY_DOWN;
-            ev.key.key = c.SDLK_A;
-            ev.key.mod = c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT;
-            if (!c.SDL_PushEvent(&ev)) std.log.err("run: approval key not delivered", .{});
-        }
-    }
-    if (!fixture_step_sent and frame >= 10) {
-        if (app.agentReady(app.active)) {
-            if (app.run) |*existing| existing.deinit();
-            const steps = [_]runs.Step{
-                .{ .name = "ask", .produces = .plan, .action = .{ .agent = .{ .harness = app.active, .request = "Say hello" } } },
-                .{ .name = "git --version", .produces = .checks, .action = .{ .command = &.{ "git", "--version" } } },
-                // A person decides before anything downstream runs: the gate is
-                // what separates a workflow's progress from its acceptance.
-                .{ .name = "approve", .produces = .review, .action = .approval },
-            };
-            app.run = runs.Run.init(app.allocator, "fixture", &steps) catch |err| {
-                std.log.err("run: fixture {s}", .{@errorName(err)});
-                return;
-            };
-            fixture_step_sent = true;
-            app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
-        } else if (frame > 200) {
-            std.log.err("run: no harness was ready to take a step", .{});
-            return;
-        }
-    }
-    if (frame < 40 or frame > 240 or run_reported) return;
-    const active = if (app.run) |*value| value else return;
-    // The fixture has one step and starts from nothing, so a single artifact is
-    // the answer: the record that a step ran and a harness replied.
-    // Every step has to have produced something: an agent's answer, a command's
-    // output with its exit status, and a person's decision.
-    if (active.artifacts.items.len < 3) {
-        if (frame == 240) {
-            std.log.err("run {s}: {d} steps, no answer recorded", .{ active.name, active.steps.len });
-        }
-        return;
-    }
-    run_reported = true;
-    const answer = active.artifacts.items[active.artifacts.items.len - 1];
-    // The answer's size is the evidence that a harness said something: a step
-    // that recorded an empty artifact did not run.
-    var start: usize = 0;
-    while (start < answer.body.len and (answer.body[start] == '\n' or answer.body[start] == '\r')) : (start += 1) {}
-    var line: usize = start;
-    while (line < answer.body.len and answer.body[line] != '\n' and answer.body[line] != '\r') : (line += 1) {}
-    std.log.info("run {s}: {d} steps, {d} artifacts, {s} from {s}, {d} bytes: {s}", .{
-        active.name,
-        active.steps.len,
-        active.artifacts.items.len,
-        answer.kind.label(),
-        answer.source,
-        answer.body.len,
-        answer.body[start..line],
-    });
-}
-
+/// A shell answers when it answers, so the screen is polled from the frame the
+/// command is typed until the answer is there: a fixed frame would make this
+/// pass or fail on how fast the machine running it is.
 fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
     switch (frame) {
         6 => app.toggleTerminal() catch {},
@@ -416,6 +313,144 @@ fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
         std.log.info("PASS: the shell answered on the terminal screen", .{});
     } else if (frame >= terminal_last_read) {
         std.log.err("terminal screen never answered: answered={} printed={}", .{ answered, printed });
+    }
+}
+
+/// A run starts from what is on screen, and its steps are the report: this
+/// exercise starts one and says what the inspector would show.
+fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
+    switch (frame) {
+        6 => {
+            app.startRun() catch |err| std.log.err("run: {s}", .{@errorName(err)});
+            // And a run whose step a harness can actually answer, so the
+            // round trip is exercised rather than described.
+            const mock = app.agentIndex("Local mock") orelse {
+                std.log.err("run: no local mock profile", .{});
+                return;
+            };
+            app.active = mock;
+            app.startAgent() catch |err| std.log.err("run: mock {s}", .{@errorName(err)});
+        },
+        8 => {
+            // The starter workflow is described before the fixture replaces it,
+            // so both the shape of a workflow and the round trip are reported.
+            if (app.run) |*starter| {
+                const current = starter.current();
+                std.log.info("run {s}: {d} steps, {d} artifacts, current={s}", .{
+                    starter.name,
+                    starter.steps.len,
+                    starter.artifacts.items.len,
+                    if (current) |step| step.name else "none",
+                });
+            }
+        },
+
+        else => {},
+    }
+    // A change is proposed while the run is still working: a review that only
+    // exists after everything finishes is not one anybody reads.
+    if (!review_proposed and frame >= 9) {
+        review_proposed = true;
+        const document = app.workspace.activeDocument();
+        app.review.propose(.{
+            .path = app.workspace.activePath() orelse "",
+            .expected_revision = document.revision,
+            .start_byte = 0,
+            .end_byte = 0,
+            .replacement = "// accepted through the review surface\n",
+        }) catch |err| std.log.err("review: {s}", .{@errorName(err)});
+        app.perspective = .review;
+    }
+
+    // The harness has to be up before a step can be sent to it, and its answer
+    // arrives when it arrives: both are polled for rather than assumed, so this
+    // does not depend on how fast a machine starts a process.
+    if (!fixture_step_sent and frame >= 10) {
+        if (app.agentReady(app.active)) {
+            if (app.run) |*existing| existing.deinit();
+            const steps = [_]runs.Step{
+                .{ .name = "ask", .produces = .plan, .action = .{ .agent = .{ .harness = app.active, .request = "Say hello" } } },
+                .{ .name = "git --version", .produces = .checks, .action = .{ .command = &.{ "git", "--version" } } },
+                // A person decides before anything downstream runs: the gate is
+                // what separates a workflow's progress from its acceptance.
+                .{ .name = "approve", .produces = .review, .action = .approval },
+            };
+            app.run = runs.Run.init(app.allocator, "fixture", &steps) catch |err| {
+                std.log.err("run: fixture {s}", .{@errorName(err)});
+                return;
+            };
+            fixture_step_sent = true;
+            app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
+        } else if (frame > 200) {
+            std.log.err("run: no harness was ready to take a step", .{});
+            return;
+        }
+    }
+
+    // The run is driven one step at a time, and each step is sent when the one
+    // before it is no longer running: a pipeline that fired everything at once
+    // would not be a pipeline.
+    if (fixture_step_sent and !run_reported) {
+        if (app.run) |*active| {
+            if (active.current()) |step| {
+                if (step.state == .waiting) {
+                    app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
+                }
+            }
+        }
+        // The person in the fixture presses the key a person would press,
+        // rather than calling the approval directly: the binding is part of
+        // what has to work.
+        if (app.runWaiting() and !approval_sent) {
+            approval_sent = true;
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_KEY_DOWN;
+            ev.key.key = c.SDLK_A;
+            ev.key.mod = c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT;
+            if (!c.SDL_PushEvent(&ev)) std.log.err("run: approval key not delivered", .{});
+        }
+    }
+
+    // Every step has to have produced something: an agent's answer, a command's
+    // output with its exit status, and a person's decision.
+    if (fixture_step_sent and !run_reported) {
+        const active = app.run orelse return;
+        if (active.artifacts.items.len < 3) {
+            if (frame > 400) std.log.err("run {s}: {d} steps, no answer recorded", .{ active.name, active.steps.len });
+            return;
+        }
+        run_reported = true;
+        const answer = active.artifacts.items[active.artifacts.items.len - 1];
+        var start: usize = 0;
+        while (start < answer.body.len and (answer.body[start] == '\n' or answer.body[start] == '\r')) : (start += 1) {}
+        var line: usize = start;
+        while (line < answer.body.len and answer.body[line] != '\n' and answer.body[line] != '\r') : (line += 1) {}
+        std.log.info("run {s}: {d} steps, {d} artifacts, {s} from {s}, {d} bytes: {s}", .{
+            active.name,
+            active.steps.len,
+            active.artifacts.items.len,
+            answer.kind.label(),
+            answer.source,
+            answer.body.len,
+            answer.body[start..line],
+        });
+        return;
+    }
+
+    // The review is answered once the run it belongs to has reported: a change
+    // is read while the work goes on and accepted when it is done.
+    if (review_proposed and !review_reported) {
+        if (app.review.count() > 0) {
+            review_held += 1;
+            if (review_held < 150) return;
+            app.acceptReview() catch |err| std.log.err("review: {s}", .{@errorName(err)});
+            return;
+        }
+        review_reported = true;
+        const bytes = app.workspace.activeDocument().snapshot(a) catch return;
+        defer a.free(bytes);
+        const landed = std.mem.startsWith(u8, bytes, "// accepted through the review surface");
+        std.log.info("review: {d} change(s) waiting, accepted={}", .{ app.review.count(), landed });
     }
 }
 

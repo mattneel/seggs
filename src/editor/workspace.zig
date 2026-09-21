@@ -187,6 +187,14 @@ pub const Workspace = struct {
         return null;
     }
 
+    /// Whether the buffer named by `path` is open and still at `revision`.
+    /// Null means the file is not open, which is a different answer from a
+    /// buffer that has moved on.
+    pub fn bufferMatches(self: *const Workspace, path: []const u8, revision: u64) ?bool {
+        const index = self.findBuffer(path) orelse return null;
+        return self.buffers.items[index].document.revision == revision;
+    }
+
     /// Apply a queued edit to the buffer named by the edit's path.
     pub fn applyReview(self: *Workspace, queue: *review.ReviewQueue, index: usize) !review.Outcome {
         const edit = queue.editAt(index);

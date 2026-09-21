@@ -66,6 +66,15 @@ pub const ReviewQueue = struct {
     }
 
     /// The removed and inserted text for a queued edit. The caller owns both.
+    /// Drop a proposed change. Rejecting is a decision like accepting: the
+    /// queue is what a person is being asked about, and answering is either.
+    pub fn discard(self: *ReviewQueue, index: usize) void {
+        if (index >= self.edits.items.len) return;
+        // The queue owns the strings it was given, so dropping an edit drops
+        // them with it.
+        self.freeEdit(self.edits.orderedRemove(index));
+    }
+
     pub fn preview(self: *const ReviewQueue, index: usize, document: *const Document, a: Allocator) !Preview {
         const edit = self.edits.items[index];
         const bytes = try document.snapshot(a);

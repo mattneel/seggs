@@ -39,6 +39,7 @@ METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
+REVIEW_LINE = re.compile(r"review: (\d+) change\(s\) waiting, accepted=(true|false)")
 ANSWER_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, (\S+) from (.+?), (\d+) bytes")
 
 INSPECTOR_LINE = re.compile(r"inspector: selection=false")
@@ -662,11 +663,18 @@ def check_run(binary: str) -> None:
     step to a harness that is really running and records what comes back, so
     the check covers both the shape of a workflow and the round trip.
     """
-    command = display_command([binary, "--windowed", "--frames", "260", "--exercise-run"], app_env())
+    # A change has to be accepted into a real file, so the fixture opens a
+    # throwaway one: a gate that edited the repository would be a gate nobody
+    # could run twice.
+    workdir = Path(tempfile.mkdtemp(prefix="seggs-review-"))
+    target = workdir / "reviewed.zig"
+    target.write_text("const std = @import(\"std\");\n", encoding="utf-8")
+    command = display_command([binary, "--windowed", "--frames", "420", "--file", str(target), "--exercise-run"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     output = app_output(result)
     started = RUN_LINE.search(output)
     answered = ANSWER_LINE.search(output)
+    reviewed = REVIEW_LINE.search(output)
     if started is None or answered is None:
         print("run output:")
         for line in output.splitlines()[-10:]:
@@ -676,6 +684,8 @@ def check_run(binary: str) -> None:
     require(int(started.group(3)) >= 1, "the run started without the artifact it is supposed to carry")
     require(started.group(4) == "plan", f"the run's current step is {started.group(4)}, expected the first one")
     require(answered is not None, "a step was sent and nothing was recorded")
+    require(reviewed is not None, "a change was proposed and the review surface never reported it")
+    require(reviewed.group(2) == "true", "a change was accepted and the file did not change")
     require(int(answered.group(2)) == 3, f"the run recorded {answered.group(2)} steps, expected the three it has")
     require(int(answered.group(3)) == 3, f"the run holds {answered.group(3)} artifact(s), expected one per step")
     # The last step is a person's decision, and it is recorded like any other
@@ -685,7 +695,8 @@ def check_run(binary: str) -> None:
     require(int(answered.group(6)) > 0, "the recorded artifact is empty: a step that says nothing did not run")
     print(
         f"run: {started.group(1)} started with {started.group(2)} steps and {started.group(3)} artifact(s) at {started.group(4)}, "
-        f"then a harness answered and {answered.group(5)} recorded {answered.group(6)} bytes of {answered.group(4)}"
+        f"then a harness answered and {answered.group(5)} recorded {answered.group(6)} bytes of {answered.group(4)}, "
+        f"and a proposed change was accepted with {reviewed.group(1)} left waiting"
     )
 
 

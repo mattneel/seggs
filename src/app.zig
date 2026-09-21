@@ -1816,6 +1816,13 @@ pub const App = struct {
     /// the native format carries a terminal palette instead of leaving it at
     /// the emulator's default.
     pub fn applyTerminalPalette(self: *App) void {
+        // Nothing is pushed when no theme was loaded. The emulator's own
+        // default palette is a real one; ours is a placeholder whose sixteen
+        // ANSI entries are all the background colour, so sending it to a live
+        // terminal paints every coloured thing in a shell - the prompt, ls, a
+        // git status - in the colour of the paper. A placeholder is fine as a
+        // document's default and wrong as something to hand to a program.
+        if (self.theme_doc == null) return;
         const palette = terminalPalette(theme.current);
         var index: usize = 0;
         while (self.shells.sessionAt(index)) |session| : (index += 1) {

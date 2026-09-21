@@ -9,6 +9,10 @@ test {
     // naming them here is what puts their tests in the suite.
     _ = @import("services/theme_tm.zig");
     _ = @import("services/theme_vscode.zig");
+    // The transcript's two parsers: a Markdown block list and a unified diff,
+    // read by the drawing path rather than by each other.
+    _ = @import("ui/markdown.zig");
+    _ = @import("ui/diff.zig");
     _ = @import("editor/review.zig");
     _ = @import("editor/prompt.zig");
     _ = @import("editor/runs.zig");

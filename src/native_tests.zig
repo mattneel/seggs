@@ -26,10 +26,12 @@ test {
     std.testing.refAllDecls(ext_ui);
     _ = process;
     _ = shell_integration;
+    _ = terminals;
 }
 
 const process = @import("services/process.zig");
 const shell_integration = @import("services/shell.zig");
+const terminals = @import("services/terminals.zig");
 
 const Allocator = std.mem.Allocator;
 

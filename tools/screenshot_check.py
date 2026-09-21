@@ -39,6 +39,8 @@ METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
+TABS_LINE = re.compile(r"tabs: (\d+) open, showing (\d+) of (\d+)")
+
 COMPOSE_LINE = re.compile(r"compose (\S+): (\d+) steps, (.+)")
 
 COMMAND_LINE = re.compile(r"terminal: (the shell marked its command: (.+)|this shell reports no command boundaries)")
@@ -718,6 +720,24 @@ def check_run(binary: str) -> None:
     )
 
 
+def check_tabs(binary: str) -> None:
+    """The terminal's tabs: adding, moving, and closing all agree on which is
+    showing. The fixture does each in turn and reports where it ended up, which
+    is the arithmetic a tab strip gets wrong."""
+    command = display_command([binary, "--windowed", "--frames", "40", "--exercise-tabs"], app_env())
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+    tabs = TABS_LINE.search(output)
+    if tabs is None:
+        for line in output.splitlines()[-8:]:
+            print(f"  {line}")
+    require(tabs is not None, "the terminal tab fixture reported nothing")
+    # Three opened, one closed, so two remain, and the reader is on the first.
+    require(int(tabs.group(1)) == 2, f"{tabs.group(1)} tabs remained, expected the two that were not closed")
+    require(int(tabs.group(2)) == 1, f"the reader ended on tab {tabs.group(2)}, expected the first")
+    print(f"tabs: {tabs.group(1)} open after adding three and closing one, showing {tabs.group(2)}")
+
+
 def check_compose(binary: str) -> None:
     """A workflow reads left to right, and says what travels along it.
 
@@ -787,6 +807,7 @@ def main() -> int:
         check_terminal(binary)
         check_run(binary)
         check_compose(binary)
+        check_tabs(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1

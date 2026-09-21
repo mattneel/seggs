@@ -41,6 +41,7 @@ fn run(init: std.process.Init) !void {
     var exercise_terminal = false;
     var exercise_run = false;
     var exercise_compose = false;
+    var exercise_tabs = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -70,6 +71,8 @@ fn run(init: std.process.Init) !void {
             exercise_run = true;
         } else if (std.mem.eql(u8, arg, "--exercise-compose")) {
             exercise_compose = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-tabs")) {
+            exercise_tabs = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -209,6 +212,7 @@ fn run(init: std.process.Init) !void {
         if (exercise_terminal) exerciseTerminal(&app, frames, frame_arena.allocator());
         if (exercise_run) exerciseRun(&app, frames, frame_arena.allocator());
         if (exercise_compose) exerciseCompose(&app, frames);
+        if (exercise_tabs) exerciseTabs(&app, frames);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -479,6 +483,26 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
         defer a.free(bytes);
         const landed = std.mem.startsWith(u8, bytes, "// accepted through the review surface");
         std.log.info("review: {d} change(s) waiting, accepted={}", .{ app.review.count(), landed });
+    }
+}
+
+/// The terminal's tabs: a strip a reader can add to, move around, and close.
+fn exerciseTabs(app: *App, frame: usize) void {
+    switch (frame) {
+        4 => app.toggleTerminal() catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
+        8 => app.newTerminalTab() catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
+        12 => app.newTerminalTab() catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
+        16 => app.moveTerminalTab(false),
+        20 => app.closeTerminalTab(),
+        24 => app.shells.select(0),
+        28 => {
+            std.log.info("tabs: {d} open, showing {d} of {d}", .{
+                app.shells.count(),
+                app.shells.active + 1,
+                app.shells.count(),
+            });
+        },
+        else => {},
     }
 }
 

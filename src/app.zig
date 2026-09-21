@@ -27,6 +27,7 @@ fn inspectorRowHeight(line_height: f32) f32 {
 const review = @import("editor/review.zig");
 const wrap = @import("ui/wrap.zig");
 const shell_integration = @import("services/shell.zig");
+const terminals = @import("services/terminals.zig");
 const tree_widget = @import("ui/tree.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
@@ -153,7 +154,8 @@ pub const App = struct {
     /// what a terminal in an editor is for.
     terminal: ?vt.Terminal = null,
     shell: ?pty.Pty = null,
-    terminal_open: bool = false,
+    /// The terminal dock's sessions. A tab is one shell with its own screen.
+    shells: terminals.Terminals,
     terminal_read: std.ArrayList(u8) = .empty,
     terminal_encode: [256]u8 = undefined,
     /// The fraction of the body the terminal dock takes when it is open.
@@ -171,7 +173,7 @@ pub const App = struct {
         errdefer a.free(clients);
         for (config.agents, clients) |preset, *client| client.* = Client.init(a, preset, root);
         const cached = try workspace.activeDocument().snapshot(a);
-        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a), .files = tree_widget.Tree.init(a) };
+        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a), .files = tree_widget.Tree.init(a), .shells = terminals.Terminals.init(a) };
         try self.rebuildFiles();
         self.status("F5 starts the selected agent. Ctrl+P opens files.", .{});
         return self;
@@ -180,8 +182,7 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         // The shell is killed and reaped before the emulator that read it
         // goes away, and the buffer between them with them.
-        if (self.shell) |*shell| shell.deinit();
-        if (self.terminal) |*terminal| terminal.deinit();
+        self.shells.deinit();
         self.terminal_read.deinit(self.allocator);
         if (self.lsp_client) |*client| client.deinit();
         for (self.clients) |*client| client.deinit();
@@ -426,7 +427,7 @@ pub const App = struct {
         var command: ?[]u8 = null;
         var output: ?[]u8 = null;
         if (self.inspector_context[2]) {
-            if (self.terminal) |*terminal| {
+            if (self.activeTerminal()) |terminal| {
                 if (terminal.lastCommand(self.allocator) catch null) |result| {
                     var owned = result;
                     command = owned.command;
@@ -511,7 +512,7 @@ pub const App = struct {
                 const delta: i32 = @intFromFloat(-ev.wheel.y * 3);
                 const x = ev.wheel.mouse_x;
                 const y = ev.wheel.mouse_y;
-                if (self.terminal_open and self.geometry.terminal.contains(x, y)) {
+                if (self.terminalOpen() and self.geometry.terminal.contains(x, y)) {
                     self.scrollTerminal(delta, x, y);
                 } else if (self.geometry.explorer.contains(x, y)) {
                     self.explorer_first = adjust(self.explorer_first, delta, self.workspace.explorer.entries.items.len);
@@ -627,8 +628,17 @@ pub const App = struct {
                     self.follow_cursor = true;
                 },
                 c.SDLK_W => {
-                    if (shift) self.perspective = if (self.perspective == .compose) .code else .compose;
+                    if (shift) {
+                        self.perspective = if (self.perspective == .compose) .code else .compose;
+                    } else {
+                        // The tab a reader is looking at is the one they mean to
+                        // close, and closing the last one puts the dock away.
+                        self.closeTerminalTab();
+                    }
                 },
+                c.SDLK_T => if (shift) try self.newTerminalTab(),
+                c.SDLK_LEFT => if (shift) self.moveTerminalTab(false),
+                c.SDLK_RIGHT => if (shift) self.moveTerminalTab(true),
                 c.SDLK_A => {
                     // A run waiting for a person takes precedence over the
                     // editor's own shortcut: it is the only thing here that
@@ -1086,6 +1096,23 @@ pub const App = struct {
 
     fn mouseDown(self: *App, x: f32, y: f32) !void {
         if (self.overlay != .none) return;
+        // The terminal's own strip belongs to the interface rather than to the
+        // shell: a tab is not a click the program gets to see.
+        if (self.terminalOpen() and self.geometry.terminal.contains(x, y)) {
+            if (self.terminalTabAt(x, y)) |hit| {
+                switch (hit) {
+                    .select => |index| self.shells.select(index),
+                    .close => |index| {
+                        self.shells.select(index);
+                        self.closeTerminalTab();
+                    },
+                    .new_tab => try self.newTerminalTab(),
+                }
+                return;
+            }
+            self.focus = .terminal;
+            return;
+        }
         // The dock's own switch and rows belong to the interface, so they are
         // answered before any panel is offered the click. The files view is a
         // panel; the runs view is this.
@@ -1253,7 +1280,7 @@ pub const App = struct {
             r.height,
             self.sidebar,
             .{ .line_height = self.line_height, .char_width = self.char_width },
-            if (self.terminal_open) self.terminal_fraction else 0,
+            if (self.terminalOpen()) self.terminal_fraction else 0,
         );
         const g = self.geometry;
         try r.rect(.{ .x = 0, .y = 0, .w = r.width, .h = r.height }, theme.background);
@@ -1278,7 +1305,8 @@ pub const App = struct {
             .review => try self.drawReview(r, frame),
             .compose => try self.drawCompose(r, frame),
         }
-        if (self.terminal_open) try self.drawTerminal(r);
+        if (self.terminalOpen()) try self.drawTerminal(r);
+        if (self.terminalOpen()) try self.drawTerminalTabs(r);
         try self.drawInspector(r, frame);
         r.clip = .{ .x = 0, .y = 0, .w = r.width, .h = r.height };
         try r.rect(g.status, theme.selected);
@@ -1395,69 +1423,143 @@ pub const App = struct {
     /// Open or close the shell dock. The shell starts on first use and keeps
     /// running while the dock is closed, so closing it is not killing it.
     pub fn toggleTerminal(self: *App) !void {
-        if (self.terminal_open) {
-            self.terminal_open = false;
+        if (self.terminalOpen()) {
+            if (self.focus == .terminal) self.focus = .editor;
+            self.status("Terminal hidden. Ctrl+` brings it back.", .{});
+            return;
+        }
+        try self.newTerminalTab();
+    }
+
+    /// Whether the dock is showing. The dock is open when there is a session to
+    /// show, so closing every tab closes the dock.
+    pub fn terminalOpen(self: *const App) bool {
+        return self.shells.count() > 0;
+    }
+
+    fn activeTerminal(self: *App) ?*vt.Terminal {
+        const session = self.shells.activeSession() orelse return null;
+        return &session.terminal;
+    }
+
+    fn activeShell(self: *App) ?*pty.Pty {
+        const session = self.shells.activeSession() orelse return null;
+        return &session.shell;
+    }
+
+    /// Open another tab: a new shell with its own screen, which is what the
+    /// reader means by asking for one.
+    pub fn newTerminalTab(self: *App) !void {
+        const shell_path: []const u8 = if (std.c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
+        var plan = shell_integration.integrate(self.allocator, shell_path) catch |err| {
+            self.status("terminal: no command markers ({s})", .{@errorName(err)});
+            return;
+        };
+        defer if (plan) |*value| value.deinit(self.allocator);
+        if (plan) |value| {
+            if (value.variable) |variable| {
+                if (builtin.os.tag != .windows) {
+                    const name = self.allocator.dupeSentinel(u8, variable.name, 0) catch null;
+                    defer if (name) |bytes| self.allocator.free(bytes);
+                    const setting = self.allocator.dupeSentinel(u8, variable.value, 0) catch null;
+                    defer if (setting) |bytes| self.allocator.free(bytes);
+                    if (name != null and setting != null) _ = c.setenv(name.?, setting.?, 1);
+                }
+            }
+        }
+        const shell_argv: []const []const u8 = if (plan) |value| value.argv else &.{shell_path};
+        const index = self.shells.spawn(shell_argv, 80, 24, std.fs.path.basename(shell_path)) catch |err| {
+            self.status("terminal: {s}", .{@errorName(err)});
+            return;
+        };
+        // The editor polls the shell; a blocking read would stall the frame.
+        if (self.shells.activeSession()) |session| session.shell.setNonBlocking() catch {};
+        self.focus = .terminal;
+        self.status("Terminal {d} of {d}.", .{ index + 1, self.shells.count() });
+    }
+
+    /// Close the tab the reader is on. Closing the last one closes the dock,
+    /// because a dock with nothing in it is a dock taking up room.
+    pub fn closeTerminalTab(self: *App) void {
+        if (self.shells.count() == 0) return;
+        const closing = self.shells.active;
+        self.shells.close(closing);
+        if (self.shells.count() == 0) {
             if (self.focus == .terminal) self.focus = .editor;
             self.status("Terminal dock closed. Ctrl+` brings it back.", .{});
             return;
         }
-        if (self.shell == null) {
-            // The same call the rest of the platform layer makes. Where SHELL is
-            // not exported - which is not unusual - the terminal has a shell
-            // anyway and says nothing about markers it cannot ask for.
-            const shell_path: []const u8 = if (std.c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
-            // The shell is asked to mark its own commands, so a command result
-            // is read from the emulator rather than inferred from the shape of
-            // the screen. A shell the integration does not know is run as it is.
-            var plan = shell_integration.integrate(self.allocator, shell_path) catch |err| {
-                // A shell that cannot be asked to mark its commands still runs;
-                // the terminal just reads its screen as text, and says why.
-                self.status("terminal: no command markers ({s})", .{@errorName(err)});
-                return;
-            };
-            defer if (plan) |*value| value.deinit(self.allocator);
-            if (plan == null) self.status("terminal: {s} reports no command boundaries", .{std.fs.path.basename(shell_path)});
-            if (plan) |value| {
-                if (value.variable) |variable| {
-                    // Setting a variable for the child is how zsh is pointed at
-                    // the snippet, and it is a POSIX thing: the shells this
-                    // knows are not the ones a Windows terminal runs. The
-                    // branch is comptime, so nothing here is analysed there.
-                    if (builtin.os.tag != .windows) {
-                        const name = self.allocator.dupeSentinel(u8, variable.name, 0) catch null;
-                        defer if (name) |bytes| self.allocator.free(bytes);
-                        const setting = self.allocator.dupeSentinel(u8, variable.value, 0) catch null;
-                        defer if (setting) |bytes| self.allocator.free(bytes);
-                        if (name != null and setting != null) _ = c.setenv(name.?, setting.?, 1);
-                    }
-                }
-            }
-            const shell_argv: []const []const u8 = if (plan) |value| value.argv else &.{shell_path};
-            self.shell = pty.Pty.spawn(self.allocator, shell_argv) catch |err| {
-                self.status("terminal: {s}", .{@errorName(err)});
-                return;
-            };
-            self.terminal = vt.Terminal.init(self.allocator, 80, 24) catch |err| {
-                // The emulator could not start, so nothing would read the shell.
-                var orphan = self.shell.?;
-                orphan.deinit();
-                self.shell = null;
-                self.status("terminal: {s}", .{@errorName(err)});
-                return;
-            };
-            // The editor polls the shell; a blocking read would stall the frame.
-            if (self.shell) |*spawned| spawned.setNonBlocking() catch {};
-        }
-        self.terminal_open = true;
-        self.focus = .terminal;
-        self.status("Terminal dock open. Ctrl+` closes it.", .{});
+        self.status("Terminal {d} of {d}.", .{ self.shells.active + 1, self.shells.count() });
     }
+
+    /// Move the current tab one place along the strip.
+    pub fn moveTerminalTab(self: *App, forward: bool) void {
+        const count = self.shells.count();
+        if (count < 2) return;
+        const from = self.shells.active;
+        const to = if (forward) @min(from + 1, count - 1) else (from -| 1);
+        if (from == to) return;
+        self.shells.move(from, to);
+        self.status("Terminal {d} of {d}.", .{ self.shells.active + 1, count });
+    }
+
+    /// The tab strip above the terminal's screen. A tab per shell, the one
+    /// showing marked, and a way to add another and to close one.
+    fn drawTerminalTabs(self: *App, r: *Renderer) !void {
+        const bounds = self.geometry.terminal;
+        const strip: Rect = .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 26 };
+        r.clip = strip;
+        try r.rect(strip, theme.panel);
+        var x = strip.x + 6;
+        const count = self.shells.count();
+        for (0..count) |index| {
+            const title = self.shells.titleAt(index) orelse continue;
+            const active = index == self.shells.active;
+            const width: f32 = @min(strip.w - (x - strip.x) - 40, 150);
+            if (width < 40) break;
+            if (active) try r.rect(.{ .x = x, .y = strip.y + 3, .w = width, .h = strip.h - 6 }, theme.raised);
+            var scratch: [256]u8 = undefined;
+            const room: usize = @intFromFloat(@max(2, (width - 34) / r.atlas.advance));
+            const label = wrap.elide(&scratch, title, room);
+            try r.text(x + 8, strip.y + 7, label, if (active) theme.accent else theme.muted);
+            // A close box on every tab, and on the active one it is where a
+            // reader looks for it first.
+            try r.text(x + width - 16, strip.y + 7, "×", if (active) theme.text else theme.muted);
+            x += width + 4;
+        }
+        try r.text(x + 4, strip.y + 7, "+", theme.accent);
+    }
+
+    /// Which tab, close box, or new-tab control a point in the strip is on.
+    /// Null when the point is in the strip but on none of them.
+    pub fn terminalTabAt(self: *const App, x: f32, y: f32) ?TerminalHit {
+        const bounds = self.geometry.terminal;
+        if (bounds.w <= 0 or y < bounds.y or y >= bounds.y + 26) return null;
+        var cursor = bounds.x + 6;
+        for (0..self.shells.count()) |index| {
+            const width: f32 = @min(bounds.x + bounds.w - cursor - 40, 150);
+            if (width < 40) break;
+            if (x >= cursor and x < cursor + width) {
+                if (x >= cursor + width - 24) return .{ .close = index };
+                return .{ .select = index };
+            }
+            cursor += width + 4;
+        }
+        if (x >= cursor and x < cursor + 24) return .new_tab;
+        return null;
+    }
+
+    pub const TerminalHit = union(enum) {
+        select: usize,
+        close: usize,
+        new_tab,
+    };
 
     /// Move bytes one way and the screen the other: the shell's output into the
     /// emulator, and the size the dock gives the emulator back to the shell.
     fn pumpTerminal(self: *App) void {
-        const shell = if (self.shell) |*shell| shell else return;
-        const terminal = if (self.terminal) |*terminal| terminal else return;
+        const shell = self.activeShell() orelse return;
+        const terminal = self.activeTerminal() orelse return;
         self.terminal_read.clearRetainingCapacity();
         while (true) {
             self.terminal_read.ensureUnusedCapacity(self.allocator, 4096) catch break;
@@ -1466,7 +1568,7 @@ pub const App = struct {
             self.terminal_read.items.len += count;
         }
         if (self.terminal_read.items.len != 0) terminal.write(self.terminal_read.items);
-        if (self.terminal_open) {
+        if (self.terminalOpen()) {
             const bounds = self.geometry.terminal;
             const cols: u16 = @intFromFloat(@max(2, @floor((bounds.w - 8) / self.char_width)));
             const rows: u16 = @intFromFloat(@max(1, @floor((bounds.h - 8) / self.line_height)));
@@ -1480,7 +1582,7 @@ pub const App = struct {
     /// Draw the grid the shell produced: each cell's background, then its
     /// glyph, then the cursor where the program put it.
     fn drawTerminal(self: *App, r: *Renderer) !void {
-        const terminal = if (self.terminal) |*terminal| terminal else return;
+        const terminal = self.activeTerminal() orelse return;
         const bounds = self.geometry.terminal;
         if (bounds.h <= 0 or bounds.w <= 0) return;
         // The emulator owns the dock's colors; the editor's theme is the
@@ -1580,8 +1682,8 @@ pub const App = struct {
     /// The shell wants the keys a terminal sends, not the editor's meanings.
     /// Printable keys arrive as text, so this covers the rest.
     fn terminalKey(self: *App, keycode: c.SDL_Keycode, ctrl: bool, shift: bool, alt: bool) !void {
-        const terminal = if (self.terminal) |*terminal| terminal else return;
-        const shell = if (self.shell) |*shell| shell else return;
+        const terminal = self.activeTerminal() orelse return;
+        const shell = self.activeShell() orelse return;
         const ghostty_key: ghostty.GhosttyKey = switch (keycode) {
             c.SDLK_UP => ghostty.GHOSTTY_KEY_ARROW_UP,
             c.SDLK_DOWN => ghostty.GHOSTTY_KEY_ARROW_DOWN,
@@ -1626,15 +1728,15 @@ pub const App = struct {
     /// Typed characters go to the shell as themselves: bracketed paste is for
     /// pasting, and a program that asked for it would misread every keystroke.
     fn terminalText(self: *App, bytes: []const u8) !void {
-        const shell = if (self.shell) |*shell| shell else return;
+        const shell = self.activeShell() orelse return;
         shell.writeInput(bytes) catch {};
     }
 
     /// Paste travels through the emulator so the shell sees what it asked for:
     /// bracketed wrapping when it enabled it, and its control bytes stripped.
     fn terminalPaste(self: *App, bytes: []const u8) !void {
-        const terminal = if (self.terminal) |*terminal| terminal else return;
-        const shell = if (self.shell) |*shell| shell else return;
+        const terminal = self.activeTerminal() orelse return;
+        const shell = self.activeShell() orelse return;
         const encoded = terminal.encodePaste(bytes, &self.terminal_encode) catch return;
         if (encoded.len == 0) return;
         shell.writeInput(encoded) catch {};
@@ -1649,7 +1751,7 @@ pub const App = struct {
     /// The visible screen as text, one line per row. A display is not needed to
     /// see what a shell produced, so exercises and tests assert on this.
     pub fn terminalScreen(self: *App, a: std.mem.Allocator) !?[]u8 {
-        const terminal = if (self.terminal) |*terminal| terminal else return null;
+        const terminal = self.activeTerminal() orelse return null;
         const Collector = struct {
             allocator: std.mem.Allocator,
             text: std.ArrayList(u8) = .empty,
@@ -1676,7 +1778,7 @@ pub const App = struct {
     /// A wheel over the terminal: the program running there gets it when it
     /// asked for mouse reporting, and otherwise it moves through scrollback.
     fn scrollTerminal(self: *App, lines: i32, x: f32, y: f32) void {
-        const terminal = if (self.terminal) |*terminal| terminal else return;
+        const terminal = self.activeTerminal() orelse return;
         const bounds = self.geometry.terminal;
         const cell_x: u16 = @intFromFloat(@max(0, @floor((x - bounds.x - 4) / self.char_width)));
         const cell_y: u16 = @intFromFloat(@max(0, @floor((y - bounds.y - 4) / self.line_height)));
@@ -1684,7 +1786,7 @@ pub const App = struct {
             const button: vt.Terminal.MouseButton = if (lines < 0) .four else .five;
             const encoded = terminal.encodeMouse(.press, button, cell_x, cell_y, .{}, &self.terminal_encode) catch return;
             if (encoded.len != 0) {
-                if (self.shell) |*shell| shell.writeInput(encoded) catch {};
+                if (self.activeShell()) |shell| shell.writeInput(encoded) catch {};
             }
             return;
         }
@@ -1858,7 +1960,7 @@ pub const App = struct {
     /// shell reports nothing, which is not the same as an empty command: one is
     /// a terminal that does not know, the other is a command that did nothing.
     pub fn terminalCommand(self: *App, allocator: std.mem.Allocator) !?[]u8 {
-        const terminal = if (self.terminal) |*value| value else return null;
+        const terminal = self.activeTerminal() orelse return null;
         const result = (try terminal.lastCommand(allocator)) orelse return null;
         allocator.free(result.output);
         return result.command;
@@ -2499,7 +2601,7 @@ pub const App = struct {
                 return std.fmt.bufPrint(&self.inspector_scratch[1], "{d} lines", .{lines}) catch "file";
             },
             else => {
-                const terminal = if (self.terminal) |*value| value else return "no terminal";
+                const terminal = self.activeTerminal() orelse return "no terminal";
                 _ = terminal;
                 return "last command";
             },

@@ -977,3 +977,27 @@ test "the transcript typesets a display formula instead of showing its source" {
         }
     }
 }
+
+test "a strip scrolls only as far as its tabs reach" {
+    // The maximum is what decides whether the last tab can be reached at all,
+    // which is the failure this replaced: a strip whose tabs did not fit simply
+    // stopped drawing them, and nothing could bring them back.
+    // Three tabs of 100 with a 4 gap need 308. Given more room than that, there
+    // is nothing to scroll for.
+    try std.testing.expectEqual(@as(f32, 0), app.stripOverflow(100, 4, 3, 400));
+    // Given 200, the strip falls 108 short and may scroll exactly that far.
+    try std.testing.expectEqual(@as(f32, 108), app.stripOverflow(100, 4, 3, 200));
+    // No tabs is nothing to scroll; no room is a range that cannot go negative.
+    try std.testing.expectEqual(@as(f32, 0), app.stripOverflow(100, 4, 0, 200));
+    try std.testing.expectEqual(@as(f32, 0), app.stripOverflow(100, 4, 3, 0));
+}
+
+test "a scroll offset stays inside its strip" {
+    // Scrolling before the first tab or past the last shows a blank strip, so
+    // the wheel and the selection both come through here.
+    try std.testing.expectEqual(@as(f32, 0), app.clampScroll(-40, 108));
+    try std.testing.expectEqual(@as(f32, 108), app.clampScroll(500, 108));
+    try std.testing.expectEqual(@as(f32, 50), app.clampScroll(50, 108));
+    // A strip that does not scroll has exactly one legal offset.
+    try std.testing.expectEqual(@as(f32, 0), app.clampScroll(20, 0));
+}

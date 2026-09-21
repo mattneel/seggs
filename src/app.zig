@@ -185,6 +185,13 @@ pub const App = struct {
     /// The least a tab is worth drawing, and the most one tab may take. A name
     /// narrower than this is not a name, and one lane does not get to own the
     /// whole strip.
+    const agentTabGap: f32 = 4;
+    /// One terminal tab's width, the same for every tab, so the dock's strip
+    /// geometry is a multiplication rather than a walk that each caller has to
+    /// repeat - which is how the draw and the click came to disagree.
+    const terminalTabWidth: f32 = 150;
+    const terminalTabGap: f32 = 4;
+    const terminalNewWidth: f32 = 24;
     const agent_tab_min: f32 = 44;
     const agent_tab_max: f32 = 150;
 
@@ -421,6 +428,12 @@ pub const App = struct {
     terminal_encode: [256]u8 = undefined,
     /// The fraction of the body the terminal dock takes when it is open.
     terminal_fraction: f32 = 0.28,
+    /// How far each strip is scrolled, in pixels from its left tab. A strip
+    /// holds more tabs than it can show: the terminal dock's tabs were never
+    /// bounded and the agent strip's bound is gone, so both scroll rather than
+    /// leaving a tab that exists with nowhere to be.
+    agent_scroll: f32 = 0,
+    terminal_scroll: f32 = 0,
     /// What /etc/shells offers on this machine, each entry validated once.
     /// Fixed buffers rather than owned slices because the menu points at these
     /// and the list of installed shells does not change while we run.
@@ -846,8 +859,17 @@ pub const App = struct {
                 const delta: i32 = @intFromFloat(-ev.wheel.y * 3);
                 const x = ev.wheel.mouse_x;
                 const y = ev.wheel.mouse_y;
-                if (self.terminalOpen() and self.geometry.terminal.contains(x, y)) {
+                if (self.terminalOpen() and self.terminalStrip().contains(x, y)) {
+                    // A strip has one direction to scroll in, so a notch moves
+                    // it one tab. The screen below keeps the wheel for its own
+                    // history, which is why the strip is asked first.
+                    const step = self.terminalTabWidthOf() + terminalTabGap;
+                    self.terminal_scroll = clampScroll(self.terminal_scroll + @as(f32, @floatFromInt(delta)) * step, self.terminalOverflow());
+                } else if (self.terminalOpen() and self.geometry.terminal.contains(x, y)) {
                     self.scrollTerminal(delta, x, y);
+                } else if (self.agentStrip().contains(x, y)) {
+                    const step = self.agentTabWidth() + agentTabGap;
+                    self.agent_scroll = clampScroll(self.agent_scroll + @as(f32, @floatFromInt(delta)) * step, self.agentOverflow());
                 } else if (self.geometry.explorer.contains(x, y)) {
                     self.explorer_first = adjust(self.explorer_first, delta, self.workspace.explorer.entries.items.len);
                 } else if (self.geometry.agents.contains(x, y)) {
@@ -2579,47 +2601,95 @@ pub const App = struct {
 
     /// The tab strip above the terminal's screen. A tab per shell, the one
     /// showing marked, and a way to add another and to close one.
-    fn drawTerminalTabs(self: *App, r: *Renderer) !void {
+    fn terminalStrip(self: *const App) Rect {
         const bounds = self.geometry.terminal;
-        const strip: Rect = .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = layout.Layout.terminal_strip_height };
+        return .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = layout.Layout.terminal_strip_height };
+    }
+
+    /// The width the terminal tabs are laid out in, stopping short of the
+    /// control at the end.
+    fn terminalTabSpan(self: *const App) f32 {
+        return @max(0, self.terminalStrip().w - 12 - terminalNewWidth - terminalTabGap);
+    }
+
+    fn terminalTabWidthOf(self: *const App) f32 {
+        const span = self.terminalTabSpan();
+        if (span <= 0) return 0;
+        return @min(terminalTabWidth, span);
+    }
+
+    fn terminalOverflow(self: *const App) f32 {
+        return stripOverflow(self.terminalTabWidthOf(), terminalTabGap, self.shells.count(), self.terminalTabSpan());
+    }
+
+    /// Where a tab of the dock's strip is drawn, or null when it is scrolled
+    /// clear of it. The draw and the click both come through here, so the tab a
+    /// point lands on is the tab that was drawn.
+    fn terminalTabRect(self: *const App, index: usize) ?Rect {
+        const strip = self.terminalStrip();
+        const width = self.terminalTabWidthOf();
+        if (strip.w <= 0 or width <= 0 or index >= self.shells.count()) return null;
+        const left = strip.x + 6;
+        const x = left + @as(f32, @floatFromInt(index)) * (width + terminalTabGap) - self.terminal_scroll;
+        if (x >= left + self.terminalTabSpan()) return null;
+        if (x + width <= left) return null;
+        return .{ .x = x, .y = strip.y + 3, .w = width, .h = strip.h - 6 };
+    }
+
+    /// The new-tab control, at the strip's far end where a strip full of tabs
+    /// cannot scroll it out of reach.
+    fn terminalNewRect(self: *const App) Rect {
+        const strip = self.terminalStrip();
+        return .{ .x = strip.x + strip.w - 6 - terminalNewWidth, .y = strip.y + 3, .w = terminalNewWidth, .h = strip.h - 6 };
+    }
+
+    /// Scroll the dock's strip just far enough for the active tab to be whole,
+    /// so a shell started past the edge is shown rather than merely existing.
+    fn ensureTerminalVisible(self: *App) void {
+        const width = self.terminalTabWidthOf();
+        if (width <= 0) return;
+        const position = self.shells.active;
+        const span = self.terminalTabSpan();
+        const left = @as(f32, @floatFromInt(position)) * (width + terminalTabGap);
+        if (left < self.terminal_scroll) self.terminal_scroll = left;
+        if (left + width > self.terminal_scroll + span) self.terminal_scroll = left + width - span;
+        self.terminal_scroll = clampScroll(self.terminal_scroll, self.terminalOverflow());
+    }
+
+    fn drawTerminalTabs(self: *App, r: *Renderer) !void {
+        self.ensureTerminalVisible();
+        const strip = self.terminalStrip();
         r.clip = strip;
         try r.rect(strip, theme.panel);
-        var x = strip.x + 6;
-        const count = self.shells.count();
-        for (0..count) |index| {
+        for (0..self.shells.count()) |index| {
+            const tab = self.terminalTabRect(index) orelse continue;
             const title = self.shells.titleAt(index) orelse continue;
             const active = index == self.shells.active;
-            const width: f32 = @min(strip.w - (x - strip.x) - 40, 150);
-            if (width < 40) break;
-            if (active) try r.rect(.{ .x = x, .y = strip.y + 3, .w = width, .h = strip.h - 6 }, theme.raised);
+            if (active) try r.rect(tab, theme.raised);
             var scratch: [256]u8 = undefined;
-            const room: usize = @intFromFloat(@max(2, (width - 34) / r.atlas.advance));
+            const room: usize = @intFromFloat(@max(2, (tab.w - 34) / r.atlas.advance));
             const label = wrap.elide(&scratch, title, room);
-            try r.text(x + 8, strip.y + 7, label, if (active) theme.accent else theme.muted);
+            try r.text(tab.x + 8, strip.y + 7, label, if (active) theme.accent else theme.muted);
             // A close box on every tab, and on the active one it is where a
             // reader looks for it first.
-            try r.text(x + width - 16, strip.y + 7, "×", if (active) theme.text else theme.muted);
-            x += width + 4;
+            try r.text(tab.x + tab.w - 16, strip.y + 7, "×", if (active) theme.text else theme.muted);
         }
-        try r.text(x + 4, strip.y + 7, "+", theme.accent);
+        const plus = self.terminalNewRect();
+        try r.text(plus.x + 8, strip.y + 7, "+", theme.accent);
     }
 
     /// Which tab, close box, or new-tab control a point in the strip is on.
     /// Null when the point is in the strip but on none of them.
     pub fn terminalTabAt(self: *const App, x: f32, y: f32) ?TerminalHit {
-        const bounds = self.geometry.terminal;
-        if (bounds.w <= 0 or y < bounds.y or y >= bounds.y + 26) return null;
-        var cursor = bounds.x + 6;
+        const strip = self.terminalStrip();
+        if (strip.w <= 0 or !strip.contains(x, y)) return null;
         for (0..self.shells.count()) |index| {
-            const width: f32 = @min(bounds.x + bounds.w - cursor - 40, 150);
-            if (width < 40) break;
-            if (x >= cursor and x < cursor + width) {
-                if (x >= cursor + width - 24) return .{ .close = index };
-                return .{ .select = index };
-            }
-            cursor += width + 4;
+            const tab = self.terminalTabRect(index) orelse continue;
+            if (!tab.contains(x, y)) continue;
+            if (x >= tab.x + tab.w - 24) return .{ .close = index };
+            return .{ .select = index };
         }
-        if (x >= cursor and x < cursor + 24) return .new_tab;
+        if (self.terminalNewRect().contains(x, y)) return .new_tab;
         return null;
     }
 
@@ -3121,27 +3191,78 @@ pub const App = struct {
         return false;
     }
 
-    /// Where a lane's tab is drawn, or null when the strip has no room for it.
-    /// The draw and the click both come through here, so the tab a point lands
-    /// on is the tab that was drawn. A lane the strip has no room for has no
-    /// tab of its own: it is reached through the dock's lists, and the strip's
-    /// width decides how many tabs there are without deciding how many lanes
-    /// may run.
+    /// The width one lane's tab is drawn at.
+    ///
+    /// Tabs share the strip while the smallest of them is still readable, which
+    /// is what keeps a dock holding two or three of them from looking sparse.
+    /// Past that they keep the least a name can be read in and the strip
+    /// scrolls: a tab off the edge can be scrolled to, and a tab that was never
+    /// drawn cannot be reached at all, which is what the previous rule left.
+    fn agentTabWidth(self: *const App) f32 {
+        const strip = self.agentStrip();
+        const count = self.openAgents().count();
+        if (count == 0) return 0;
+        const gap = agentTabGap;
+        const room = strip.w - 12 - agentPlusWidth - gap;
+        const share = (room - gap * @as(f32, @floatFromInt(count - 1))) / @as(f32, @floatFromInt(count));
+        if (share < agent_tab_min) return agent_tab_min;
+        return @min(agent_tab_max, share);
+    }
+
+    /// How far the lane strip may scroll: what its tabs need beyond what it can
+    /// show, or zero when they all fit.
+    fn agentOverflow(self: *const App) f32 {
+        const count = self.openAgents().count();
+        if (count == 0) return 0;
+        return stripOverflow(self.agentTabWidth(), agentTabGap, count, self.agentTabSpan());
+    }
+
+    /// The width the tabs are laid out in, which stops short of the control at
+    /// the far end.
+    fn agentTabSpan(self: *const App) f32 {
+        const strip = self.agentStrip();
+        return @max(0, strip.w - 12 - agentPlusWidth - agentTabGap);
+    }
+
+    /// Where a lane's tab is drawn, or null when it is scrolled clear of the
+    /// strip. The draw and the click both come through here, so the tab a point
+    /// lands on is the tab that was drawn.
+    ///
+    /// A tab the strip only partly shows keeps its whole rectangle: the
+    /// renderer's clip cuts it, so the reader sees an edge of it and knows
+    /// there is more, and a click on what is visible still lands on it.
     fn agentTabRect(self: *const App, index: usize) ?Rect {
         const strip = self.agentStrip();
         const count = self.openAgents().count();
         if (strip.w <= 0 or index >= count) return null;
-        const gap: f32 = 4;
-        // Tabs share the strip, so every lane is reachable in a dock that fits
-        // four of them at their widest. Below the least a name can be read in,
-        // the strip stops rather than drawing stubs.
-        const room = strip.w - 12 - gap - agentPlusWidth - gap;
-        const share = (room - gap * @as(f32, @floatFromInt(count - 1))) / @as(f32, @floatFromInt(count));
-        const width = @min(agent_tab_max, share);
-        if (width < agent_tab_min) return null;
-        const x = strip.x + 6 + @as(f32, @floatFromInt(index)) * (width + gap);
-        if (x + width > strip.x + strip.w - 6 - agentPlusWidth - gap) return null;
+        const width = self.agentTabWidth();
+        if (width <= 0) return null;
+        const left = strip.x + 6;
+        const x = left + @as(f32, @floatFromInt(index)) * (width + agentTabGap) - self.agent_scroll;
+        if (x >= left + self.agentTabSpan()) return null;
+        if (x + width <= left) return null;
         return .{ .x = x, .y = strip.y + 3, .w = width, .h = strip.h - 6 };
+    }
+
+    /// Scroll the strip just far enough for the active lane's tab to be whole,
+    /// which is what makes Ctrl+Tab and Ctrl+1..8 land somewhere visible. Only
+    /// ever moves the strip when the selection is out of view, so scrolling by
+    /// hand is not undone by the next frame.
+    fn ensureAgentVisible(self: *App) void {
+        const lanes = self.openAgents();
+        const count = lanes.count();
+        const width = self.agentTabWidth();
+        if (count == 0 or width <= 0) return;
+        var position: usize = 0;
+        var cursor = lanes;
+        while (cursor.next()) |index| : (position += 1) {
+            if (index != self.active) continue;
+            const left = @as(f32, @floatFromInt(position)) * (width + agentTabGap);
+            const span = self.agentTabSpan();
+            if (left < self.agent_scroll) self.agent_scroll = left;
+            if (left + width > self.agent_scroll + span) self.agent_scroll = left + width - span;
+        }
+        self.agent_scroll = clampScroll(self.agent_scroll, self.agentOverflow());
     }
 
     /// The control at the end of the strip. It sits at the far end rather than
@@ -3164,7 +3285,7 @@ pub const App = struct {
         var lanes = self.openAgents();
         var position: usize = 0;
         while (lanes.next()) |index| : (position += 1) {
-            const tab = self.agentTabRect(position) orelse break;
+            const tab = self.agentTabRect(position) orelse continue;
             if (!tab.contains(x, y)) continue;
             // The close box is the last of a tab, which is where a reader looks
             // for it, and it takes the click before the tab does.
@@ -4992,6 +5113,7 @@ pub const App = struct {
     /// with lanes in it instead of shells, and it is read the same way: a name,
     /// a mark, and a box to close it with.
     fn drawAgentTabs(self: *App, r: *Renderer) !void {
+        self.ensureAgentVisible();
         const strip = self.agentStrip();
         r.clip = strip;
         try r.rect(strip, theme.background);
@@ -5000,7 +5122,7 @@ pub const App = struct {
         var open = self.openAgents();
         var position: usize = 0;
         while (open.next()) |index| : (position += 1) {
-            const tab = self.agentTabRect(position) orelse break;
+            const tab = self.agentTabRect(position) orelse continue;
             const client = self.clients[index];
             const active = index == self.active;
             if (active) try r.rect(tab, theme.raised);
@@ -5109,6 +5231,21 @@ fn clip(buf: []u8, bytes: []const u8) []const u8 {
     const take = @min(buf.len, bytes.len);
     @memcpy(buf[0..take], bytes[0..take]);
     return buf[0..take];
+}
+
+/// How far a strip may scroll: what its tabs need beyond what it can show, or
+/// zero when they all fit. Pure, so the wheel and the selection agree on the
+/// range without either having to ask the other.
+pub fn stripOverflow(tab_width: f32, gap: f32, count: usize, span: f32) f32 {
+    if (count == 0 or span <= 0) return 0;
+    const content = @as(f32, @floatFromInt(count)) * (tab_width + gap) - gap;
+    return @max(0, content - span);
+}
+
+/// A scroll offset kept inside its own range, so neither the wheel nor a
+/// selection can leave the strip showing nothing.
+pub fn clampScroll(offset: f32, maximum: f32) f32 {
+    return std.math.clamp(offset, 0, @max(0, maximum));
 }
 
 fn adjust(value: usize, delta: i32, maximum: usize) usize {

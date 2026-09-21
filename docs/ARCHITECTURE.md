@@ -280,6 +280,20 @@ not looking at. The line is produced by a pure function in `src/ui/activity.zig`
 that writes into a buffer its caller owns and reads no clock, so the same facts
 draw the same words on any machine and the drawing allocates nothing per frame.
 
+Neither strip bounds how many tabs exist: the dock's sessions were never capped,
+and the lane strip's cap turned out to be the strip's own width wearing a
+program's clothes. Tabs share a strip while the smallest of them is still
+readable, and past that they keep that width and the strip scrolls sideways, one
+tab per wheel notch. Both strips ask `stripOverflow` and `clampScroll` for their
+range, so the wheel and the selection cannot disagree about where the end is,
+and both keep the active tab whole by scrolling to it - which is what makes
+Ctrl+Tab and Ctrl+1..8 land somewhere visible rather than on a lane the reader
+cannot see. A tab the strip only partly shows keeps its whole rectangle and is
+cut by the renderer's clip, so its edge is the affordance and a click on what is
+visible still lands on it. The control at the end of each strip sits at the far
+end rather than after the last tab, which is what keeps it reachable when the
+strip is full.
+
 ## Transcript
 
 An agent's prose is Markdown, and the panel renders it: headings, bullets (an

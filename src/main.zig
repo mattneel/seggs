@@ -33,6 +33,7 @@ const help =
     \\                     reaches the state a person would rather than asserting
     \\                     it from the code. Names: window ime click terminal run
     \\                     compose tabs markdown transcript toolcalls records
+    \\                     strips
     \\                     formula liveness themes embedded.
 ;
 
@@ -73,6 +74,7 @@ fn run(init: std.process.Init) !void {
     var exercise_liveness = false;
     var exercise_themes = false;
     var exercise_embedded = false;
+    var exercise_strips = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -118,6 +120,8 @@ fn run(init: std.process.Init) !void {
             exercise_liveness = true;
         } else if (std.mem.eql(u8, arg, "--exercise-themes")) {
             exercise_themes = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-strips")) {
+            exercise_strips = true;
         } else if (std.mem.eql(u8, arg, "--exercise-embedded")) {
             exercise_embedded = true;
         } else {
@@ -295,6 +299,7 @@ fn run(init: std.process.Init) !void {
         if (exercise_liveness) exerciseLiveness(&app, frames, &renderer, init.io, a, liveness_working_shot);
         if (exercise_themes) app.exerciseThemes(frames);
         if (exercise_embedded) exerciseEmbedded(&app, frames);
+        if (exercise_strips) exerciseStrips(&app, frames);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -374,6 +379,37 @@ var pipe_sent = false;
 /// A shell answers when it answers, so the screen is polled from the frame the
 /// command is typed until the answer is there: a fixed frame would make this
 /// pass or fail on how fast the machine running it is.
+/// Fill a strip past its width, so the scrolling can be looked at rather than
+/// asserted. The dock's tabs were never bounded, so it is the one that can be
+/// filled from an exercise without a config that names more agents than the
+/// default four; the lane strip uses the same range maths and comes into view
+/// the same way.
+fn exerciseStrips(app: *App, frame: usize) void {
+    switch (frame) {
+        6 => app.toggleTerminal() catch {},
+        else => {},
+    }
+    if (frame < 90 or strips_open) return;
+    strips_open = true;
+    // One shell started many times over: the point is the strip, not the
+    // programs. The last tab is the active one, so the strip has to have
+    // scrolled for the capture to show it whole - which is the behaviour, and
+    // the reason the exercise exists.
+    for (0..10) |_| app.newTerminalTab("/bin/sh") catch |err| {
+        std.log.err("strips: {s}", .{@errorName(err)});
+        return;
+    };
+    // And every configured lane, so a config naming more agents than the strip
+    // can show scrolls the other strip too. With the default four there is
+    // nothing to scroll, which is correct and looks like nothing happening.
+    for (0..app.clients.len) |index| {
+        app.active = index;
+        app.startAgent() catch |err| std.log.err("strips: lane {d}: {s}", .{ index, @errorName(err) });
+    }
+}
+
+var strips_open = false;
+
 fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
     switch (frame) {
         6 => app.toggleTerminal() catch {},

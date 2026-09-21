@@ -69,10 +69,17 @@ def main() -> int:
     # that the linked binary loads at startup, and that one has to be installed
     # next to it or the process dies before it prints anything. The Unix shared
     # library is for embedding, which this repository does not do.
+    # A shared library is emitted into bin, not lib, and a binary that links
+    # the import library beside it fails at startup unless the DLL travels too.
     source_lib = source / "zig-out/lib"
+    source_bin = source / "zig-out/bin"
     built = [
         p for p in sorted(source_lib.glob("*"))
         if p.name.startswith(("libghostty-vt", "ghostty-vt")) and p.suffix in (".a", ".lib", ".dll")
+    ]
+    built += [
+        p for p in sorted(source_bin.glob("*"))
+        if p.name.startswith(("libghostty-vt", "ghostty-vt")) and p.suffix in (".dll", ".so", ".dylib")
     ]
     if not built:
         listing = ", ".join(sorted(p.name for p in source_lib.glob("*"))) or "nothing"

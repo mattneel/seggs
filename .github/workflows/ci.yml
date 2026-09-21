@@ -242,12 +242,11 @@ jobs:
           "$env:GITHUB_WORKSPACE/.deps/tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Build the terminal library
         run: python tools/bootstrap_ghostty.py
-      - name: Runtime libraries beside the tests
+      - name: Runtime libraries on the path
         shell: pwsh
         run: |
           # A test binary that cannot load a library dies before it can say
-          # which one, and it runs from a cache directory rather than from the
-          # repository, so the runtime libraries are placed next to it.
+          # which one, so this names what is installed where the loader looks.
           foreach ($dir in @("$env:GITHUB_WORKSPACE/.deps/win/lib", "$env:GITHUB_WORKSPACE/.deps/install/lib", "$env:GITHUB_WORKSPACE/.deps/install/bin")) {
             if (Test-Path $dir) {
               Write-Host "runtime $dir"
@@ -256,13 +255,6 @@ jobs:
               Write-Host "runtime $dir (absent)"
             }
           }
-          $targets = Get-ChildItem .zig-cache -Recurse -Filter test.exe -ErrorAction SilentlyContinue
-          foreach ($exe in $targets) {
-            foreach ($dir in @("$env:GITHUB_WORKSPACE/.deps/win/lib", "$env:GITHUB_WORKSPACE/.deps/install/lib", "$env:GITHUB_WORKSPACE/.deps/install/bin")) {
-              if (Test-Path $dir) { Copy-Item -Path "$dir/*.dll" -Destination $exe.Directory -Force -ErrorAction SilentlyContinue }
-            }
-          }
-          Write-Host "copied for $($targets.Count) test binary(ies)"
 
       - name: Shader compiler
         shell: pwsh

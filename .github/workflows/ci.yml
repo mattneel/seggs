@@ -238,6 +238,13 @@ jobs:
           "$env:GITHUB_WORKSPACE/.deps/win/lib" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$env:GITHUB_WORKSPACE/.deps/win/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           "$env:GITHUB_WORKSPACE/.deps/install/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          # A test binary that cannot find a library dies before it can say so.
+          foreach ($dir in @("$env:GITHUB_WORKSPACE/.deps/win/bin", "$env:GITHUB_WORKSPACE/.deps/win/lib", "$env:GITHUB_WORKSPACE/.deps/install/lib")) {
+            if (Test-Path $dir) {
+              Write-Host "runtime $dir"
+              Get-ChildItem $dir -Filter *.dll | Select-Object -ExpandProperty Name | ForEach-Object { Write-Host "  $_" }
+            }
+          }
           "$env:GITHUB_WORKSPACE/.deps/tools/glslang/bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
       - name: Build the terminal library
         run: python tools/bootstrap_ghostty.py

@@ -53,7 +53,7 @@ pub fn init(res_dir: [*:0]const u8) bool {
 /// tried so an installed build works once it does, and the directory is only
 /// looked for when the first formula appears.
 pub fn resourceDir() [*:0]const u8 {
-    return ".deps/MicroTex/res";
+    return ".deps/src/MicroTex/res";
 }
 
 pub fn deinit() void {

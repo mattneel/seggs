@@ -10,13 +10,19 @@ const files = @import("platform/files.zig");
 
 const help =
     \\Seggs 0.2.0 — GPU editor and concurrent ACP client
+    \\
     \\Usage: seggs [--workspace PATH] [--file PATH] [--config PATH]
-    \\             [--font PATH] [--windowed | --fullscreen] [--frames N]
+    \\             [--theme PATH] [--font PATH] [--windowed | --fullscreen]
+    \\             [--window-size WIDTHxHEIGHT] [--frames N]
+    \\       seggs seggsc exec FILE.js
+    \\
     \\Defaults: current directory, fullscreen, no automatic agent launch.
     \\Config files execute programs. Only load a config that you trust.
     \\F5 starts the selected agent. Ctrl+L focuses the prompt.
     \\Ctrl+Enter sends to that agent. Ctrl+Shift+Enter picks a destination.
     \\Ctrl+Shift+A opens an agent. F11 toggles fullscreen. Ctrl+Q quits.
+    \\
+    \\--version prints the version and exits. -h is a synonym for --help.
     \\
     \\QA flags, for looking at a frame with nobody in front of it:
     \\  --screenshot PATH  Write the last frame to PATH. The extension picks the

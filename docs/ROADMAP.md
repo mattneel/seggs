@@ -17,7 +17,7 @@ close it. A capability counts as landed only when a check can fail on it;
 Two landed items are covered by the nearest check rather than one named for
 them: the save gate's conflict races are the watcher's external-edit detection
 plus the review queue's conflict outcome, and a process flood is bounded by the
-agent count limit and the transport's queue limits rather than by a flood test.
+transport's queue limits rather than by a flood test.
 
 ## Milestone 1: Native acceptance
 

@@ -1,7 +1,7 @@
 # Seggs
 
 Seggs is a GPU editor and a concurrent ACP client: one window that edits files,
-runs up to eight agent harnesses beside them, and can be extended while it runs.
+runs agent harnesses beside them, and can be extended while it runs.
 
 The editor is Zig over SDL3's GPU API, with one pipeline, one glyph atlas, and
 one draw call per frame while every quad on it samples the atlas; a picture is

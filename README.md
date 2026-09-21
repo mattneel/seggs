@@ -24,7 +24,7 @@ ACP connects independent agent processes to the right-hand panel.
 | Transcript | Markdown prose, fenced diffs in the theme's diff colours, and tool calls as chips placed where they happened, openable to their fields and diff |
 | Display math | A formula the agent wrote is typeset by a TeX engine and drawn as the mathematics it is, in either the one-line or the opened-and-closed form; a formula the engine refuses falls back to its source rather than disappearing |
 | ACP | JSON-RPC over newline-delimited stdio, initialization, new sessions, prompts, text/tool/plan updates, cancellation |
-| Parallel agents | Up to eight independent processes, per-agent state, separate transcripts, one destination per request |
+| Parallel agents | One independent process per configured agent, per-agent state, separate transcripts, one destination per request |
 | Permissions | Explicit one-time approval or rejection, no automatic approval, bounded pending requests |
 | Capabilities | Editor-backed filesystem reads and writes, plus client-owned terminals with explicit process ownership and bounded output |
 | Integrations | Oh-My-Pi, Codex ACP adapter, Claude ACP adapter, custom argv, local mock |
@@ -196,7 +196,7 @@ zig build run -- --config /absolute/path/to/agents.json
 ```
 
 Seggs does not load executable settings from a workspace automatically.
-The config supports up to eight agents with unique IDs.
+The config names as many agents as you need, each with a unique ID.
 The [JSON schema](config/agents.schema.json) describes its structure.
 
 ## Keyboard reference

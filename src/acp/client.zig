@@ -77,6 +77,11 @@ pub const Client = struct {
     last_error: ?[]u8 = null,
     completed_turns: usize = 0,
     tool_events: usize = 0,
+    /// Every line this lane has received, ever. Monotone, and deliberately not
+    /// derived from the transcript: the transcript is capped and trims from the
+    /// front, so its length stops moving while bytes are still arriving - and a
+    /// reader watching for signs of life would see a working turn go quiet.
+    updates: usize = 0,
     /// The tool calls a lane has seen, in arrival order. Each one knows the
     /// byte offset it belongs at, which is how the interface places a chip in
     /// the prose instead of the transcript carrying a line about it. Bounded by
@@ -403,6 +408,7 @@ pub const Client = struct {
     }
 
     fn handle(self: *Client, line: []const u8) !void {
+        self.updates += 1;
         const parsed = try std.json.parseFromSlice(rpc.Value, self.allocator, line, .{ .allocate = .alloc_always });
         var retained = false;
         defer if (!retained) parsed.deinit();

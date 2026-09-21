@@ -46,6 +46,7 @@ fn run(init: std.process.Init) !void {
     var exercise_markdown = false;
     var exercise_transcript = false;
     var exercise_toolcalls = false;
+    var exercise_liveness = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -83,6 +84,8 @@ fn run(init: std.process.Init) !void {
             exercise_transcript = true;
         } else if (std.mem.eql(u8, arg, "--exercise-toolcalls")) {
             exercise_toolcalls = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-liveness")) {
+            exercise_liveness = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -194,6 +197,14 @@ fn run(init: std.process.Init) !void {
         const resolved = try std.fs.path.resolve(arena, &.{ root, path });
         try app.openFile(resolved);
     }
+    // A stall is two pictures of one lane: the frame while it works and the
+    // frame after it has gone quiet. The run's own `--screenshot` is the second
+    // one, so the first is written beside it - two frames of one run rather than
+    // two runs of a stopwatch.
+    var liveness_working_shot: ?[]const u8 = null;
+    if (exercise_liveness) {
+        if (screenshot_arg) |path| liveness_working_shot = try std.fmt.allocPrint(arena, "{s}.working", .{path});
+    }
     var frame_arena = std.heap.ArenaAllocator.init(a);
     defer frame_arena.deinit();
     var frames: usize = 0;
@@ -245,6 +256,7 @@ fn run(init: std.process.Init) !void {
         if (exercise_markdown) exerciseMarkdown(&app, frames);
         if (exercise_transcript) exerciseTranscript(&app, frames);
         if (exercise_toolcalls) exerciseToolCalls(&app, frames);
+        if (exercise_liveness) exerciseLiveness(&app, frames, &renderer, liveness_working_shot);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -858,6 +870,118 @@ fn exerciseToolCalls(app: *App, frame: usize) void {
 /// Whether a call is open, as the report words it.
 fn openWord(open: bool) []const u8 {
     return if (open) "true" else "false";
+}
+
+/// The two readings a reader has to be able to tell apart: a lane that is
+/// working and a lane that has gone quiet mid-turn.
+///
+/// The turn is real - the prompt goes over the wire to the mock harness - and so
+/// is the silence: the harness's `quiet` prompt names the calls it is making and
+/// then never answers at all, which is what a harness that is thinking, or hung,
+/// looks like from this side of the pipe. The reading is taken through the call
+/// the dock draws its line with, at each moment, so a line reported here is a
+/// line that was on screen; the run then ends with the stalled reading on
+/// screen, which is what the run's own `--screenshot` holds.
+var liveness_sent = false;
+var liveness_working = false;
+var liveness_named = false;
+var liveness_stalled = false;
+var liveness_started: u64 = 0;
+/// The phase the fixture last saw and how many frames in a row it has held.
+var liveness_phase: u8 = 0;
+var liveness_held: usize = 0;
+
+/// How many frames in a row a phase is held before the fixture believes it. The
+/// reading is taken after the frame has been drawn, so a phase that has only
+/// just begun is a frame ahead of the pixels on screen - exactly where the two
+/// thresholds sit - and a few frames of it are waited out first, which is what
+/// makes the picture that follows a picture of this phase rather than the one
+/// before it.
+const liveness_settled_frames: usize = 4;
+
+/// How long the fixture waits for the whole reading before giving up and saying
+/// so. The stall itself takes `activity.stall_after_ms` of real silence; this is
+/// the backstop that keeps a broken run from being a run that hangs.
+const liveness_deadline_ms: u64 = 60_000;
+
+fn exerciseLiveness(app: *App, frame: usize, renderer: *Renderer, working_shot: ?[]const u8) void {
+    if (liveness_started == 0) liveness_started = App.now();
+    if (liveness_stalled) return;
+    const mock = app.agentIndex("Local mock") orelse {
+        std.log.err("liveness: no local mock profile", .{});
+        app.running = false;
+        return;
+    };
+    switch (frame) {
+        6 => {
+            app.active = mock;
+            app.startAgent() catch |err| std.log.err("liveness: {s}", .{@errorName(err)});
+            return;
+        },
+        else => {},
+    }
+    if (!liveness_sent) {
+        if (!app.agentReady(mock)) {
+            if (frame > 600) {
+                std.log.err("liveness: the harness never came up", .{});
+                app.running = false;
+            }
+            return;
+        }
+        liveness_sent = true;
+        app.prompt_text.clearRetainingCapacity();
+        app.prompt_text.appendSlice(app.allocator, "quiet") catch |err| {
+            std.log.err("liveness: {s}", .{@errorName(err)});
+            return;
+        };
+        app.pipeTo(mock) catch |err| std.log.err("liveness: {s}", .{@errorName(err)});
+        return;
+    }
+    // The dock's own reading, fitted to the dock's own width: what is logged
+    // here is what a reader would see.
+    var line: [256]u8 = undefined;
+    const reading = app.activityLine(mock, &line, app.geometry.agents.w);
+    const phase: u8 = @intFromEnum(reading.phase);
+    if (phase != liveness_phase) {
+        liveness_phase = phase;
+        liveness_held = 0;
+    }
+    liveness_held += 1;
+    if (liveness_held < liveness_settled_frames) return;
+    switch (reading.phase) {
+        // The turn is in flight and the harness has been quiet for less than the
+        // stall threshold, which is what a reader sees while an agent thinks.
+        .working => if (!liveness_working) {
+            liveness_working = true;
+            std.log.info("liveness: working reading: \"{s}\" indicator \"{s}\" after {d}ms", .{
+                reading.line, reading.indicator, App.now() -| liveness_started,
+            });
+            if (working_shot) |path| renderer.capture(path) catch |err| std.log.err("liveness: {s}", .{@errorName(err)});
+        } else if (!liveness_named and app.agentCallCount(mock) > 0) {
+            // The harness has said what it is on, and the line names it: the
+            // subject is the latest call's, which is what a reader watching an
+            // agent work wants to know.
+            liveness_named = true;
+            std.log.info("liveness: named reading: \"{s}\" indicator \"{s}\" after {d}ms", .{
+                reading.line, reading.indicator, App.now() -| liveness_started,
+            });
+        },
+        // The same turn past the threshold: nothing has arrived and the line
+        // says so. The run stops here, so the frame the screenshot holds is this
+        // one.
+        .stalled => {
+            liveness_stalled = true;
+            std.log.info("liveness: stalled reading: \"{s}\" indicator \"{s}\" after {d}ms", .{
+                reading.line, reading.indicator, App.now() -| liveness_started,
+            });
+            app.running = false;
+        },
+        else => {},
+    }
+    if (!liveness_stalled and App.now() -| liveness_started > liveness_deadline_ms) {
+        std.log.err("liveness: the turn never read as stalled; the dock still says \"{s}\"", .{reading.line});
+        app.running = false;
+    }
 }
 
 /// What the agent strip reported: the lane a tab click moved the interface to,

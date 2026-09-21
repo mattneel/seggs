@@ -280,6 +280,16 @@ class MockAgent:
         return "\ntool-calls=4"
 
     def complete(self, turn: Turn) -> None:
+        # A harness that thinks, then works, then goes quiet: it takes a moment
+        # before it has anything to say, then names the calls it is making, and
+        # after that nothing arrives at all for the turn - which is what a
+        # harness that has hung, or one that is waiting on something it will
+        # never hear about, looks like from this side of the pipe. Nothing is
+        # ever sent for the turn, so the silence that follows is the real thing.
+        if turn.text.startswith("quiet"):
+            turn.cancelled.wait(2.5)
+            self.tool_calls(turn)
+            return
         try:
             self.update(turn.session_id, {"sessionUpdate": "plan", "entries": [{"content": "Echo the prompt without workspace access", "priority": "medium", "status": "in_progress"}]})
             permission = self.permission(turn) if turn.text.startswith("permission") else ""

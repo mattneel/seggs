@@ -32,6 +32,7 @@ const terminals = @import("services/terminals.zig");
 const tree_widget = @import("ui/tree.zig");
 const menu_widget = @import("ui/menu.zig");
 const tool_call = @import("ui/tool_call.zig");
+const activity = @import("ui/activity.zig");
 const ToolCall = @import("acp/tool_call.zig").ToolCall;
 
 /// Shown in place of a panel when no extension registered one, so a session
@@ -114,6 +115,42 @@ pub const App = struct {
     /// whole strip.
     const agent_tab_min: f32 = 44;
     const agent_tab_max: f32 = 150;
+
+    /// The most bytes one activity line may take. `activity.read` hands back an
+    /// empty line when its buffer cannot hold one, so the buffer is sized for
+    /// the longest line the module can produce - a stalled line carrying the
+    /// longest subject a tool call holds (`tool_call.max_line_bytes`, the chip's
+    /// own bound) with the words around it - rather than for a typical line. The
+    /// dock narrows it further, to the columns it can actually draw.
+    const activity_line_capacity = 256;
+
+    /// What a lane has done since the last frame, and when.
+    ///
+    /// The client says what arrived; it does not say when, and it must not grow
+    /// a clock to say so. This record is where the two meet: a pulse is the
+    /// cheap tuple that changes when *anything* arrives - the transcript the
+    /// prose lands in, the count of tool calls, and the state the lane reports -
+    /// so comparing one frame's pulse against the last is how "something
+    /// arrived" is noticed, and the state's two edges are where a turn starts
+    /// and ends.
+    const Liveness = struct {
+        const Pulse = struct { transcript: usize, tool_events: usize, updates: usize, state: Client.State };
+
+        /// Milliseconds on the editor's clock when the turn began, or zero when
+        /// no turn is in flight. A turn is in flight exactly while the lane
+        /// reports one of the working states.
+        turn_start_ms: u64 = 0,
+        /// Milliseconds on the editor's clock when anything last arrived. This
+        /// is the number that separates working from stuck.
+        last_event_ms: u64 = 0,
+        /// The pulse as of the last frame. It starts at the shape of a lane
+        /// that has never done anything, so the first frame a lane is looked at
+        /// reports an arrival only if something has actually happened.
+        pulse: Pulse = .{ .transcript = 0, .tool_events = 0, .updates = 0, .state = .offline },
+        /// Whether the lane was in a turn at the last frame, which is how the
+        /// two edges of a turn are seen without anyone having to report them.
+        busy: bool = false,
+    };
     const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes", "Show runs", "Compose the run" };
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
@@ -184,6 +221,15 @@ pub const App = struct {
     /// clock, so the same frame of two runs renders the same pixels and a
     /// screenshot comparison is meaningful.
     frame_count: u64 = 0,
+    /// What each lane has done and when, in the order of `clients`. The client
+    /// knows what arrived and stays ignorant of when - deliberately, so the ACP
+    /// layer never reads a clock - and this is the other half: the App watches,
+    /// and the two durations it produces are what the dock is drawn from.
+    liveness: []Liveness,
+    /// The line the dock writes for the chosen lane. It lives on the App rather
+    /// than on the stack of a draw pass because the dock is redrawn every frame
+    /// and `activity.read` writes a line rather than allocating one.
+    activity_line: [activity_line_capacity]u8 = undefined,
     /// Last status an extension wrote, so the same message is applied once. It
     /// must not be compared against the current message, or an extension's stale
     /// one would keep overwriting what the editor says afterwards.
@@ -270,8 +316,13 @@ pub const App = struct {
         const clients = try a.alloc(Client, config.agents.len);
         errdefer a.free(clients);
         for (config.agents, clients) |preset, *client| client.* = Client.init(a, preset, root);
+        // One record per lane, empty until a frame looks at it: a lane that has
+        // been sitting there since startup has not just done something.
+        const liveness = try a.alloc(Liveness, config.agents.len);
+        errdefer a.free(liveness);
+        for (liveness) |*lane| lane.* = .{};
         const cached = try workspace.activeDocument().snapshot(a);
-        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a), .files = tree_widget.Tree.init(a), .shells = terminals.Terminals.init(a) };
+        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .liveness = liveness, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a), .files = tree_widget.Tree.init(a), .shells = terminals.Terminals.init(a) };
         try self.rebuildFiles();
         self.status("F5 starts the selected agent. Ctrl+P opens files.", .{});
         return self;
@@ -289,6 +340,7 @@ pub const App = struct {
         if (self.lsp_client) |*client| client.deinit();
         for (self.clients) |*client| client.deinit();
         self.allocator.free(self.clients);
+        self.allocator.free(self.liveness);
         self.workspace.deinit();
         self.allocator.free(self.cached);
         self.menu_items.deinit(self.allocator);
@@ -435,9 +487,12 @@ pub const App = struct {
         self.pumpTerminal();
         for (self.clients) |*client| client.pump();
         self.advanceRun();
-        const now = c.SDL_GetTicks();
-        if (now -| self.last_watch > 1000) {
-            self.last_watch = now;
+        // What the lanes did is read after they have been pumped, so a byte
+        // that arrived on this frame counts on this frame.
+        const t = App.now();
+        self.observeLiveness(t);
+        if (t -| self.last_watch > 1000) {
+            self.last_watch = t;
             if (self.workspace.externalChanged(self.workspace.activeIndex())) {
                 self.status("File changed on disk. Ctrl+R reloads.", .{});
             }
@@ -3114,6 +3169,127 @@ pub const App = struct {
         try self.sendTo(index);
     }
 
+    // ---- what a lane is doing, and how long it has been doing nothing ------
+    //
+    // The dock draws one line about the chosen lane, and that line rests on two
+    // facts the client cannot give: how long the turn has been running, and how
+    // long it has been since anything arrived. The client knows what arrived and
+    // not when - deliberately, so the ACP layer never reads a clock - so the
+    // clock is read here, the two durations are computed here, and
+    // `ui/activity.zig` turns them into the words a reader scans.
+
+    /// The clock this file times with. SDL's tick counter is the one the frame
+    /// loop already measures with, so there is a single clock here rather than
+    /// two that can disagree; a caller that needs a time asks for it rather
+    /// than reaching for the tick counter itself.
+    pub fn now() u64 {
+        return c.SDL_GetTicks();
+    }
+
+    /// Notice what each lane did since the last frame, and when.
+    ///
+    /// The pulse is compared here and nowhere else. When it moves, something
+    /// arrived - prose landing in the transcript, a tool call, a change of
+    /// state - and that is the instant the lane's silence restarts; when it does
+    /// not move, the lane has said nothing, which is the fact the whole reading
+    /// rests on.
+    ///
+    /// The same observation gives a turn its two edges. The state going busy is
+    /// a prompt that was sent, which is where a turn starts; the state leaving
+    /// busy is a turn that is over, where the timings are cleared - so an idle
+    /// lane stops reporting the silence of a turn that finished, without any
+    /// timer to keep in step. It is read off the state rather than written at
+    /// the places that send, because a prompt leaves the editor from two of them
+    /// (the composer, and a run step) and the client raising `.busy` is the one
+    /// thing every send has in common.
+    fn observeLiveness(self: *App, t: u64) void {
+        for (self.clients, self.liveness) |*client, *live| {
+            const pulse: Liveness.Pulse = .{
+                .transcript = client.transcript.items.len,
+                .tool_events = client.tool_events,
+                // The counter that cannot be fooled: the transcript stops
+                // growing once it is full and drops from the front, so its
+                // length alone would read a working turn as gone quiet.
+                .updates = client.updates,
+                .state = client.state,
+            };
+            const arrived = pulse.transcript != live.pulse.transcript or
+                pulse.tool_events != live.pulse.tool_events or
+                pulse.updates != live.pulse.updates or
+                pulse.state != live.pulse.state;
+            live.pulse = pulse;
+
+            if (!turnInFlight(client.state)) {
+                // No turn, no silence to report: a lane that kept its stamps
+                // would read as stalled for the rest of the session.
+                live.turn_start_ms = 0;
+                live.last_event_ms = 0;
+                live.busy = false;
+                continue;
+            }
+            if (!live.busy) {
+                // This frame is where the turn began, and it has been silent
+                // since the prompt went out.
+                live.turn_start_ms = t;
+                live.last_event_ms = t;
+            } else if (arrived) live.last_event_ms = t;
+            live.busy = true;
+        }
+    }
+
+    /// What one lane looks like to `activity.read`: the lane's own word for its
+    /// state, whether a turn is in flight, and the two durations the record
+    /// above produces. Nothing here guesses at a state - the label, `up` and the
+    /// working states all come from `Client.State`.
+    fn factsOf(self: *const App, index: usize) activity.Facts {
+        const client = &self.clients[index];
+        const live = &self.liveness[index];
+        const t = App.now();
+        const busy = turnInFlight(client.state);
+        return .{
+            .state_label = client.state.label(),
+            .busy = busy,
+            .up = client.state.up(),
+            // Only the failed state has a reason to give. A message left over
+            // from a failure the lane has come back from is not today's news,
+            // and the module drops it when it is empty.
+            .failure = if (client.state == .failed) (client.last_error orelse "") else "",
+            // A duration belongs to a turn, and there is none to measure
+            // without one: zero rather than the age of the last turn.
+            .since_start_ms = if (busy and live.turn_start_ms != 0) t -| live.turn_start_ms else 0,
+            .since_event_ms = if (busy and live.last_event_ms != 0) t -| live.last_event_ms else 0,
+            // What the lane is on now is its latest call; a call from a turn
+            // that is over is not what it is doing, and the module reads an
+            // empty subject as "thinking" rather than printing a gap.
+            .subject = if (busy) lastCallSubject(client) else "",
+            // The indicator moves on the frame count, which is the only clock a
+            // redraw needs: the dock is drawn every frame anyway.
+            .frame = self.frame_count,
+        };
+    }
+
+    /// The reading for a lane, written into `buf` and fitted to the `width` it
+    /// will be drawn in. The buffer is the caller's - the dock hands over the
+    /// one on the App, and a caller that wants the same words for a log hands
+    /// over one of its own - and it is narrowed to the columns the width holds,
+    /// so a line too long loses a whole part rather than its end: on a stalled
+    /// line the end is the number the reader came for.
+    pub fn activityLine(self: *const App, index: usize, buf: []u8, width: f32) activity.Reading {
+        // One column is held back for the indicator that may follow the words,
+        // so a line that fills the dock does not push it off the edge.
+        const usable = @max(0, (width - 28) / self.char_width) - 1;
+        const columns: usize = if (usable > 0) @intFromFloat(usable) else 0;
+        return activity.read(self.factsOf(index), buf[0..@min(buf.len, columns)]);
+    }
+
+    /// Which phase a lane's tab is marked for. A tab has room for a dot and not
+    /// for a line, so the module is asked for the decision alone: a one-byte
+    /// buffer fits no line at all, which is what leaves the line out.
+    fn tabPhase(self: *const App, index: usize) activity.Phase {
+        var nothing: [1]u8 = undefined;
+        return activity.read(self.factsOf(index), &nothing).phase;
+    }
+
     /// The agent dock: which lanes are open, what the chosen one is doing, and
     /// what it has said.
     ///
@@ -3131,9 +3307,26 @@ pub const App = struct {
         try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = 1, .h = bounds.h }, theme.border);
         try self.drawAgentTabs(r);
 
+        // The strip is drawn in its own clip and leaves it behind, so the dock's
+        // body is put back before anything of it is drawn.
+        r.clip = bounds;
+        // What the lane is doing, in one line, directly under the strip and
+        // above the run. It is the first thing in the body of the dock, which is
+        // where a reader's eye already goes, and it makes room for itself: the
+        // run and everything under it start below this line rather than under
+        // it.
+        const doing_y = bounds.y + agent_strip_height + 4;
+        const doing = self.activityLine(self.active, &self.activity_line, bounds.w);
+        try r.text(bounds.x + 14, doing_y, doing.line, doing.color);
+        // The indicator follows the words, and is drawn only while the lane has
+        // something under way: the module hands back an empty string when
+        // nothing should move, which is a fact about the phase and not about
+        // the room left for it.
+        try r.text(bounds.x + 14 + self.char_width * @as(f32, @floatFromInt(doing.line.len + 1)), doing_y, doing.indicator, doing.color);
+
         // The run is evidence, not the navigation: it gets the room that is
-        // left after the strip and the composer.
-        const run_y = bounds.y + agent_strip_height + 14;
+        // left after the strip, the lane's own line, and the composer.
+        const run_y = doing_y + self.line_height + 6;
         const client = &self.clients[self.active];
         const permission = if (client.permission != null) self.permissionRect() else null;
         const run_bottom = if (permission) |rect| rect.y - 8 else bounds.y + bounds.h - 110;
@@ -3411,12 +3604,16 @@ pub const App = struct {
             const active = index == self.active;
             if (active) try r.rect(tab, theme.raised);
             // Every tab is a live agent, so the mark says what it is doing
-            // rather than whether it exists.
-            const working = switch (client.state) {
-                .busy, .cancelling, .initialize, .new_session => true,
-                else => false,
+            // rather than whether it exists - and it says the same thing the
+            // line under the strip says, in the one colour a dot has room for.
+            // A lane that has gone quiet turns red here, which is the only
+            // place a reader can see it from a tab they are not looking at.
+            const mark = switch (self.tabPhase(index)) {
+                .stalled, .failed => theme.red,
+                .starting, .working => theme.amber,
+                else => theme.accent,
             };
-            try r.text(tab.x + 6, tab.y + 4, "●", if (working) theme.amber else theme.accent);
+            try r.text(tab.x + 6, tab.y + 4, "●", mark);
             const room: usize = @intFromFloat(@max(2, (tab.w - 34) / r.atlas.advance));
             // A name longer than the scratch is drawn as it is: the tab's own
             // clip is what cuts it.
@@ -3451,6 +3648,27 @@ pub const App = struct {
         r.clip = screen;
     }
 };
+
+/// Whether a turn is in flight. A prompt is what puts a lane in `busy`, and it
+/// stays there until that request is answered; `cancelling` is the same turn
+/// with a stop asked for, which is still a turn. The startup states are the lane
+/// coming up around a session rather than a turn, and the activity module reads
+/// those from the label the lane publishes. The switch is exhaustive so a state
+/// added to the client is a decision here rather than a silent `false`.
+fn turnInFlight(state: Client.State) bool {
+    return switch (state) {
+        .busy, .cancelling => true,
+        .offline, .initialize, .new_session, .ready, .failed => false,
+    };
+}
+
+/// What a lane's latest tool call was about, or empty when it has made none.
+/// The records are the client's; reading the last one is how the dock says what
+/// the agent is on rather than only how long it has been on it.
+fn lastCallSubject(client: *const Client) []const u8 {
+    const calls = client.toolCalls();
+    return if (calls.len == 0) "" else calls[calls.len - 1].subject;
+}
 
 fn adjust(value: usize, delta: i32, maximum: usize) usize {
     if (delta < 0) return value -| @as(usize, @intCast(-delta));

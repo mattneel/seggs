@@ -73,6 +73,12 @@ const Unsupported = struct {
         return 0;
     }
 
+    pub fn titleAt(_: *const Unsupported, _: usize) ?[]const u8 {
+        return null;
+    }
+
+    pub fn setTitle(_: *Unsupported, _: usize, _: []const u8) !void {}
+
     pub fn activeSession(_: *Unsupported) ?*Session {
         return null;
     }

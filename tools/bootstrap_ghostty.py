@@ -55,7 +55,11 @@ def main() -> int:
              "--destination", str(toolchain), "--version", pin["zig"]])
     source = checkout("ghostty", pin["repository"], pin["commit"])
     environment = {**os.environ, "PATH": f"{toolchain}{os.pathsep}{os.environ['PATH']}"}
-    run([str(toolchain / "zig"), "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast"],
+    # The baseline CPU, so the library this produces is not tied to whichever
+    # machine built it: the build cache travels between machines that do not
+    # have the same instructions, and an artifact compiled for one of them
+    # faults on the next.
+    run([str(toolchain / "zig"), "build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "-Dcpu=baseline"],
         cwd=source, env=environment)
     (prefix / "lib").mkdir(parents=True, exist_ok=True)
     if (prefix / "include/ghostty").exists():

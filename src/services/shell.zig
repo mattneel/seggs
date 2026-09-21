@@ -80,14 +80,22 @@ pub fn integrate(a: Allocator, shell_path: []const u8) !?Plan {
 
     // bash is pointed at the file; zsh is pointed at a directory and reads
     // `.zshrc` out of it, so the two differ only in where it is written.
+    // zsh is pointed at the directory and reads `.zshrc` out of it, so the
+    // variable names the directory while the file is written inside it. A
+    // ZDOTDIR that names the file leaves zsh looking for startup files in a
+    // directory that does not exist, and it runs its first-use setup instead
+    // of reading them.
+    var zdotdir: ?[]u8 = null;
+    defer if (zdotdir) |dir| a.free(dir);
     const where = if (is_bash)
         try files.tempPath(a, "shell", ".bashrc")
     else blk: {
         const dir = try files.tempPath(a, "zdotdir", "");
-        defer a.free(dir);
+        errdefer a.free(dir);
         const dir_z = try a.dupeSentinel(u8, dir, 0);
         defer a.free(dir_z);
         if (!c.SDL_CreateDirectory(dir_z.ptr)) return error.SnippetDirectory;
+        zdotdir = dir;
         break :blk try std.fmt.allocPrint(a, "{s}{c}.zshrc", .{ dir, std.fs.path.sep });
     };
     const where_z = try a.dupeSentinel(u8, where, 0);
@@ -111,9 +119,12 @@ pub fn integrate(a: Allocator, shell_path: []const u8) !?Plan {
     } else {
         // The variable belongs to the process, not to the editor: a shell is
         // the only thing that reads it.
-        plan.variable = .{ .name = "ZDOTDIR", .value = where };
+        // Both the fields and the pair the caller reads point at the plan's
+        // own copies: the temporary path this was built from is freed when
+        // this function returns, and the caller keeps the plan for longer.
         plan.variable_name = try a.dupe(u8, "ZDOTDIR");
-        plan.variable_value = try a.dupe(u8, where);
+        plan.variable_value = try a.dupe(u8, zdotdir.?);
+        plan.variable = .{ .name = plan.variable_name, .value = plan.variable_value };
     }
     return plan;
 }
@@ -145,4 +156,14 @@ test "a shell the integration knows is given its markers, and another is not" {
     try std.testing.expectEqualStrings("/bin/zsh", zsh.argv[0]);
     try std.testing.expect(zsh.variable != null);
     try std.testing.expectEqualStrings("ZDOTDIR", zsh.variable.?.name);
+    // zsh reads `$ZDOTDIR/.zshrc`, so the variable names a directory and the
+    // snippet lives inside it. A variable that names the file itself leaves
+    // zsh with no startup file to read, and it runs its first-use setup
+    // instead of starting the shell.
+    const expected = try std.fmt.allocPrint(a, "{s}{c}.zshrc", .{ zsh.variable.?.value, std.fs.path.sep });
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, zsh.snippet);
+    const zshrc = try files.read(a, zsh.snippet, 4096);
+    defer a.free(zshrc);
+    try std.testing.expect(std.mem.indexOf(u8, zshrc, "zshrc") != null);
 }

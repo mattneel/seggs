@@ -9,9 +9,11 @@ const c = @import("std").c;
 pub const Pty = if (builtin.os.tag == .windows) Unsupported else Posix;
 
 const Unsupported = struct {
-    pub fn spawn(_: std.mem.Allocator, _: []const []const u8) !Unsupported {
+    pub fn spawn(_: std.mem.Allocator, _: []const []const u8, _: u16, _: u16) !Unsupported {
         return error.PtyUnsupported;
     }
+
+    pub fn resize(_: *Unsupported, _: u16, _: u16) void {}
 
     pub fn readOutput(_: *Unsupported, _: []u8) !usize {
         return error.PtyUnsupported;
@@ -34,14 +36,26 @@ const Posix = struct {
     pid: c_int,
 
     extern fn forkpty(amaster: *c_int, name: ?*anyopaque, termp: ?*anyopaque, winp: ?*anyopaque) c_int;
+    extern fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
+
+    /// The kernel's own number for "set the window size", which is what tells
+    /// the program on the other end of the terminal how much room it has.
+    const TIOCSWINSZ: c_ulong = switch (builtin.os.tag) {
+        .linux => std.os.linux.T.IOCSWINSZ,
+        else => 0x80087467,
+    };
     extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;
     extern fn close(fd: c_int) c_int;
     extern fn execvp(file: [*:0]const u8, argv: ?*anyopaque) c_int;
 
-    pub fn spawn(a: std.mem.Allocator, argv: []const []const u8) !Posix {
+    pub fn spawn(a: std.mem.Allocator, argv: []const []const u8, cols: u16, rows: u16) !Posix {
         if (argv.len == 0) return error.EmptyCommand;
         var master: c_int = 0;
-        const pid = forkpty(&master, null, null, null);
+        // The size travels with the terminal, not after it: a program that
+        // starts life on a zero-width screen lays its prompt out to nothing
+        // and stays that way until something tells it otherwise.
+        var size = std.posix.winsize{ .col = cols, .row = rows, .xpixel = 0, .ypixel = 0 };
+        const pid = forkpty(&master, null, null, @as(*anyopaque, @ptrCast(&size)));
         if (pid < 0) return error.Forkpty;
         if (pid == 0) {
             // Child: run the command on the slave terminal.
@@ -82,6 +96,13 @@ const Posix = struct {
         if (flags < 0) return error.PtyFlags;
         const nonblock: u32 = @bitCast(std.posix.O{ .NONBLOCK = true });
         if (c.fcntl(self.master, std.posix.F.SETFL, flags | @as(c_int, @intCast(nonblock))) < 0) return error.PtyFlags;
+    }
+
+    /// Tell the program on the other end how much room it has. The kernel
+    /// delivers this as SIGWINCH, which is how a shell knows to redraw.
+    pub fn resize(self: *Posix, cols: u16, rows: u16) void {
+        var size = std.posix.winsize{ .col = cols, .row = rows, .xpixel = 0, .ypixel = 0 };
+        _ = ioctl(self.master, TIOCSWINSZ, @as(*anyopaque, @ptrCast(&size)));
     }
 
     pub fn deinit(self: *Posix) void {

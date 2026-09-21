@@ -509,6 +509,18 @@ fn exerciseTabs(app: *App, frame: usize) void {
         16 => app.moveTerminalTab(false),
         20 => app.closeTerminalTab(),
         24 => app.shells.select(0),
+        28 => {
+            // Toggling the view twice is a round trip: it puts the dock away
+            // and brings it back. Anything that starts a shell here turns one
+            // key into a row of tabs.
+            const before = app.shells.count();
+            app.toggleTerminal() catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
+            if (app.terminalOpen()) std.log.err("tabs: the dock stayed up", .{});
+            app.toggleTerminal() catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
+            if (!app.terminalOpen()) std.log.err("tabs: the dock did not come back", .{});
+            if (app.shells.count() != before) std.log.err("tabs: toggling started a shell", .{});
+            std.log.info("tabs: toggle kept {d} shell(s) and the dock is {s}", .{ app.shells.count(), if (app.terminalOpen()) "up" else "down" });
+        },
         50 => {
             // A drag over the screen, then the copy key: what a reader does with
             // a terminal's output before sending it somewhere. The shells have

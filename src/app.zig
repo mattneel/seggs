@@ -171,6 +171,9 @@ pub const App = struct {
     terminal_encode: [256]u8 = undefined,
     /// The fraction of the body the terminal dock takes when it is open.
     terminal_fraction: f32 = 0.28,
+    /// Whether the dock is on screen. The sessions keep running while it is
+    /// away: this is the dock, not the shells.
+    terminal_shown: bool = true,
     char_width: f32 = 10,
     line_height: f32 = 22,
     last_watch: u64 = 0,
@@ -1478,18 +1481,24 @@ pub const App = struct {
     /// Open or close the shell dock. The shell starts on first use and keeps
     /// running while the dock is closed, so closing it is not killing it.
     pub fn toggleTerminal(self: *App) !void {
-        if (self.terminalOpen()) {
+        // Whether there is anything to show and whether it is on screen are
+        // two questions. Asking the second one first reads "the dock is put
+        // away" as "there are no sessions", and answers by starting another
+        // shell every time the key is pressed.
+        if (self.shells.count() == 0) return self.newTerminalTab();
+        self.terminal_shown = !self.terminal_shown;
+        if (self.terminal_shown) {
+            self.status("Terminal shown.", .{});
+        } else {
             if (self.focus == .terminal) self.focus = .editor;
             self.status("Terminal hidden. Ctrl+` brings it back.", .{});
-            return;
         }
-        try self.newTerminalTab();
     }
 
-    /// Whether the dock is showing. The dock is open when there is a session to
-    /// show, so closing every tab closes the dock.
+    /// Whether the dock is on screen: there is a session to show and the dock
+    /// has not been put away.
     pub fn terminalOpen(self: *const App) bool {
-        return self.shells.count() > 0;
+        return self.terminal_shown and self.shells.count() > 0;
     }
 
     fn activeTerminal(self: *App) ?*vt.Terminal {
@@ -1529,6 +1538,7 @@ pub const App = struct {
         };
         // The editor polls the shell; a blocking read would stall the frame.
         if (self.shells.activeSession()) |session| session.shell.setNonBlocking() catch {};
+        self.terminal_shown = true;
         self.focus = .terminal;
         self.status("Terminal {d} of {d}.", .{ index + 1, self.shells.count() });
     }
@@ -1711,6 +1721,10 @@ pub const App = struct {
             const rows: u16 = @intFromFloat(@max(1, @floor((bounds.h - 8) / self.line_height)));
             if (cols != terminal.cols() or rows != terminal.rows()) {
                 terminal.resize(cols, rows, @intFromFloat(@round(self.char_width)), @intFromFloat(@round(self.line_height))) catch {};
+                // The emulator's size and the shell's are two different
+                // terminals until this says so: without it the program keeps
+                // laying its output out for whatever it was told at birth.
+                self.shells.resizeActive(cols, rows);
             }
         }
         terminal.update() catch {};

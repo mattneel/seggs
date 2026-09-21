@@ -685,7 +685,7 @@ test "the host loads a bundle whose source comes from a file" {
 test "a terminal read returns nothing rather than blocking when idle" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var shell = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "sleep 5" });
+    var shell = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "sleep 5" }, 80, 24);
     defer shell.deinit();
     try shell.setNonBlocking();
     var buffer: [256]u8 = undefined;
@@ -734,10 +734,64 @@ test "the explorer omits directories the project generates" {
     try std.testing.expect(saw_source);
 }
 
+test "a shell is told how big its terminal is, and told again when it changes" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var p = try pty.Pty.spawn(a, &.{"/bin/sh"}, 80, 24);
+    defer p.deinit();
+    // The shell asks the kernel, which is the only thing that knows: this is
+    // the size the program lays its prompt and its output out for. A terminal
+    // that never says is a terminal of no width, and the program draws
+    // nothing.
+    try p.writeInput("stty size\n");
+    var buf: [4096]u8 = undefined;
+    var n: usize = 0;
+    while (n < buf.len and std.mem.indexOf(u8, buf[0..n], "24 80") == null) {
+        const count = p.readOutput(buf[n..]) catch break;
+        if (count == 0) break;
+        n += count;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "24 80") != null);
+
+    // Resizing the dock has to reach the shell the same way, or the program
+    // keeps drawing for the terminal it was born with.
+    p.resize(120, 40);
+    try p.writeInput("stty size\n");
+    n = 0;
+    while (n < buf.len and std.mem.indexOf(u8, buf[0..n], "40 120") == null) {
+        const count = p.readOutput(buf[n..]) catch break;
+        if (count == 0) break;
+        n += count;
+    }
+    try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "40 120") != null);
+}
+
+test "a shell's first prompt arrives without any input being sent" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var p = try pty.Pty.spawn(a, &.{"/bin/sh"}, 80, 24);
+    defer p.deinit();
+    // The editor polls rather than blocks, so the read that finds nothing yet
+    // has to leave the output for the next one. A shell that only speaks when
+    // spoken to would show an empty terminal until the first keystroke, which
+    // is what a reader sees as a terminal that never opened.
+    try p.setNonBlocking();
+    var buf: [4096]u8 = undefined;
+    var n: usize = 0;
+    var tries: usize = 0;
+    // The editor comes back to this every frame; the loop here just stands in
+    // for enough frames that a shell which is going to speak has spoken.
+    while (n == 0 and tries < 200_000) : (tries += 1) {
+        const count = p.readOutput(buf[n..]) catch break;
+        n += count;
+    }
+    try std.testing.expect(n > 0);
+}
+
 test "pty spawns a shell and echoes output" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var p = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "echo seggs-pty" });
+    var p = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "echo seggs-pty" }, 80, 24);
     defer p.deinit();
     var buf: [1024]u8 = undefined;
     var n: usize = 0;

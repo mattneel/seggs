@@ -65,6 +65,8 @@ const Unsupported = struct {
 
     pub fn close(_: *Unsupported, _: usize) void {}
 
+    pub fn resizeActive(_: *Unsupported, _: u16, _: u16) void {}
+
     pub fn move(_: *Unsupported, _: usize, _: usize) void {}
 
     pub fn select(_: *Unsupported, _: usize) void {}
@@ -106,7 +108,7 @@ const Posix = struct {
     /// Add a session and make it the one showing, which is what opening a tab
     /// means.
     pub fn spawn(self: *Posix, argv: []const []const u8, cols: u16, rows: u16, title: []const u8) !usize {
-        var shell = try pty.Pty.spawn(self.allocator, argv);
+        var shell = try pty.Pty.spawn(self.allocator, argv, cols, rows);
         errdefer shell.deinit();
         var terminal = try vt.Terminal.init(self.allocator, cols, rows);
         errdefer terminal.deinit();
@@ -148,6 +150,12 @@ const Posix = struct {
         if (self.sessions.items.len == 0) return null;
         if (self.active >= self.sessions.items.len) self.active = self.sessions.items.len - 1;
         return &self.sessions.items[self.active];
+    }
+
+    /// Keep the shell's idea of the terminal the same as the dock's.
+    pub fn resizeActive(self: *Posix, cols: u16, rows: u16) void {
+        const session = self.activeSession() orelse return;
+        session.shell.resize(cols, rows);
     }
 
     pub fn titleAt(self: *const Posix, index: usize) ?[]const u8 {

@@ -636,8 +636,8 @@ fn exerciseTabs(app: *App, frame: usize) void {
         // More exits than there are shells: the count varies with what the
         // fixture opened above, and an exit typed at a shell that has already
         // gone lands on nothing.
-        70, 74, 78, 82, 86 => if (app.activeShell()) |shell| shell.writeInput("exit\n") catch {},
-        90 => std.log.info("tabs: after exit {d} shell(s) remain, dock is {s}", .{
+        244, 248, 252, 256, 260 => if (app.activeShell()) |shell| shell.writeInput("exit\n") catch {},
+        266 => std.log.info("tabs: after exit {d} shell(s) remain, dock is {s}", .{
             app.shells.count(),
             if (app.terminalOpen()) "up" else "down",
         }),
@@ -654,20 +654,29 @@ fn exerciseTabs(app: *App, frame: usize) void {
             std.log.info("tabs: toggle kept {d} shell(s) and the dock is {s}", .{ app.shells.count(), if (app.terminalOpen()) "up" else "down" });
         },
         50 => {
-            // A drag over the screen, then the copy key: what a reader does with
-            // a terminal's output before sending it somewhere.
-            app.terminal_selection = .{ .anchor = .{ .x = 0, .y = 0 }, .cursor = .{ .x = 12, .y = 0 } };
+            // A line to take, typed rather than waited for. A shell prints a
+            // prompt when it is ready and that prompt is not at a frame anyone
+            // can name - on a cold runner it is seconds away - so the fixture
+            // puts something on the screen it can rely on. The write reaches the
+            // pty and the shell reads it whenever it comes up.
+            app.terminalInput("echo seggs-tabs\r") catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
         },
-        51...61, 65...68 => {
+        51...61, 65...240 => {
             if (frame == 60) std.log.info("tabs: {d} open, showing {d} of {d}", .{
                 app.shells.count(),
                 app.shells.active + 1,
                 app.shells.count(),
             });
-            // A prompt arrives when the shell is ready rather than at a frame
-            // number, and a shell that has printed nothing has nothing to copy.
-            // So the copy is tried again each frame until it finds text, and the
-            // line is reported when it does - which is what the gate reads.
+            // A drag over the screen, then the copy key: what a reader does with
+            // a terminal's output before sending it somewhere. The screen is
+            // empty until that line lands, and nothing copies nothing, so the
+            // copy is tried each frame until it takes and the line the gate
+            // reads is written the moment it does. The window is the same one
+            // the terminal fixture's shell gets, which is known to be enough on
+            // the platforms this runs on.
+            if (app.terminal_selection == null) {
+                app.terminal_selection = .{ .anchor = .{ .x = 0, .y = 0 }, .cursor = .{ .x = 20, .y = 0 } };
+            }
             if (tabs_copied) return;
             if (std.mem.indexOf(u8, app.statusText(), "Copied") != null) {
                 tabs_copied = true;
@@ -676,7 +685,7 @@ fn exerciseTabs(app: *App, frame: usize) void {
             }
             app.copyTerminalSelection() catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
         },
-        69 => if (!tabs_copied) std.log.err("tabs: nothing was selected in the terminal", .{}),
+        241 => if (!tabs_copied) std.log.err("tabs: nothing was selected in the terminal", .{}),
         // The shell list: what this machine can run in a tab, rather than
         // whatever SHELL happens to name. It comes after the report at sixty,
         // so that report is still the arithmetic the move and the close left

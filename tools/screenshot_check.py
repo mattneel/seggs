@@ -852,7 +852,11 @@ def check_tabs(binary: str) -> None:
     """The terminal's tabs: adding, moving, and closing all agree on which is
     showing. The fixture does each in turn and reports where it ended up, which
     is the arithmetic a tab strip gets wrong."""
-    command = display_command([binary, "--windowed", "--frames", "90", "--exercise-tabs"], app_env())
+    # The same budget the terminal fixture gets, and for the same reason: a
+    # shell needs seconds to come up on a cold runner, and this fixture waits for
+    # one to print before it takes a selection from the screen. Ninety frames
+    # was enough on a warm machine and a race on every other.
+    command = display_command([binary, "--windowed", "--frames", "300", "--exercise-tabs"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     output = app_output(result)
     tabs = TABS_LINE.search(output)

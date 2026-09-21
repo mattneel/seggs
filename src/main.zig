@@ -657,8 +657,7 @@ fn exerciseTabs(app: *App, frame: usize) void {
             // A line to take, typed rather than waited for. A shell prints a
             // prompt when it is ready and that prompt is not at a frame anyone
             // can name - on a cold runner it is seconds away - so the fixture
-            // puts something on the screen it can rely on. The write reaches the
-            // pty and the shell reads it whenever it comes up.
+            // puts something on the screen it can rely on.
             app.terminalInput("echo seggs-tabs\r") catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
         },
         51...61, 65...240 => {
@@ -674,6 +673,14 @@ fn exerciseTabs(app: *App, frame: usize) void {
             // reads is written the moment it does. The window is the same one
             // the terminal fixture's shell gets, which is known to be enough on
             // the platforms this runs on.
+            // Again every sixty frames, for a shell that was not up when the
+            // first line was written. A pty takes a write before its program is
+            // running, but a tab opened a moment ago may have no shell at all
+            // yet, and a fixture that talks to nothing on the first try never
+            // talks again.
+            if (!tabs_copied and frame % 60 == 50) {
+                app.terminalInput("echo seggs-tabs\r") catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
+            }
             if (app.terminal_selection == null) {
                 app.terminal_selection = .{ .anchor = .{ .x = 0, .y = 0 }, .cursor = .{ .x = 20, .y = 0 } };
             }

@@ -876,6 +876,15 @@ def check_tabs(binary: str) -> None:
     # The same fixture drags over the screen and copies: a selection that never
     # reaches the clipboard is a selection that does nothing.
     copied = TABS_COPY.search(output)
+    if copied is None:
+        # The run's own output is the only thing that explains a missing line,
+        # and this one has two ways to go missing: the copy found nothing on the
+        # screen, or the platform would not take the text. Which it was is in
+        # the status the fixture reported.
+        print("  the terminal copy reported nothing; the fixture said:")
+        for line in output.splitlines():
+            if "tabs:" in line:
+                print(f"    {line}")
     require(copied is not None, "selecting in the terminal reported nothing")
     require(int(copied.group(1)) > 0, "a selection in the terminal copied nothing")
     print(

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("native");
 const Workspace = @import("editor/workspace.zig").Workspace;
 const Document = @import("editor/document.zig").Document;
@@ -1387,11 +1388,17 @@ pub const App = struct {
             if (plan == null) self.status("terminal: {s} reports no command boundaries", .{std.fs.path.basename(shell_path)});
             if (plan) |value| {
                 if (value.variable) |variable| {
-                    const name = self.allocator.dupeSentinel(u8, variable.name, 0) catch null;
-                    defer if (name) |bytes| self.allocator.free(bytes);
-                    const setting = self.allocator.dupeSentinel(u8, variable.value, 0) catch null;
-                    defer if (setting) |bytes| self.allocator.free(bytes);
-                    if (name != null and setting != null) _ = c.setenv(name.?, setting.?, 1);
+                    // Setting a variable for the child is how zsh is pointed at
+                    // the snippet, and it is a POSIX thing: the shells this
+                    // knows are not the ones a Windows terminal runs. The
+                    // branch is comptime, so nothing here is analysed there.
+                    if (builtin.os.tag != .windows) {
+                        const name = self.allocator.dupeSentinel(u8, variable.name, 0) catch null;
+                        defer if (name) |bytes| self.allocator.free(bytes);
+                        const setting = self.allocator.dupeSentinel(u8, variable.value, 0) catch null;
+                        defer if (setting) |bytes| self.allocator.free(bytes);
+                        if (name != null and setting != null) _ = c.setenv(name.?, setting.?, 1);
+                    }
                 }
             }
             const shell_argv: []const []const u8 = if (plan) |value| value.argv else &.{shell_path};

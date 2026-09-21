@@ -13,6 +13,9 @@ test {
     // read by the drawing path rather than by each other.
     _ = @import("ui/markdown.zig");
     _ = @import("ui/diff.zig");
+    // What a lane says about itself: the line a reader glances at, and the
+    // difference between working and stuck.
+    _ = @import("ui/activity.zig");
     _ = @import("editor/review.zig");
     _ = @import("editor/prompt.zig");
     _ = @import("editor/runs.zig");

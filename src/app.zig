@@ -1654,7 +1654,7 @@ pub const App = struct {
     /// showing marked, and a way to add another and to close one.
     fn drawTerminalTabs(self: *App, r: *Renderer) !void {
         const bounds = self.geometry.terminal;
-        const strip: Rect = .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 26 };
+        const strip: Rect = .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = layout.Layout.terminal_strip_height };
         r.clip = strip;
         try r.rect(strip, theme.panel);
         var x = strip.x + 6;
@@ -1716,14 +1716,17 @@ pub const App = struct {
         }
         if (self.terminal_read.items.len != 0) terminal.write(self.terminal_read.items);
         if (self.terminalOpen()) {
-            const bounds = self.geometry.terminal;
+            const bounds = layout.Layout.terminalScreen(self.geometry.terminal);
             const cols: u16 = @intFromFloat(@max(2, @floor((bounds.w - 8) / self.char_width)));
             const rows: u16 = @intFromFloat(@max(1, @floor((bounds.h - 8) / self.line_height)));
             if (cols != terminal.cols() or rows != terminal.rows()) {
-                terminal.resize(cols, rows, @intFromFloat(@round(self.char_width)), @intFromFloat(@round(self.line_height))) catch {};
                 // The emulator's size and the shell's are two different
                 // terminals until this says so: without it the program keeps
                 // laying its output out for whatever it was told at birth.
+                terminal.resize(cols, rows, @intFromFloat(@round(self.char_width)), @intFromFloat(@round(self.line_height))) catch |err| {
+                    self.status("terminal: cannot resize ({s})", .{@errorName(err)});
+                    return;
+                };
                 self.shells.resizeActive(cols, rows);
             }
         }
@@ -1734,7 +1737,7 @@ pub const App = struct {
     /// glyph, then the cursor where the program put it.
     fn drawTerminal(self: *App, r: *Renderer) !void {
         const terminal = self.activeTerminal() orelse return;
-        const bounds = self.geometry.terminal;
+        const bounds = layout.Layout.terminalScreen(self.geometry.terminal);
         if (bounds.h <= 0 or bounds.w <= 0) return;
         // The emulator owns the dock's colors; the editor's theme is the
         // fallback for the case where it cannot answer at all.

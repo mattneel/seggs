@@ -84,7 +84,20 @@ const Posix = struct {
         var offset: usize = 0;
         while (offset < bytes.len) {
             const n = write(self.master, bytes[offset..].ptr, bytes.len - offset);
-            if (n < 0) return error.PtyWrite;
+            if (n < 0) {
+                // The master is non-blocking so that reading never stalls a
+                // frame, and the same flag applies to writing. A keystroke
+                // that waited for room rather than being dropped is the
+                // difference between typing and typing that does not arrive.
+                if (std.posix.errno(@as(isize, -1)) != .AGAIN) return error.PtyWrite;
+                var waiting = [_]std.posix.pollfd{.{
+                    .fd = self.master,
+                    .events = std.posix.POLL.OUT,
+                    .revents = 0,
+                }};
+                _ = std.posix.poll(&waiting, 100) catch {};
+                continue;
+            }
             offset += @intCast(n);
         }
     }

@@ -39,6 +39,23 @@ pub const Layout = struct {
 
     /// The metrics the shell uses with its default font, for callers that only
     /// need a layout and tests that check the shape of one.
+    /// The tab strip along the top of the terminal dock. It belongs to the dock
+    /// rather than to the screen inside it, and the grid starts under it.
+    pub const terminal_strip_height: f32 = 26;
+
+    /// The part of the dock the shell's screen occupies. The size the shell is
+    /// told and the place its output is drawn have to be the same rectangle, or
+    /// the program lays out rows for space the reader cannot see - which is how a
+    /// prompt ends up underneath the tabs.
+    pub fn terminalScreen(dock: Rect) Rect {
+        return .{
+            .x = dock.x,
+            .y = dock.y + terminal_strip_height,
+            .w = dock.w,
+            .h = @max(0, dock.h - terminal_strip_height),
+        };
+    }
+
     pub fn calculateDefault(width: f32, height: f32, sidebar: bool) Layout {
         return calculate(width, height, sidebar, .{ .line_height = 22, .char_width = 9.5 }, 0);
     }
@@ -107,6 +124,22 @@ pub const Layout = struct {
         };
     }
 };
+
+test "the shell's screen sits below the tab strip and fits inside the dock" {
+    const dock: Rect = .{ .x = 100, .y = 500, .w = 600, .h = 216 };
+    const screen = Layout.terminalScreen(dock);
+    // The strip is the dock's, so the screen starts under it and is shorter by
+    // exactly that much. A grid told it has the strip's rows too draws its
+    // first line where the tabs are, which is a prompt nobody can see.
+    try std.testing.expectEqual(dock.y + Layout.terminal_strip_height, screen.y);
+    try std.testing.expectEqual(dock.h - Layout.terminal_strip_height, screen.h);
+    try std.testing.expectEqual(dock.w, screen.w);
+    // Whole rows have to fit, at the height the shell is told about.
+    const rows = @floor((screen.h - 8) / 22);
+    try std.testing.expect(rows * 22 <= screen.h);
+    // A dock too short for a strip leaves nothing rather than a negative box.
+    try std.testing.expectEqual(@as(f32, 0), Layout.terminalScreen(.{ .x = 0, .y = 0, .w = 10, .h = 10 }).h);
+}
 
 test "panels tile the window" {
     const l = Layout.calculateDefault(1440, 900, true);

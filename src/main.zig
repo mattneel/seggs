@@ -34,6 +34,7 @@ fn run(init: std.process.Init) !void {
     var file_arg: ?[]const u8 = null;
     var config_arg: ?[]const u8 = null;
     var font_arg: ?[]const u8 = null;
+    var theme_arg: ?[]const u8 = null;
     var screenshot_arg: ?[]const u8 = null;
     var exercise_window = false;
     var exercise_ime = false;
@@ -85,6 +86,8 @@ fn run(init: std.process.Init) !void {
                 config_arg = value;
             } else if (std.mem.eql(u8, arg, "--font")) {
                 font_arg = value;
+            } else if (std.mem.eql(u8, arg, "--theme")) {
+                theme_arg = value;
             } else if (std.mem.eql(u8, arg, "--window-size")) {
                 var parts = std.mem.splitScalar(u8, value, 'x');
                 window_width = std.fmt.parseInt(c_int, parts.next() orelse "1440", 10) catch return error.BadWindowSize;
@@ -167,6 +170,16 @@ fn run(init: std.process.Init) !void {
         std.log.info("extensions: {d} loaded; status: {s}", .{ loaded, host.status() });
     } else {
         std.log.info("extensions: none loaded from {s}", .{extension_dir});
+    }
+    if (theme_arg) |path| {
+        // Loading a theme is not fatal: an editor that refuses to start because
+        // a colour file has a typo in it is worse than one that starts in its
+        // own palette and says what went wrong.
+        const resolved = try std.fs.path.resolve(arena, &.{ root, path });
+        app.loadTheme(resolved) catch |err| {
+            app.status("theme {s}: {s}", .{ path, @errorName(err) });
+            std.log.err("theme {s}: {s}", .{ resolved, @errorName(err) });
+        };
     }
     if (file_arg) |path| {
         const resolved = try std.fs.path.resolve(arena, &.{ root, path });
@@ -511,8 +524,8 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
 fn exerciseTabs(app: *App, frame: usize) void {
     switch (frame) {
         4 => app.toggleTerminal() catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
-        8 => app.newTerminalTab() catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
-        12 => app.newTerminalTab() catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
+        8 => app.newTerminalTab(null) catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
+        12 => app.newTerminalTab(null) catch |err| std.log.err("tabs: {s}", .{@errorName(err)}),
         16 => app.moveTerminalTab(false),
         20 => app.closeTerminalTab(),
         24 => app.shells.select(0),
@@ -520,8 +533,10 @@ fn exerciseTabs(app: *App, frame: usize) void {
         // `exit` in the shell is the one thing a reader types in a terminal
         // that means "I am done here", and the tab goes with it. The second
         // one leaves nothing behind, so the dock goes too.
-        70 => if (app.activeShell()) |shell| shell.writeInput("exit\n") catch {},
-        78 => if (app.activeShell()) |shell| shell.writeInput("exit\n") catch {},
+        // More exits than there are shells: the count varies with what the
+        // fixture opened above, and an exit typed at a shell that has already
+        // gone lands on nothing.
+        70, 74, 78, 82, 86 => if (app.activeShell()) |shell| shell.writeInput("exit\n") catch {},
         90 => std.log.info("tabs: after exit {d} shell(s) remain, dock is {s}", .{
             app.shells.count(),
             if (app.terminalOpen()) "up" else "down",
@@ -553,6 +568,13 @@ fn exerciseTabs(app: *App, frame: usize) void {
             });
             std.log.info("tabs: copy reported {s}", .{app.statusText()});
         },
+        // The shell list: what this machine can run in a tab, rather than
+        // whatever SHELL happens to name. It comes after the report at sixty,
+        // so that report is still the arithmetic the move and the close left
+        // rather than the count this tab adds to it.
+        62 => pushKeyMod(c.SDLK_T, c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT),
+        63 => pushKey(c.SDLK_RETURN),
+        64 => std.log.info("tabs: shells: {s}", .{app.statusText()}),
         else => {},
     }
 }
@@ -586,41 +608,35 @@ fn exerciseCompose(app: *App, frame: usize) void {
     }
 }
 
-/// What the agent strip reported: the lane a tab click selected, so the frame
-/// that says what F5 did can name the same lane the click did.
+/// What the agent strip reported: the lane a tab click moved the interface to,
+/// so the frame that says what the click did can name the same lane.
 var tab_clicked = false;
 var tab_name: []const u8 = "";
 
+/// Whether the dock's own controls are part of this run at all. They are when a
+/// lane is running in a window with room for the dock; a window too narrow for
+/// columns drops the dock, and that run is a different check. Where the dock
+/// cannot be clicked the fixture says so in a line the gate reads, rather than
+/// leaving the steps it could not take looking like steps that passed.
+var dock_clickable = false;
+
+/// Whether the panel click was actually pushed, so the frames that report what
+/// it did only report it when it happened.
+var panel_clicked = false;
+
 fn exerciseClick(app: *App, frame: usize) void {
     switch (frame) {
-        6 => {
-            const point = app.panelPoint("transcript") orelse {
-                std.log.warn("click: no transcript panel was drawn", .{});
-                return;
-            };
-            var ev = std.mem.zeroes(c.SDL_Event);
-            ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
-            ev.button.button = c.SDL_BUTTON_LEFT;
-            ev.button.clicks = 1;
-            ev.button.x = point.x;
-            ev.button.y = point.y;
-            if (!c.SDL_PushEvent(&ev)) std.log.warn("click not delivered: {s}", .{c.SDL_GetError()});
-        },
-        7 => std.log.info("click: status is now {s}", .{app.message_()}),
-        8 => pushKey(c.SDLK_TAB),
-        9 => pushKey(c.SDLK_RETURN),
-        11 => std.log.info("click: activate status is now {s}", .{app.message_()}),
         12 => {
             // Opening a file from the explorer: the request travels from the
             // panel to the editor and back as a status message.
             // The navigator is native, so the fixture clicks a row of the tree
             // rather than a panel an extension used to draw there.
             const row = app.explorerFirstFileRow() orelse {
-                std.log.warn("open: no file row was drawn", .{});
+                std.log.err("click: FAIL - no explorer row was drawn, so the click had nothing to land on", .{});
                 return;
             };
             const point = app.explorerRowPoint(row) orelse {
-                std.log.warn("open: that row is not on screen", .{});
+                std.log.err("click: FAIL - that explorer row is not on screen", .{});
                 return;
             };
             var ev = std.mem.zeroes(c.SDL_Event);
@@ -632,11 +648,34 @@ fn exerciseClick(app: *App, frame: usize) void {
             if (!c.SDL_PushEvent(&ev)) std.log.warn("open click not delivered: {s}", .{c.SDL_GetError()});
         },
         14 => std.log.info("open: status is now {s}", .{app.message_()}),
+        // A lane has to be running before anything the dock draws is clicked:
+        // the dock is on screen exactly while something is running in it, and a
+        // lane nobody has started is offered by the list of templates rather
+        // than drawn as a tab. The list opens from the keyboard, which is what
+        // a reader with a collapsed dock has.
+        15 => pushKeyMod(c.SDLK_A, c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT),
+        16 => {
+            pushInput("mock");
+            // Moving the pointer onto a row has to reach the panel that drew
+            // it. The navigator is native now, so the pointer is moved over a
+            // panel an extension still draws: the check is that a panel takes
+            // events, and the tab strip is one.
+            const point = app.hoverPoint("tabs") orelse {
+                std.log.err("click: FAIL - the editor's tab strip was not drawn, so the pointer had nowhere to move", .{});
+                return;
+            };
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_MOUSE_MOTION;
+            ev.motion.x = point.x;
+            ev.motion.y = point.y;
+            if (!c.SDL_PushEvent(&ev)) std.log.warn("hover not delivered: {s}", .{c.SDL_GetError()});
+        },
+        17 => pushKey(c.SDLK_RETURN),
         18 => {
             // The rail is the region every width keeps, so clicking it is what a
             // narrow window can still do.
             const point = app.panelFocusPoint("activity") orelse {
-                std.log.warn("rail: no rail entry was drawn", .{});
+                std.log.err("click: FAIL - the activity rail was not drawn, so the click had nothing to land on", .{});
                 return;
             };
             var ev = std.mem.zeroes(c.SDL_Event);
@@ -647,57 +686,27 @@ fn exerciseClick(app: *App, frame: usize) void {
             ev.button.y = point.y;
             if (!c.SDL_PushEvent(&ev)) std.log.warn("rail click not delivered: {s}", .{c.SDL_GetError()});
         },
-        16 => {
-            // Moving the pointer onto a row has to reach the panel that drew it.
-            // The navigator is native now, so the pointer is moved over a panel
-            // an extension still draws: the check is that a panel takes events,
-            // and the tab strip is one.
-            const point = app.hoverPoint("tabs") orelse {
-                std.log.warn("hover: no tab was drawn", .{});
-                return;
-            };
-            var ev = std.mem.zeroes(c.SDL_Event);
-            ev.type = c.SDL_EVENT_MOUSE_MOTION;
-            ev.motion.x = point.x;
-            ev.motion.y = point.y;
-            if (!c.SDL_PushEvent(&ev)) std.log.warn("hover not delivered: {s}", .{c.SDL_GetError()});
+        19 => {
+            // The frame the lane has had to come up by. Everything below that
+            // aims at the dock is inside it, so this is the frame that says
+            // whether there is a dock to aim at, and which of the two reasons
+            // there is not.
+            dock_clickable = app.agentsOpen() and app.geometry.agents.w > 0;
+            if (dock_clickable) {
+                std.log.info("agents: {s} is {s} and the dock is up", .{ app.agentName(app.active), app.agentState(app.active).label() });
+            } else if (app.agentsOpen()) {
+                std.log.warn("click: skipped - this window has no room for the agent dock, so its controls are not part of this run", .{});
+            } else {
+                std.log.err("click: FAIL - no lane came up, so the dock stayed collapsed and none of its controls were drawn", .{});
+            }
         },
-        15 => {
-            // The agent dock's strip is the dock's navigation: the click lands
-            // on a lane's tab, and the lane is what the interface then works
-            // on. F5 two frames later starts that lane, which is how the click
-            // is observable from outside: the status names the lane it started.
-            const mock = app.agentIndex("Local mock") orelse {
-                std.log.warn("tabs: no local mock profile", .{});
-                return;
-            };
-            const point = app.agentTabPoint(mock) orelse {
-                std.log.warn("tabs: no agent tab was drawn", .{});
-                return;
-            };
-            tab_clicked = true;
-            tab_name = app.agentName(mock);
-            var ev = std.mem.zeroes(c.SDL_Event);
-            ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
-            ev.button.button = c.SDL_BUTTON_LEFT;
-            ev.button.clicks = 1;
-            ev.button.x = point.x;
-            ev.button.y = point.y;
-            if (!c.SDL_PushEvent(&ev)) std.log.warn("tab click not delivered: {s}", .{c.SDL_GetError()});
-        },
-        17 => {
-            // Only when the click landed: a window too narrow for the dock has
-            // no tab to click, and starting whatever lane happened to be
-            // selected would be exercising something else.
-            if (tab_clicked) pushKey(c.SDLK_F5);
-        },
-        19 => std.log.info("agent tab: clicked {s}, F5: {s}", .{ tab_name, app.statusText() }),
         20 => {
+            if (!dock_clickable) return;
             // Both ways in, and the same list either way. The `+` at the end of
             // the strip opens the templates as a dropdown under itself; the
             // filter line and the rows are the same rows the key opens.
             const point = app.agentPlusPoint() orelse {
-                std.log.warn("agents: no control to open one was drawn", .{});
+                std.log.err("click: FAIL - the control that opens a lane was not drawn, so the click had nothing to land on", .{});
                 return;
             };
             var ev = std.mem.zeroes(c.SDL_Event);
@@ -719,7 +728,72 @@ fn exerciseClick(app: *App, frame: usize) void {
         25 => pushInput("mock"),
         26 => pushKey(c.SDLK_RETURN),
         27 => std.log.info("agents: jump key: {s}", .{app.statusText()}),
+        // The run area belongs to the extension until the lane the dock is
+        // showing has said something, and after that it is that lane's own
+        // record. A lane that was never started is one that has said nothing,
+        // so the interface is moved onto one before the panel is clicked: that
+        // is the state the panel is on screen in, and Ctrl+1..8 picks a lane by
+        // number.
+        28 => pushKeyMod(c.SDLK_1, c.SDL_KMOD_CTRL),
+        29 => {
+            if (!dock_clickable) return;
+            const point = app.panelPoint("transcript") orelse {
+                std.log.err("click: FAIL - the transcript panel was not drawn, so the click had nothing to land on", .{});
+                return;
+            };
+            panel_clicked = true;
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+            ev.button.button = c.SDL_BUTTON_LEFT;
+            ev.button.clicks = 1;
+            ev.button.x = point.x;
+            ev.button.y = point.y;
+            if (!c.SDL_PushEvent(&ev)) std.log.warn("click not delivered: {s}", .{c.SDL_GetError()});
+        },
         30 => {
+            if (!panel_clicked) return;
+            std.log.info("click: status is now {s}", .{app.message_()});
+            pushKey(c.SDLK_TAB);
+        },
+        31 => if (panel_clicked) pushKey(c.SDLK_RETURN),
+        32 => {
+            if (!panel_clicked) return;
+            std.log.info("click: activate status is now {s}", .{app.message_()});
+            // The strip is the dock's navigation: a click on a lane's tab makes
+            // that lane the one the interface works on. The interface was moved
+            // off that lane at frame twenty-eight, so the click is visible in
+            // what the frame after it says the interface is on rather than
+            // taken on faith.
+            const mock = app.agentIndex("Local mock") orelse {
+                std.log.err("click: FAIL - this session has no Local mock lane to click", .{});
+                return;
+            };
+            // The strip lists the lanes that are running, so the lane's tab is
+            // at its position among those rather than at its position in the
+            // registry.
+            var position: usize = 0;
+            for (0..mock) |index| {
+                if (app.agentState(index).up()) position += 1;
+            }
+            const point = app.agentTabPoint(position) orelse {
+                std.log.err("click: FAIL - no lane tab fits in a dock {d:.0} pixels wide, so the click had nothing to land on", .{app.geometry.agents.w});
+                return;
+            };
+            tab_clicked = true;
+            tab_name = app.agentName(mock);
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+            ev.button.button = c.SDL_BUTTON_LEFT;
+            ev.button.clicks = 1;
+            ev.button.x = point.x;
+            ev.button.y = point.y;
+            if (!c.SDL_PushEvent(&ev)) std.log.warn("tab click not delivered: {s}", .{c.SDL_GetError()});
+        },
+        33 => {
+            if (!tab_clicked) return;
+            std.log.info("agent tab: clicked {s}, now on {s}", .{ tab_name, app.agentName(app.active) });
+        },
+        34 => {
             // And the destination list, with something to send: a request that
             // is a selection does not need words, and the lane started at frame
             // seventeen has had the frames since to finish its handshake.
@@ -727,20 +801,18 @@ fn exerciseClick(app: *App, frame: usize) void {
             app.selection_anchor = 0;
             pushKeyMod(c.SDLK_RETURN, c.SDL_KMOD_CTRL | c.SDL_KMOD_SHIFT);
         },
-        31 => pushKey(c.SDLK_RETURN),
-        32 => std.log.info("agents: send to: {s}", .{app.statusText()}),
-        34 => {
+        35 => pushKey(c.SDLK_RETURN),
+        36 => {
+            std.log.info("agents: send to: {s}", .{app.statusText()});
             // Ctrl+W closes what has focus, and the dock is what has it: the
             // lane goes the way its own tab's box closes it.
             pushKeyMod(c.SDLK_W, c.SDL_KMOD_CTRL);
         },
-        35 => std.log.info("agents: close: {s}", .{app.statusText()}),
-        36 => pushKey(c.SDLK_ESCAPE),
         37 => {
-            // With the keyboard back in the editor the same key closes the file
-            // it was showing, and the last buffer is left alone.
-            pushKeyMod(c.SDLK_W, c.SDL_KMOD_CTRL);
+            std.log.info("agents: close: {s}", .{app.statusText()});
+            pushKey(c.SDLK_ESCAPE);
         },
+        38 => pushKeyMod(c.SDLK_W, c.SDL_KMOD_CTRL),
         39 => std.log.info("agents: close buffer: {s}", .{app.statusText()}),
         else => {},
     }

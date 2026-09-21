@@ -216,6 +216,12 @@ pub const App = struct {
     shell_count: usize = 0,
     shells_detected: bool = false,
 
+    /// The loaded theme document, when one was loaded. The palette the rest of
+    /// the interface reads borrows from this, so it has to outlive the load:
+    /// freeing it at the end of the call that read it would leave every role
+    /// pointing at freed memory, and never freeing it leaks the document.
+    theme_doc: ?theme.Theme = null,
+
     /// Whether the dock is on screen. The sessions keep running while it is
     /// away: this is the dock, not the shells.
     terminal_shown: bool = true,
@@ -242,6 +248,10 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // The theme document outlives the call that read it, because the
+        // palette borrows its strings, so it is released here with everything
+        // else the editor owns.
+        if (self.theme_doc) |loaded| theme.deinit(loaded, self.allocator);
         // The shell is killed and reaped before the emulator that read it
         // goes away, and the buffer between them with them.
         self.shells.deinit();
@@ -1726,13 +1736,22 @@ pub const App = struct {
     pub fn loadTheme(self: *App, path: []const u8) !void {
         const bytes = try files.read(self.allocator, path, 1024 * 1024);
         defer self.allocator.free(bytes);
-        const trimmed = std.mem.trimLeft(u8, bytes, " \t\r\n");
+        var start: usize = 0;
+        while (start < bytes.len and switch (bytes[start]) {
+            ' ', '\t', '\r', '\n' => true,
+            else => false,
+        }) : (start += 1) {}
+        const trimmed = bytes[start..];
         const parsed = if (trimmed.len > 0 and trimmed[0] == '<')
             try theme_tm.parse(self.allocator, bytes)
         else if (std.mem.indexOf(u8, bytes, "tokenColors") != null)
             try theme_vscode.parse(self.allocator, bytes)
         else
             try theme.parse(self.allocator, bytes);
+        // The one we were showing goes now that a replacement has parsed
+        // successfully: a theme that fails to load leaves the last good one up.
+        if (self.theme_doc) |previous| theme.deinit(previous, self.allocator);
+        self.theme_doc = parsed;
         theme.apply(parsed);
         self.applyTerminalPalette();
         self.status("Theme: {s}", .{parsed.name});

@@ -51,7 +51,12 @@ COMMAND_LINE = re.compile(r"terminal: (the shell marked its command: (.+)|this s
 REVIEW_LINE = re.compile(r"review: (\d+) change\(s\) waiting, accepted=(true|false)")
 ANSWER_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, (\S+) from (.+?), (\d+) bytes")
 
-AGENT_TAB_LINE = re.compile(r"agent tab: clicked (.+), F5: (.+)")
+AGENT_TAB_LINE = re.compile(r"agent tab: clicked (.+), now on (.+)")
+# A step the click fixture could not take, in the fixture's own words. The run
+# that checks the dock has a window wide enough for it and a lane to put in it,
+# so there is nothing it is allowed to leave undone: a step quietly dropped is
+# worse than one that fails, and this line is how a dropped one is caught.
+CLICK_PROBLEM = re.compile(r"click: (?:skipped|FAIL) - (.+)")
 AGENT_JUMP_LINE = re.compile(r"agents: jump list: (.+)")
 AGENT_KEY_LINE = re.compile(r"agents: jump key: (.+)")
 AGENT_SEND_LINE = re.compile(r"agents: send to: (.+)")
@@ -507,50 +512,57 @@ def check_panel(binary: str) -> None:
     """
     command = display_command([binary, "--windowed", "--frames", "40", "--exercise-click"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
-    loaded = EXTENSION_LINE.search(app_output(result))
+    out = app_output(result)
+    loaded = EXTENSION_LINE.search(out)
     require(loaded is not None, "the extension host reported no extensions")
     require(int(loaded.group(1)) >= 2, f"only {loaded.group(1)} extension(s) loaded, expected the panel and status bundles")
-    click = PANEL_CLICK.search(app_output(result))
+    # Whatever the fixture could not do, it says so itself rather than leaving
+    # the step out: the line is read here so a skipped step is a failure with a
+    # reason, not a quietly shorter run.
+    problem = CLICK_PROBLEM.search(out)
+    require(problem is None, f"the click fixture could not take a step it is here to take: {problem.group(1) if problem else ''}")
+    click = PANEL_CLICK.search(out)
     require(click is not None, "a click on an extension panel did not reach a handler")
     # The run then presses Tab and Enter, and clicks an explorer row and a lane.
     # Between them the two kinds of request an extension can make are covered:
     # one the editor applies to the document, one it applies to an agent.
-    opened = EDITOR_OPEN.search(app_output(result))
+    opened = EDITOR_OPEN.search(out)
     require(opened is not None, "an explorer row did not open a file")
     # The agent dock's strip is its navigation: a click on a lane's tab makes
-    # that lane the one the interface works on, and F5 then starts it. The
-    # status line names the lane, so a click that landed on the wrong tab is
-    # visible rather than silent.
-    tab = AGENT_TAB_LINE.search(app_output(result))
+    # that lane the one the interface works on. The fixture moves the interface
+    # off that lane first, so the line it reads back names the lane the click
+    # chose: a click that missed would leave the other name there.
+    tab = AGENT_TAB_LINE.search(out)
     require(tab is not None, "a click on an agent tab was not reported")
     require(
-        tab.group(2).startswith("Started") and tab.group(1) in tab.group(2),
-        f"the tab click selected {tab.group(1)}, but F5 then said {tab.group(2)!r}",
+        tab.group(2) == tab.group(1),
+        f"the tab click moved the interface to {tab.group(2)!r} rather than to {tab.group(1)!r}, whose tab was clicked",
     )
+    require(tab.group(1) == "Local mock", f"the tab click landed on {tab.group(1)!r}, not on the lane the fixture opened")
     # Both jump lists come off the same rows and the same keys. The template
     # list is opened with Ctrl+Shift+A, filtered by typing, and chosen with
     # Return; the destination list is opened with Ctrl+Shift+Enter and chosen
     # the same way, and the status line names what each one did.
-    jump = AGENT_JUMP_LINE.search(app_output(result))
+    jump = AGENT_JUMP_LINE.search(out)
     require(jump is not None, "the template jump list reported nothing")
     require("Local mock" in jump.group(1), f"the jump list chose {jump.group(1)!r}, not the lane that was filtered for")
-    key = AGENT_KEY_LINE.search(app_output(result))
+    key = AGENT_KEY_LINE.search(out)
     require(key is not None, "the same list opened by a key reported nothing")
     require("Local mock" in key.group(1), f"the key-opened list chose {key.group(1)!r}")
-    sent = AGENT_SEND_LINE.search(app_output(result))
+    sent = AGENT_SEND_LINE.search(out)
     require(sent is not None, "the destination list reported nothing")
     require("Prompt sent to Local mock" in sent.group(1), f"the destination list said {sent.group(1)!r}")
     # Ctrl+W closes what has focus. In the dock that is the lane, and in the
     # editor it is the file behind the one on screen.
-    close = AGENT_CLOSE_LINE.search(app_output(result))
+    close = AGENT_CLOSE_LINE.search(out)
     require(close is not None, "the close key reported nothing for the dock")
     require("Closed Local mock" in close.group(1), f"the close key said {close.group(1)!r} with the dock focused")
-    buffer = BUFFER_CLOSE_LINE.search(app_output(result))
+    buffer = BUFFER_CLOSE_LINE.search(out)
     require(buffer is not None, "the close key reported nothing for the editor")
     require(buffer.group(1).startswith("Closed "), f"the close key said {buffer.group(1)!r} with the editor focused")
     # And a pointer moving over a row, which panels use to respond before a
     # click. It is dispatched only when the node under the pointer changes.
-    hover = HOVER_LINE.search(app_output(result))
+    hover = HOVER_LINE.search(out)
     require(hover is not None, "moving the pointer over a panel reached no handler")
     print(
         f"panel: {loaded.group(1)} extension(s) loaded, click reached panel {click.group(1)}, "

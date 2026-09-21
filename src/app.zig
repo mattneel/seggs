@@ -174,6 +174,9 @@ pub const App = struct {
     /// Whether the dock is on screen. The sessions keep running while it is
     /// away: this is the dock, not the shells.
     terminal_shown: bool = true,
+    /// The display's pixels per point. Every size the editor computes is in
+    /// device pixels, so a pointer arriving in points is converted by this.
+    scale: f32 = 1,
     char_width: f32 = 10,
     line_height: f32 = 22,
     last_watch: u64 = 0,
@@ -501,7 +504,26 @@ pub const App = struct {
         self.fullscreen = !self.fullscreen;
     }
 
-    pub fn event(self: *App, ev: c.SDL_Event) !void {
+    pub fn event(self: *App, raw: c.SDL_Event) !void {
+        var ev = raw;
+        // SDL reports pointer positions in points and everything this editor
+        // measures with is in device pixels, so the pointer is converted once
+        // here rather than at every comparison it takes part in.
+        if (self.scale != 1) switch (ev.type) {
+            c.SDL_EVENT_MOUSE_BUTTON_DOWN, c.SDL_EVENT_MOUSE_BUTTON_UP => {
+                ev.button.x *= self.scale;
+                ev.button.y *= self.scale;
+            },
+            c.SDL_EVENT_MOUSE_MOTION => {
+                ev.motion.x *= self.scale;
+                ev.motion.y *= self.scale;
+            },
+            c.SDL_EVENT_MOUSE_WHEEL => {
+                ev.wheel.mouse_x *= self.scale;
+                ev.wheel.mouse_y *= self.scale;
+            },
+            else => {},
+        };
         switch (ev.type) {
             c.SDL_EVENT_QUIT, c.SDL_EVENT_WINDOW_CLOSE_REQUESTED => self.requestQuit(),
             c.SDL_EVENT_TEXT_EDITING => {

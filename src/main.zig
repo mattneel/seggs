@@ -132,7 +132,11 @@ fn run(init: std.process.Init) !void {
     _ = c.SDL_SetWindowMinimumSize(window, 640, 420);
     _ = c.SDL_StartTextInput(window);
     defer _ = c.SDL_StopTextInput(window);
-    var renderer = try Renderer.init(a, window, font_z.ptr);
+    // Pixels per point. The face is rasterised at this density and the layout
+    // is measured in device pixels, so a denser display is sharper rather than
+    // smaller.
+    const scale = c.SDL_GetWindowDisplayScale(window);
+    var renderer = try Renderer.init(a, window, font_z.ptr, scale);
     defer renderer.deinit();
     // The primary face covers one script family; anything else, such as CJK or
     // emoji, is drawn from a fallback face when the system has one.
@@ -179,7 +183,10 @@ fn run(init: std.process.Init) !void {
         try app.update();
         var width: c_int = 0;
         var height: c_int = 0;
-        if (!c.SDL_GetWindowSize(window, &width, &height)) return error.WindowSize;
+        // The drawable is in device pixels, which is what the GPU draws into
+        // and what every measurement here is expressed in.
+        if (!c.SDL_GetWindowSizeInPixels(window, &width, &height)) return error.WindowSize;
+        app.scale = c.SDL_GetWindowDisplayScale(window);
         renderer.begin(@floatFromInt(@max(1, width)), @floatFromInt(@max(1, height)));
         _ = frame_arena.reset(.retain_capacity);
         try app.draw(&renderer, frame_arena.allocator());

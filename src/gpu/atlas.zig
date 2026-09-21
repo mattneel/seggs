@@ -69,13 +69,29 @@ pub const Atlas = struct {
     /// Codepoints that fell back to the placeholder glyph.
     missing: usize = 0,
     /// Nominal monospace advance, used for tab stops.
+    /// The display's pixels per point, kept because the fallback faces are
+    /// rasterised at the same density as the primary one.
+    scale: f32,
     advance: f32,
     line_height: f32,
     /// Distance from the top of a line to its baseline, in draw units.
     ascent: f32,
 
-    pub fn init(a: std.mem.Allocator, device: *c.SDL_GPUDevice, font_path: [*:0]const u8) !Atlas {
-        const font = c.TTF_OpenFont(font_path, 32) orelse return error.FontOpen;
+    /// The size the interface measures in, in points.
+    pub const base: f32 = 16;
+
+    /// The face is rasterised at twice the size the interface measures in, so
+    /// glyphs stay sharp when they are drawn at their measured size.
+    pub const oversample: f32 = 2;
+
+    /// `scale` is the display's pixels per point. The face is rasterised at
+    /// `base * oversample * scale`, so a high-density display gets a finer
+    /// face rather than a stretched one, while every metric below is converted
+    /// back into points: the layout is the same on every display and only the
+    /// pixels differ.
+    pub fn init(a: std.mem.Allocator, device: *c.SDL_GPUDevice, font_path: [*:0]const u8, scale: f32) !Atlas {
+        const raster: f32 = @round(base * oversample * scale);
+        const font = c.TTF_OpenFont(font_path, raster) orelse return error.FontOpen;
         errdefer c.TTF_CloseFont(font);
         var advance: c_int = 0;
         if (!c.TTF_GetGlyphMetrics(font, 'M', null, null, null, null, &advance)) return error.FontMetrics;
@@ -110,9 +126,14 @@ pub const Atlas = struct {
             .transfer = transfer,
             .surface = surface,
             .packer = Packer.init(width, height),
-            .advance = @as(f32, @floatFromInt(advance)) / 2,
-            .line_height = @max(22, @as(f32, @floatFromInt(c.TTF_GetFontLineSkip(font))) / 2),
-            .ascent = @as(f32, @floatFromInt(c.TTF_GetFontAscent(font))) / 2,
+            .scale = scale,
+            // In device pixels: the face was rasterised larger by the same
+            // factor, so dividing the oversample back out leaves metrics that
+            // grew with the display. A denser screen gets the same interface
+            // drawn larger and sharper, not the same number of smaller points.
+            .advance = @as(f32, @floatFromInt(advance)) / oversample,
+            .line_height = @max(22 * scale, @as(f32, @floatFromInt(c.TTF_GetFontLineSkip(font))) / oversample),
+            .ascent = @as(f32, @floatFromInt(c.TTF_GetFontAscent(font))) / oversample,
         };
         errdefer atlas.glyphs.deinit(a);
         return atlas;
@@ -206,7 +227,7 @@ pub const Atlas = struct {
     /// face has no glyph, which is how `fallbackGlyph` rasterizes a codepoint
     /// the shaper could not resolve.
     pub fn addFallback(self: *Atlas, path: [*:0]const u8) !void {
-        const fallback = c.TTF_OpenFont(path, 32) orelse return error.FontOpen;
+        const fallback = c.TTF_OpenFont(path, @round(base * oversample * self.scale)) orelse return error.FontOpen;
         errdefer c.TTF_CloseFont(fallback);
         if (!c.TTF_AddFallbackFont(self.font, fallback)) return error.FallbackRejected;
         try self.fallbacks.append(self.allocator, fallback);

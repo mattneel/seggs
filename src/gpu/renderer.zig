@@ -28,7 +28,7 @@ pub const Renderer = struct {
     height: f32 = 1,
     clip: Rect = .{ .x = 0, .y = 0, .w = 1, .h = 1 },
 
-    pub fn init(a: std.mem.Allocator, window: *c.SDL_Window, font: [*:0]const u8) !Renderer {
+    pub fn init(a: std.mem.Allocator, window: *c.SDL_Window, font: [*:0]const u8, scale: f32) !Renderer {
         const metal = builtin.os.tag == .macos;
         const format = if (metal) c.SDL_GPU_SHADERFORMAT_MSL else c.SDL_GPU_SHADERFORMAT_SPIRV;
         const device = c.SDL_CreateGPUDevice(format, builtin.mode == .debug, null) orelse return error.GpuDevice;
@@ -86,7 +86,7 @@ pub const Renderer = struct {
         sampler_info.address_mode_w = c.SDL_GPU_SAMPLERADDRESSMODE_CLAMP_TO_EDGE;
         const sampler = c.SDL_CreateGPUSampler(device, &sampler_info) orelse return error.GpuSampler;
         errdefer c.SDL_ReleaseGPUSampler(device, sampler);
-        var atlas = try Atlas.init(a, device, font);
+        var atlas = try Atlas.init(a, device, font, scale);
         var shaper = try Shaper.init(a, std.mem.span(font));
         errdefer shaper.deinit();
         atlas.placeholder_id = shaper.glyphIndex('?');

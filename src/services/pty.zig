@@ -19,6 +19,12 @@ const Unsupported = struct {
         return error.PtyUnsupported;
     }
 
+    /// Nothing runs on a terminal that does not exist, so nothing there has
+    /// ended.
+    pub fn ended(_: *Unsupported) bool {
+        return false;
+    }
+
     pub fn writeInput(_: *Unsupported, _: []const u8) !void {
         return error.PtyUnsupported;
     }
@@ -34,6 +40,8 @@ const Posix = struct {
     allocator: std.mem.Allocator,
     master: c_int,
     pid: c_int,
+    /// Set once the reading side has seen the program go.
+    gone: bool = false,
 
     extern fn forkpty(amaster: *c_int, name: ?*anyopaque, termp: ?*anyopaque, winp: ?*anyopaque) c_int;
     extern fn ioctl(fd: c_int, request: c_ulong, ...) c_int;
@@ -73,11 +81,25 @@ const Posix = struct {
 
     /// Reads whatever the program has said, and nothing when it has said
     /// nothing: a polled PTY reports the empty read rather than waiting.
+    /// Whether the program on the other end has gone. A read that reports end
+    /// of file, or the input/output error a closed slave raises, means the
+    /// same thing here: there is nothing left on the other side of this
+    /// terminal. Which of the two it is depends on the system.
+    pub fn ended(self: *const Posix) bool {
+        return self.gone;
+    }
+
     pub fn readOutput(self: *Posix, buf: []u8) !usize {
-        return std.posix.read(self.master, buf) catch |err| switch (err) {
-            error.WouldBlock => 0,
-            else => error.PtyRead,
+        const count = std.posix.read(self.master, buf) catch |err| switch (err) {
+            error.WouldBlock => return 0,
+            error.InputOutput => {
+                self.gone = true;
+                return 0;
+            },
+            else => return error.PtyRead,
         };
+        if (count == 0) self.gone = true;
+        return count;
     }
 
     pub fn writeInput(self: *Posix, bytes: []const u8) !void {

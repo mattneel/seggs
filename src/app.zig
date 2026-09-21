@@ -1528,7 +1528,7 @@ pub const App = struct {
         return &session.terminal;
     }
 
-    fn activeShell(self: *App) ?*pty.Pty {
+    pub fn activeShell(self: *App) ?*pty.Pty {
         const session = self.shells.activeSession() orelse return null;
         return &session.shell;
     }
@@ -1737,6 +1737,14 @@ pub const App = struct {
             self.terminal_read.items.len += count;
         }
         if (self.terminal_read.items.len != 0) terminal.write(self.terminal_read.items);
+        // The program can end while the dock is open: the reader typed `exit`,
+        // or it crashed, or its input closed. A tab whose program is gone
+        // cannot run anything, so it closes itself - and the last one takes the
+        // dock with it, which is what closing it by hand does.
+        if (shell.ended()) {
+            self.closeTerminalTab();
+            return;
+        }
         if (self.terminalOpen()) {
             const bounds = layout.Layout.terminalScreen(self.geometry.terminal);
             const cols: u16 = @intFromFloat(@max(2, @floor((bounds.w - 8) / self.char_width)));

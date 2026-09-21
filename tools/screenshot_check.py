@@ -41,6 +41,7 @@ PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
 TABS_COPY = re.compile(r"tabs: copy reported Copied (\d+) byte")
 
+EXIT_LINE = re.compile(r"after exit (\d+) shell\(s\) remain, dock is (\w+)")
 TABS_LINE = re.compile(r"tabs: (\d+) open, showing (\d+) of (\d+)")
 
 COMPOSE_LINE = re.compile(r"compose (\S+): (\d+) steps, (.+)")
@@ -736,6 +737,12 @@ def check_tabs(binary: str) -> None:
     require(tabs is not None, "the terminal tab fixture reported nothing")
     # Three opened, one closed, so two remain, and the reader is on the first.
     require(int(tabs.group(1)) == 2, f"{tabs.group(1)} tabs remained, expected the two that were not closed")
+    # Both shells then leave. A tab whose program is gone cannot run anything,
+    # and the last one takes the dock with it.
+    exit_line = EXIT_LINE.search(output)
+    require(exit_line is not None, "the terminal fixture reported nothing after exit")
+    require(int(exit_line.group(1)) == 0, f"{exit_line.group(1)} shells outlived their programs")
+    require(exit_line.group(2) == "down", "the dock stayed up with nothing in it")
     require(int(tabs.group(2)) == 1, f"the reader ended on tab {tabs.group(2)}, expected the first")
     # The same fixture drags over the screen and copies: a selection that never
     # reaches the clipboard is a selection that does nothing.

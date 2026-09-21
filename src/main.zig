@@ -516,6 +516,16 @@ fn exerciseTabs(app: *App, frame: usize) void {
         16 => app.moveTerminalTab(false),
         20 => app.closeTerminalTab(),
         24 => app.shells.select(0),
+
+        // `exit` in the shell is the one thing a reader types in a terminal
+        // that means "I am done here", and the tab goes with it. The second
+        // one leaves nothing behind, so the dock goes too.
+        70 => if (app.activeShell()) |shell| shell.writeInput("exit\n") catch {},
+        78 => if (app.activeShell()) |shell| shell.writeInput("exit\n") catch {},
+        90 => std.log.info("tabs: after exit {d} shell(s) remain, dock is {s}", .{
+            app.shells.count(),
+            if (app.terminalOpen()) "up" else "down",
+        }),
         28 => {
             // Toggling the view twice is a round trip: it puts the dock away
             // and brings it back. Anything that starts a shell here turns one

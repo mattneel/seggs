@@ -788,6 +788,23 @@ test "a shell's first prompt arrives without any input being sent" {
     try std.testing.expect(n > 0);
 }
 
+test "a shell that exits is reported as ended" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var p = try pty.Pty.spawn(a, &.{ "/bin/sh", "-c", "exit 7" }, 80, 24);
+    defer p.deinit();
+    try p.setNonBlocking();
+    try std.testing.expect(!p.ended());
+    var buf: [256]u8 = undefined;
+    var tries: usize = 0;
+    while (!p.ended() and tries < 200_000) : (tries += 1) {
+        _ = p.readOutput(&buf) catch break;
+    }
+    // The program said nothing and left. The terminal has to say so, or the
+    // editor keeps a tab whose program is gone and can never answer again.
+    try std.testing.expect(p.ended());
+}
+
 test "pty spawns a shell and echoes output" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     const a = std.testing.allocator;

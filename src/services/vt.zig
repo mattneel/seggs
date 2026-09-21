@@ -456,6 +456,63 @@ pub const Terminal = struct {
         return .{ .command = try command.toOwnedSlice(a), .output = try output.toOwnedSlice(a) };
     }
 
+    /// A place on the screen, in cells from the top left.
+    pub const Point = struct { x: u16, y: u16 };
+
+    /// The text a selection covers.
+    ///
+    /// A terminal's rows are padded to the screen's width, so each row is cut
+    /// where its content ends: copying a line should not paste a screenful of
+    /// spaces behind it. The selection is over the viewport, which is what a
+    /// pointer can reach.
+    pub fn select(self: *Terminal, a: Allocator, from: Point, to: Point) ![]u8 {
+        // A selection is two corners, and a reader can drag either way: they are
+        // put in reading order first, on both axes, so a drag upwards and to the
+        // left means the same as the same drag made the other way.
+        const forward = from.y < to.y or (from.y == to.y and from.x <= to.x);
+        const first = if (forward) from else to;
+        const last = if (forward) to else from;
+        const Collector = struct {
+            list: Allocator,
+            from: Point,
+            to: Point,
+            out: std.ArrayList(u8) = .empty,
+            row: u16 = 0,
+
+            fn visit(collector: *@This(), row: u16, cells: []const Cell) anyerror!void {
+                _ = row;
+                if (collector.row < collector.from.y or collector.row > collector.to.y) {
+                    collector.row += 1;
+                    return;
+                }
+                defer collector.row += 1;
+                const start: usize = if (collector.row == collector.from.y) collector.from.x else 0;
+                const end: usize = if (collector.row == collector.to.y) collector.to.x else std.math.maxInt(u16);
+                var line: [1024]u8 = undefined;
+                var written: usize = 0;
+                for (cells, 0..) |cell, column| {
+                    if (column < start or column > end) continue;
+                    if (written == line.len) break;
+                    if (cell.codepoints.len == 0) {
+                        line[written] = ' ';
+                        written += 1;
+                        continue;
+                    }
+                    const codepoint = std.math.cast(u21, cell.codepoints[0]) orelse continue;
+                    written += std.unicode.utf8Encode(codepoint, line[written..]) catch 0;
+                }
+                // Cut the padding, keep the text.
+                while (written > 0 and line[written - 1] == ' ') written -= 1;
+                try collector.out.appendSlice(collector.list, line[0..written]);
+                if (collector.row < collector.to.y) try collector.out.append(collector.list, '\n');
+            }
+        };
+        var collector: Collector = .{ .list = a, .from = first, .to = last };
+        errdefer collector.out.deinit(a);
+        try self.visitRows(&collector, Collector.visit);
+        return collector.out.toOwnedSlice(a);
+    }
+
     /// Move the viewport through scrollback. Negative scrolls up into history,
     /// which is what a wheel does; the program's own screen is untouched.
     pub fn scroll(self: *Terminal, lines: isize) void {
@@ -781,4 +838,28 @@ test "a shell that marks its commands gives a result, and one that does not give
     plain.write("$ zig build test\r\nerror: 3 things\r\n");
     try plain.update();
     try std.testing.expect((try plain.lastCommand(std.testing.allocator)) == null);
+}
+
+test "a selection is the text it covers, without the screen's padding" {
+    var terminal = try Terminal.init(std.testing.allocator, 20, 4);
+    defer terminal.deinit();
+    terminal.write("first line\r\nsecond line\r\nthird");
+    try terminal.update();
+
+    // From the start of one line into the next: the first line is taken whole,
+    // because a selection that spans rows takes all of the rows between.
+    const across = try terminal.select(std.testing.allocator, .{ .x = 0, .y = 0 }, .{ .x = 5, .y = 1 });
+    defer std.testing.allocator.free(across);
+    try std.testing.expectEqualStrings("first line\nsecond", across);
+
+    // Part of one row only, and the row's padding is not part of it. Columns are
+    // inclusive, so this is the second word and not the space before it.
+    const word = try terminal.select(std.testing.allocator, .{ .x = 7, .y = 1 }, .{ .x = 10, .y = 1 });
+    defer std.testing.allocator.free(word);
+    try std.testing.expectEqualStrings("line", word);
+
+    // A selection read backwards is the same selection.
+    const reversed = try terminal.select(std.testing.allocator, .{ .x = 5, .y = 0 }, .{ .x = 0, .y = 0 });
+    defer std.testing.allocator.free(reversed);
+    try std.testing.expectEqualStrings("first", reversed);
 }

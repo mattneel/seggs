@@ -20,7 +20,34 @@ const Terminal = struct {
 };
 
 pub const Client = struct {
-    pub const State = enum { offline, initialize, new_session, ready, busy, cancelling, failed };
+    pub const State = enum {
+        offline,
+        initialize,
+        new_session,
+        ready,
+        busy,
+        cancelling,
+        failed,
+
+        /// Whether the lane is up at all. A harness that is working is up: it is
+        /// the lane that is gone that is not, and calling a busy agent offline
+        /// makes the interface disagree with what is plainly happening.
+        pub fn up(self: State) bool {
+            return switch (self) {
+                .offline, .failed => false,
+                else => true,
+            };
+        }
+
+        pub fn label(self: State) []const u8 {
+            return switch (self) {
+                .offline, .failed => "OFFLINE",
+                .ready => "READY",
+                .initialize, .new_session => "STARTING",
+                .busy, .cancelling => "WORKING",
+            };
+        }
+    };
     const Request = struct { id: u64, kind: enum { initialize, authenticate, new_session, prompt, set_config }, deadline: u64 };
     /// An authentication method the harness says it accepts.
     pub const AuthMethod = struct { id: []u8, name: []u8 };
@@ -709,3 +736,15 @@ pub const Client = struct {
         try files.replace(self.allocator, path, self.transcript.items);
     }
 };
+
+test "a working harness is up, and only a gone one is not" {
+    try std.testing.expect(Client.State.busy.up());
+    try std.testing.expect(Client.State.ready.up());
+    try std.testing.expect(!Client.State.offline.up());
+    try std.testing.expect(!Client.State.failed.up());
+    // The labels say what is happening rather than two states for three
+    // situations: an agent that is mid-turn is neither ready nor gone.
+    try std.testing.expectEqualStrings("WORKING", Client.State.busy.label());
+    try std.testing.expectEqualStrings("READY", Client.State.ready.label());
+    try std.testing.expectEqualStrings("OFFLINE", Client.State.failed.label());
+}

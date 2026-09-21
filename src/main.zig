@@ -287,6 +287,7 @@ var approval_held: usize = 0;
 var review_proposed = false;
 var review_reported = false;
 var review_held: usize = 0;
+var pipe_sent = false;
 
 /// A shell answers when it answers, so the screen is polled from the frame the
 /// command is typed until the answer is there: a fixed frame would make this
@@ -469,6 +470,19 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
         return;
     }
 
+    // A selection with nothing typed is a complete request, and it used to do
+    // nothing at all: the harness answers it or the selection never left.
+    if (run_reported and !pipe_sent) {
+        pipe_sent = true;
+        const mock = app.agentIndex("Local mock") orelse return;
+        const before = app.agentTranscript(mock);
+        const document = app.workspace.activeDocument();
+        document.cursor = 8;
+        app.selection_anchor = 0;
+        app.pipeTo(mock) catch |err| std.log.err("pipe: {s}", .{@errorName(err)});
+        std.log.info("pipe: selection sent with an empty prompt, transcript {d} -> {d}", .{ before, app.agentTranscript(mock) });
+    }
+
     // The review is answered once the run it belongs to has reported: a change
     // is read while the work goes on and accepted when it is done.
     if (review_proposed and !review_reported) {
@@ -495,12 +509,20 @@ fn exerciseTabs(app: *App, frame: usize) void {
         16 => app.moveTerminalTab(false),
         20 => app.closeTerminalTab(),
         24 => app.shells.select(0),
-        28 => {
+        50 => {
+            // A drag over the screen, then the copy key: what a reader does with
+            // a terminal's output before sending it somewhere. The shells have
+            // had time to print a prompt by now, so there is text to take.
+            app.terminal_selection = .{ .anchor = .{ .x = 0, .y = 0 }, .cursor = .{ .x = 12, .y = 0 } };
+            app.copyTerminalSelection() catch |err| std.log.err("tabs: {s}", .{@errorName(err)});
+        },
+        60 => {
             std.log.info("tabs: {d} open, showing {d} of {d}", .{
                 app.shells.count(),
                 app.shells.active + 1,
                 app.shells.count(),
             });
+            std.log.info("tabs: copy reported {s}", .{app.statusText()});
         },
         else => {},
     }

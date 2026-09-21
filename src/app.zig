@@ -154,6 +154,10 @@ pub const App = struct {
     /// what a terminal in an editor is for.
     terminal: ?vt.Terminal = null,
     shell: ?pty.Pty = null,
+    /// What the pointer has dragged over in the terminal, when it has.
+    terminal_selection: ?TerminalSelection = null,
+    terminal_dragging: bool = false,
+
     /// The terminal dock's sessions. A tab is one shell with its own screen.
     shells: terminals.Terminals,
     terminal_read: std.ArrayList(u8) = .empty,
@@ -370,7 +374,11 @@ pub const App = struct {
     }
 
     fn submit(self: *App, broadcast: bool) !void {
-        if (self.prompt_text.items.len == 0) return;
+        // A request does not need words when it carries context. Selecting code
+        // and sending it is a complete ask - the code is what is being asked
+        // about - and requiring a sentence as well is how a selection ends up
+        // being impossible to send.
+        if (self.prompt_text.items.len == 0 and !self.carriesContext()) return;
         const message = try self.promptWithContext();
         defer self.allocator.free(message);
         var sent: usize = 0;
@@ -393,6 +401,15 @@ pub const App = struct {
         self.prompt_text.clearRetainingCapacity();
         self.transcript_scroll = 0;
         self.status("Prompt sent to {d} agent(s).", .{sent});
+    }
+
+    /// Whether the inspector has anything switched on that a request could
+    /// carry. Someone who switched it on meant to send it.
+    pub fn carriesContext(self: *App) bool {
+        if (self.inspector_context[0] and self.selectedRange() != null) return true;
+        if (self.inspector_context[1]) return true;
+        if (self.inspector_context[2] and self.activeTerminal() != null) return true;
+        return false;
     }
 
     /// Build the outgoing prompt: the current selection plus the language
@@ -502,9 +519,12 @@ pub const App = struct {
             c.SDL_EVENT_MOUSE_BUTTON_DOWN => if (ev.button.button == c.SDL_BUTTON_LEFT) try self.mouseDown(ev.button.x, ev.button.y),
             c.SDL_EVENT_MOUSE_BUTTON_UP => {
                 self.drag = false;
+                self.terminal_dragging = false;
                 if (self.selection_anchor == self.workspace.activeDocument().cursor) self.selection_anchor = null;
             },
-            c.SDL_EVENT_MOUSE_MOTION => if (!self.drag) self.hoverPanel(ev.motion.x, ev.motion.y) else {
+            c.SDL_EVENT_MOUSE_MOTION => if (self.terminal_dragging) {
+                if (self.terminal_selection) |*selection| selection.cursor = self.terminalCell(ev.motion.x, ev.motion.y);
+            } else if (!self.drag) self.hoverPanel(ev.motion.x, ev.motion.y) else {
                 self.workspace.activeDocument().cursor = self.positionAt(ev.motion.x, ev.motion.y);
                 self.follow_cursor = true;
             },
@@ -667,7 +687,16 @@ pub const App = struct {
                         self.status("Reload failed: {s}", .{@errorName(err)});
                     }
                 },
-                c.SDLK_C => try self.copySelection(),
+                c.SDLK_C => {
+                    // A terminal's Ctrl+C belongs to the program running in it,
+                    // so copying from the terminal takes the shift - and the
+                    // editor keeps the plain key.
+                    if (shift and self.focus == .terminal) {
+                        try self.copyTerminalSelection();
+                    } else {
+                        try self.copySelection();
+                    }
+                },
                 c.SDLK_V => {
                     const bytes = c.SDL_GetClipboardText();
                     if (bytes != null) {
@@ -1111,6 +1140,15 @@ pub const App = struct {
                 return;
             }
             self.focus = .terminal;
+            // A drag from here selects the screen's text, unless the program
+            // asked for the mouse, in which case the pointer is its business.
+            if (self.activeTerminal()) |terminal| {
+                if (!terminal.wantsMouse()) {
+                    const cell = self.terminalCell(x, y);
+                    self.terminal_selection = .{ .anchor = cell, .cursor = cell };
+                    self.terminal_dragging = true;
+                }
+            }
             return;
         }
         // The dock's own switch and rows belong to the interface, so they are
@@ -1503,6 +1541,56 @@ pub const App = struct {
         self.status("Terminal {d} of {d}.", .{ self.shells.active + 1, count });
     }
 
+    /// A cell the pointer is over, clamped to the screen.
+    fn terminalCell(self: *App, x: f32, y: f32) vt.Terminal.Point {
+        const bounds = self.geometry.terminal;
+        const top = bounds.y + 26;
+        const cell_x: u16 = @intFromFloat(@max(0, @floor((x - bounds.x - 4) / self.char_width)));
+        const cell_y: u16 = @intFromFloat(@max(0, @floor((y - top - 4) / self.line_height)));
+        return .{ .x = @min(cell_x, 200), .y = @min(cell_y, 200) };
+    }
+
+    /// What the pointer has dragged over in the terminal, if anything.
+    pub const TerminalSelection = struct { anchor: vt.Terminal.Point, cursor: vt.Terminal.Point };
+
+    /// Whether a cell is inside the selection, in reading order.
+    fn terminalSelected(self: *const App, column: usize, row: usize) bool {
+        const selection = self.terminal_selection orelse return false;
+        const forward = selection.anchor.y < selection.cursor.y or
+            (selection.anchor.y == selection.cursor.y and selection.anchor.x <= selection.cursor.x);
+        const from = if (forward) selection.anchor else selection.cursor;
+        const to = if (forward) selection.cursor else selection.anchor;
+        const y: u16 = @intCast(row);
+        const x: u16 = @intCast(column);
+        if (y < from.y or y > to.y) return false;
+        if (y == from.y and x < from.x) return false;
+        if (y == to.y and x > to.x) return false;
+        return true;
+    }
+
+    /// Copy what the pointer selected. A terminal's own Ctrl+C belongs to the
+    /// program, so copying takes the shift, which is what every terminal does.
+    pub fn copyTerminalSelection(self: *App) !void {
+        const selection = self.terminal_selection orelse {
+            self.status("Nothing is selected in the terminal.", .{});
+            return;
+        };
+        const terminal = self.activeTerminal() orelse return;
+        const picked = try terminal.select(self.allocator, selection.anchor, selection.cursor);
+        defer self.allocator.free(picked);
+        if (picked.len == 0) {
+            self.status("Nothing is selected in the terminal.", .{});
+            return;
+        }
+        const terminated = try self.allocator.dupeSentinel(u8, picked, 0);
+        defer self.allocator.free(terminated);
+        if (!c.SDL_SetClipboardText(terminated.ptr)) {
+            self.status("terminal: could not reach the clipboard", .{});
+            return;
+        }
+        self.status("Copied {d} byte(s) from the terminal.", .{picked.len});
+    }
+
     /// The tab strip above the terminal's screen. A tab per shell, the one
     /// showing marked, and a way to add another and to close one.
     fn drawTerminalTabs(self: *App, r: *Renderer) !void {
@@ -1595,6 +1683,7 @@ pub const App = struct {
 
         const Painter = struct {
             r: *Renderer,
+            app: *const App,
             origin_x: f32,
             origin_y: f32,
             char_width: f32,
@@ -1625,6 +1714,10 @@ pub const App = struct {
                     if (!std.mem.eql(f32, &cell_background, &painter.palette[0])) {
                         try painter.r.rect(.{ .x = x, .y = y, .w = painter.char_width, .h = painter.line_height }, cell_background);
                     }
+                    // What the pointer dragged over, under the text it covers.
+                    if (painter.app.terminalSelected(column, row)) {
+                        try painter.r.rect(.{ .x = x, .y = y, .w = painter.char_width, .h = painter.line_height }, theme.selected);
+                    }
                     if (cell.style.underline != 0) {
                         try painter.r.rect(.{ .x = x, .y = y + painter.line_height - 2, .w = painter.char_width, .h = 1 }, cell_foreground);
                     }
@@ -1647,6 +1740,7 @@ pub const App = struct {
 
         var painter: Painter = .{
             .r = r,
+            .app = self,
             .origin_x = bounds.x + 4,
             .origin_y = bounds.y + 4,
             .char_width = self.char_width,
@@ -2506,12 +2600,16 @@ pub const App = struct {
         for (self.clients, 0..) |client, index| {
             const y = pipe_y + @as(f32, @floatFromInt(index)) * 26;
             const chosen = index == self.active;
-            const ready = client.state == .ready;
+            const up = client.state.up();
             if (chosen) try r.rect(.{ .x = bounds.x + 6, .y = y - 1, .w = 3, .h = 20 }, theme.accent);
             var name: [96]u8 = undefined;
             const named = try std.fmt.bufPrint(&name, "{d}  {s}", .{ index + 1, client.preset.name });
-            try r.text(bounds.x + 14, y + 6, named, if (ready) theme.text else theme.muted);
-            try r.text(bounds.x + bounds.w - 78, y + 6, if (ready) "READY" else "OFFLINE", if (ready) theme.accent else theme.muted);
+            try r.text(bounds.x + 14, y + 6, named, if (up) theme.text else theme.muted);
+            try r.text(bounds.x + bounds.w - 78, y + 6, client.state.label(), switch (client.state) {
+                .ready => theme.accent,
+                .busy, .cancelling, .initialize, .new_session => theme.amber,
+                .offline, .failed => theme.muted,
+            });
         }
 
         // The run is evidence, not the navigation: it gets the room that is

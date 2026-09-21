@@ -27,6 +27,7 @@ test {
     _ = process;
     _ = shell_integration;
     _ = terminals;
+    _ = @import("acp/client.zig");
 }
 
 const process = @import("services/process.zig");

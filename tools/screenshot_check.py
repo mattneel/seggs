@@ -39,6 +39,8 @@ METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
+TABS_COPY = re.compile(r"tabs: copy reported Copied (\d+) byte")
+
 TABS_LINE = re.compile(r"tabs: (\d+) open, showing (\d+) of (\d+)")
 
 COMPOSE_LINE = re.compile(r"compose (\S+): (\d+) steps, (.+)")
@@ -724,7 +726,7 @@ def check_tabs(binary: str) -> None:
     """The terminal's tabs: adding, moving, and closing all agree on which is
     showing. The fixture does each in turn and reports where it ended up, which
     is the arithmetic a tab strip gets wrong."""
-    command = display_command([binary, "--windowed", "--frames", "40", "--exercise-tabs"], app_env())
+    command = display_command([binary, "--windowed", "--frames", "90", "--exercise-tabs"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     output = app_output(result)
     tabs = TABS_LINE.search(output)
@@ -735,7 +737,15 @@ def check_tabs(binary: str) -> None:
     # Three opened, one closed, so two remain, and the reader is on the first.
     require(int(tabs.group(1)) == 2, f"{tabs.group(1)} tabs remained, expected the two that were not closed")
     require(int(tabs.group(2)) == 1, f"the reader ended on tab {tabs.group(2)}, expected the first")
-    print(f"tabs: {tabs.group(1)} open after adding three and closing one, showing {tabs.group(2)}")
+    # The same fixture drags over the screen and copies: a selection that never
+    # reaches the clipboard is a selection that does nothing.
+    copied = TABS_COPY.search(output)
+    require(copied is not None, "selecting in the terminal reported nothing")
+    require(int(copied.group(1)) > 0, "a selection in the terminal copied nothing")
+    print(
+        f"tabs: {tabs.group(1)} open after adding three and closing one, showing {tabs.group(2)}, "
+        f"and selecting copied {copied.group(1)} byte(s)"
+    )
 
 
 def check_compose(binary: str) -> None:

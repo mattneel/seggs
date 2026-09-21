@@ -15,7 +15,16 @@ const process = @import("services/process.zig");
 const ghostty = @import("ghostty");
 const theme = @import("ui/theme.zig");
 const runs = @import("editor/runs.zig");
+
+/// A context row in the inspector is its name and, under it, what it would
+/// carry. The height follows the line metrics rather than a number chosen for
+/// one font size, because the interface does not get to decide how tall a line
+/// of text is.
+fn inspectorRowHeight(line_height: f32) f32 {
+    return line_height * 2 + 8;
+}
 const review = @import("editor/review.zig");
+const wrap = @import("ui/wrap.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
@@ -41,8 +50,12 @@ pub const App = struct {
     /// same workspace and run, not a separate application: switching keeps the
     /// open file and the selected run.
     const Perspective = enum { code, review };
+
+    /// What the left dock navigates. The roadmap's rail is the long version of
+    /// this; two things to look at is where it starts.
+    const Dock = enum { files, runs };
     const Overlay = enum { none, files, commands, quit };
-    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes" };
+    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes", "Show runs" };
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
     workspace: Workspace,
@@ -84,9 +97,17 @@ pub const App = struct {
     /// Scratch for the inspector's own labels, so drawing does not allocate.
     inspector_scratch: [3][64]u8 = undefined,
 
-    /// The run the inspector is showing, if any. A run is the work: it does not
-    /// belong to a panel, and closing one does not end it.
-    run: ?runs.Run = null,
+    /// Runs this session knows about, oldest first. A run is the work rather
+    /// than a panel: it keeps its identity, its steps, and its artifacts
+    /// whether or not anything is looking at it, and starting another one does
+    /// not throw the first away.
+    runs: std.ArrayList(runs.Run) = .empty,
+
+    /// Which run the inspector and the navigator are about.
+    run_index: usize = 0,
+
+    /// Which way the left dock is looking.
+    dock: Dock = .files,
 
     /// Position in `focus_order` while the panels own the keyboard.
     panel_focus: usize = 0,
@@ -158,7 +179,8 @@ pub const App = struct {
         self.query.deinit(self.allocator);
         self.prompt_text.deinit(self.allocator);
         self.preedit.deinit(self.allocator);
-        if (self.run) |*run| run.deinit();
+        for (self.runs.items) |*run| run.deinit();
+        self.runs.deinit(self.allocator);
         self.review.deinit();
         self.panel_tree.deinit();
         self.panel_rects.deinit(self.allocator);
@@ -1025,6 +1047,25 @@ pub const App = struct {
 
     fn mouseDown(self: *App, x: f32, y: f32) !void {
         if (self.overlay != .none) return;
+        // The dock's own switch and rows belong to the interface, so they are
+        // answered before any panel is offered the click. The files view is a
+        // panel; the runs view is this.
+        const dock = self.geometry.explorer;
+        if (dock.w > 0 and dock.contains(x, y)) {
+            if (y < dock.y + 26) {
+                self.dock = if (x < dock.x + 70) .files else .runs;
+                return;
+            }
+            if (self.dock == .runs) {
+                const offset = @max(0, y - dock.y - 36);
+                const index: usize = @intFromFloat(offset / 48);
+                if (index < self.runs.items.len) {
+                    self.run_index = index;
+                    self.status("Run {s} selected.", .{self.runs.items[index].name});
+                }
+                return;
+            }
+        }
         if (self.clickPanel(x, y)) return;
         const g = self.geometry;
         if (g.activity.contains(x, y)) {
@@ -1116,6 +1157,7 @@ pub const App = struct {
                         6 => try self.clients[self.active].cancel(),
                         7 => try self.startRun(),
                         8 => self.perspective = if (self.perspective == .review) .code else .review,
+                        9 => self.dock = if (self.dock == .runs) .files else .runs,
                         else => unreachable,
                     }
                     return;
@@ -1158,7 +1200,14 @@ pub const App = struct {
         try r.text(116, 11, "/ agent-native workspace", theme.muted);
         try r.text(@max(400, r.width - 174), 11, "SDL3 GPU / ACP", theme.accent);
         _ = try self.drawPanel(r, "activity", g.activity);
-        if (g.explorer.w > 0) _ = try self.drawPanel(r, "explorer", g.explorer);
+        if (g.explorer.w > 0) {
+            if (self.dock == .runs) {
+                try self.drawRuns(r);
+            } else {
+                _ = try self.drawPanel(r, "explorer", g.explorer);
+            }
+            try self.drawDockSwitch(r);
+        }
         if (self.perspective == .review) {
             try self.drawReview(r, frame);
         } else {
@@ -1581,11 +1630,12 @@ pub const App = struct {
     fn inspectorRowAt(self: *App, y: f32) ?InspectorRow {
         const bounds = self.geometry.agents;
         const context_y = bounds.y + 46;
+        const row_height = inspectorRowHeight(self.line_height);
         for (0..3) |index| {
-            const row_y = context_y + @as(f32, @floatFromInt(index)) * 26;
-            if (y >= row_y and y < row_y + 26) return .{ .context = index };
+            const row_y = context_y + @as(f32, @floatFromInt(index)) * row_height;
+            if (y >= row_y and y < row_y + row_height) return .{ .context = index };
         }
-        const pipe_y = context_y + 3 * 26 + 34;
+        const pipe_y = context_y + 3 * row_height + 20;
         for (0..self.clients.len) |index| {
             const row_y = pipe_y + @as(f32, @floatFromInt(index)) * 26;
             if (y >= row_y and y < row_y + 26) return .{ .destination = index };
@@ -1622,6 +1672,24 @@ pub const App = struct {
         return .{ .x = bounds.x + 60, .y = y + 10 };
     }
 
+    /// The run the inspector is about, if this session has started any.
+    pub fn activeRun(self: *App) ?*runs.Run {
+        if (self.runs.items.len == 0) return null;
+        if (self.run_index >= self.runs.items.len) self.run_index = self.runs.items.len - 1;
+        return &self.runs.items[self.run_index];
+    }
+
+    /// How many runs are waiting for a person to decide something. This is the
+    /// number the navigator surfaces, because a run that needs nothing from
+    /// anybody is not news.
+    pub fn decisionsWaiting(self: *App) usize {
+        var waiting: usize = 0;
+        for (self.runs.items) |run| {
+            if (run.state == .waiting_for_approval) waiting += 1;
+        }
+        return waiting;
+    }
+
     /// The starter workflow. Starting a run needs no harness to be up, because
     /// a run is the task rather than the tool that happens to do it.
     pub fn startRun(self: *App) !void {
@@ -1630,7 +1698,6 @@ pub const App = struct {
             .{ .name = "implement", .produces = .implementation, .harness = 1, .request = "Implement the plan. Describe the change you made." },
             .{ .name = "review", .produces = .review, .harness = 2, .request = "Review the implementation against the plan." },
         };
-        if (self.run) |*existing| existing.deinit();
         var run = try runs.Run.init(self.allocator, std.fs.path.basename(self.workspace.activePath() orelse "workspace"), &steps);
         errdefer run.deinit();
         // What the run starts from is the code that was on screen, kept as the
@@ -1642,7 +1709,9 @@ pub const App = struct {
             .source = try self.allocator.dupe(u8, "workspace"),
             .body = try self.allocator.dupe(u8, bytes),
         });
-        self.run = run;
+        try self.runs.append(self.allocator, run);
+        self.run_index = self.runs.items.len - 1;
+        self.dock = .runs;
         self.status("Run {s}: {d} steps.", .{ run.name, run.steps.len });
     }
 
@@ -1680,7 +1749,7 @@ pub const App = struct {
     /// running here and recorded when the harness finishes its turn: asking is
     /// not the same as being answered.
     pub fn runStep(self: *App) !void {
-        const run = if (self.run) |*value| value else return error.NoRun;
+        const run = self.activeRun() orelse return error.NoRun;
         const step = run.current() orelse return error.RunFinished;
         switch (step.action) {
             .agent => |agent| {
@@ -1739,7 +1808,7 @@ pub const App = struct {
     /// verdict: the artifact is the text the harness returned, and what it
     /// means is for the next step or for the developer.
     fn advanceRun(self: *App) void {
-        const run = if (self.run) |*value| value else return;
+        const run = self.activeRun() orelse return;
         const step = run.current() orelse return;
         if (step.state != .running) return;
         const harness = switch (step.action) {
@@ -1794,6 +1863,54 @@ pub const App = struct {
         if (count > 0 and self.review_selected + 1 < count) self.review_selected += 1;
     }
 
+    /// The dock says which of two things it is navigating. Which one is a
+    /// choice the developer makes, not a mode the interface decides for them:
+    /// files are where the work is, runs are what is happening to it.
+    fn drawDockSwitch(self: *App, r: *Renderer) !void {
+        const bounds = self.geometry.explorer;
+        r.clip = bounds;
+        try r.rect(.{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 26 }, theme.background);
+        const waiting = self.decisionsWaiting();
+        try r.text(bounds.x + 12, bounds.y + 8, "FILES", if (self.dock == .files) theme.accent else theme.muted);
+        try r.text(bounds.x + 74, bounds.y + 8, "RUNS", if (self.dock == .runs) theme.accent else theme.muted);
+        if (waiting > 0) {
+            var label: [32]u8 = undefined;
+            const words = try std.fmt.bufPrint(&label, "{d} to decide", .{waiting});
+            try r.text(bounds.x + bounds.w - 88, bounds.y + 8, words, theme.amber);
+        }
+    }
+
+    /// The runs this session knows about. A run that needs a person says so
+    /// rather than looking like the ones that are merely working.
+    fn drawRuns(self: *App, r: *Renderer) !void {
+        const bounds = self.geometry.explorer;
+        r.clip = bounds;
+        try r.rect(bounds, theme.panel);
+        var y = bounds.y + 36;
+        for (self.runs.items, 0..) |*run, index| {
+            if (y + 44 > bounds.y + bounds.h) break;
+            const chosen = index == self.run_index;
+            if (chosen) try r.rect(.{ .x = bounds.x + 4, .y = y - 4, .w = bounds.w - 8, .h = 42 }, theme.raised);
+            try r.text(bounds.x + 12, y, run.name, if (chosen) theme.accent else theme.text);
+            const step = run.current();
+            var state: [80]u8 = undefined;
+            const label = try std.fmt.bufPrint(&state, "{s} · {s}", .{
+                if (step) |value| value.name else "nothing left",
+                switch (run.state) {
+                    .running => "running",
+                    .waiting_for_approval => "waiting for you",
+                    .done => "done",
+                    .failed => "failed",
+                },
+            });
+            try r.text(bounds.x + 12, y + 20, label, if (run.state == .waiting_for_approval) theme.amber else theme.muted);
+            y += 48;
+        }
+        if (self.runs.items.len == 0) {
+            try r.text(bounds.x + 12, bounds.y + 36, "No runs yet.", theme.muted);
+        }
+    }
+
     /// The review surface: what is waiting to be accepted, and what stands in
     /// the way of accepting it. A change that cannot land is shown as such
     /// rather than hidden, because the developer is being asked about it.
@@ -1804,7 +1921,7 @@ pub const App = struct {
         try r.rect(bounds, theme.background);
         const queue = &self.review;
         var header: [160]u8 = undefined;
-        const link = if (self.run) |run| run.name else "no run";
+        const link = if (self.activeRun()) |run| run.name else "no run";
         const title = try std.fmt.bufPrint(&header, "REVIEW · {d} change(s) · {s}", .{ queue.count(), link });
         try r.text(bounds.x + 24, bounds.y + 20, title, theme.text);
         try r.text(bounds.x + 24, bounds.y + 44, "Up/Down choose · A accept · R reject · Esc back to the code", theme.muted);
@@ -1860,8 +1977,8 @@ pub const App = struct {
         self.status("Review: change rejected.", .{});
     }
 
-    pub fn runWaiting(self: *const App) bool {
-        const run = if (self.run) |value| &value else return false;
+    pub fn runWaiting(self: *App) bool {
+        const run = self.activeRun() orelse return false;
         return run.state == .waiting_for_approval;
     }
 
@@ -1869,13 +1986,15 @@ pub const App = struct {
     /// any other: the run records that a person accepted what came before it,
     /// which is what separates a workflow's progress from its acceptance.
     pub fn approveStep(self: *App) !void {
-        const run = if (self.run) |*value| value else return error.NoRun;
+        const run = self.activeRun() orelse return error.NoRun;
         const step = run.current() orelse return error.RunFinished;
         if (step.action != .approval) return error.NotAnApproval;
         var body: [256]u8 = undefined;
         const words = try std.fmt.bufPrint(&body, "approved by the developer; {d} artifact(s) preceded it", .{run.artifacts.items.len});
         try run.record(step, words);
-        run.state = .running;
+        // Approving the last step finishes the run: an approval that leaves a
+        // finished run looking busy is a run nobody can trust the state of.
+        run.state = if (run.isDone()) .done else .running;
         self.status("Run {s}: {s} approved.", .{ run.name, step.name });
     }
 
@@ -1909,15 +2028,27 @@ pub const App = struct {
         const rows = [_][]const u8{ "Selection", "Current file", "Terminal output" };
         const context_y = bounds.y + 46;
         for (rows, 0..) |name, index| {
-            const y = context_y + @as(f32, @floatFromInt(index)) * 26;
+            const y = context_y + @as(f32, @floatFromInt(index)) * inspectorRowHeight(r.atlas.line_height);
             const on = self.inspector_context[index];
-            try r.text(bounds.x + 14, y + 6, if (on) "[x]" else "[ ]", if (on) theme.accent else theme.muted);
-            try r.text(bounds.x + 40, y + 6, name, if (on) theme.text else theme.muted);
+            try r.text(bounds.x + 12, y + 4, if (on) "[x]" else "[ ]", if (on) theme.accent else theme.muted);
+            try r.text(bounds.x + 56, y + 4, name, if (on) theme.text else theme.muted);
+            // What a row would carry goes under it and wraps: a second column
+            // collides with the first at the narrow end of the dock, which is
+            // where an inspector is most often read.
             const detail = self.inspectorDetail(index);
-            try r.text(bounds.x + 200, y + 6, detail, theme.muted);
+            try wrapped(r, frame, .{
+                .x = bounds.x + 56,
+                .y = y + 4 + r.atlas.line_height,
+                .w = bounds.w - 70,
+                .h = r.atlas.line_height * 2,
+            }, detail, theme.muted);
         }
 
-        const pipe_y = context_y + 3 * 26 + 34;
+        // Wrapped text sets its own clip, so each section starts by taking the
+        // dock's back: a label drawn under the last row's rect is a label that
+        // gets cut in half.
+        r.clip = bounds;
+        const pipe_y = context_y + 3 * inspectorRowHeight(r.atlas.line_height) + 20;
         try r.text(bounds.x + 14, pipe_y - 18, "PIPE TO", theme.muted);
         for (self.clients, 0..) |client, index| {
             const y = pipe_y + @as(f32, @floatFromInt(index)) * 26;
@@ -1936,11 +2067,12 @@ pub const App = struct {
         const client = &self.clients[self.active];
         const permission = if (client.permission != null) self.permissionRect() else null;
         const run_bottom = if (permission) |rect| rect.y - 8 else bounds.y + bounds.h - 110;
+        r.clip = bounds;
         try r.text(bounds.x + 14, run_y, "RUN", theme.muted);
         // A run shows its steps first: the question a run answers is which step
         // is holding it, and the transcript is the evidence underneath.
         var steps_height: f32 = 0;
-        if (self.run) |*active| {
+        if (self.activeRun()) |active| {
             for (active.steps, 0..) |*step, index| {
                 const y = run_y + 18 + @as(f32, @floatFromInt(index)) * 22;
                 if (y + 18 > run_bottom) break;
@@ -1958,10 +2090,13 @@ pub const App = struct {
                 };
                 try r.text(bounds.x + 14, y, mark, colour);
                 try r.text(bounds.x + 34, y, step.name, colour);
-                try r.text(bounds.x + 150, y, step.produces.label(), theme.muted);
+                // The name can be a command, so what the step produces has its
+                // own column rather than whatever the name left behind.
+                try r.text(bounds.x + 200, y, step.produces.label(), theme.muted);
             }
             steps_height = @min(@as(f32, @floatFromInt(active.steps.len)) * 22 + 10, @max(0, run_bottom - run_y - 18));
         }
+        r.clip = bounds;
         const run: Rect = .{ .x = bounds.x + 14, .y = run_y + 18 + steps_height, .w = bounds.w - 28, .h = @max(0, run_bottom - run_y - 18 - steps_height) };
         if (client.transcript.items.len == 0 and try self.drawPanel(r, "transcript", run)) {
             // A registered panel owns this space, so the interface does not
@@ -2073,27 +2208,26 @@ fn countLines(bytes: []const u8) usize {
     return n;
 }
 
+/// Text drawn from the top of a rect, wrapping at its width.
+fn wrapped(r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, color: theme.Color) !void {
+    if (rect.h < r.atlas.line_height or rect.w <= 0) return;
+    r.clip = rect;
+    const columns: usize = @intFromFloat(@max(1, rect.w / r.atlas.advance));
+    var spans: std.ArrayList([]const u8) = .empty;
+    try wrap.spans(frame, bytes, columns, &spans);
+    const rows: usize = @intFromFloat(rect.h / r.atlas.line_height);
+    for (spans.items[0..@min(spans.items.len, rows)], 0..) |span, row| {
+        try r.text(rect.x, rect.y + @as(f32, @floatFromInt(row)) * r.atlas.line_height, span, color);
+    }
+}
+
 fn wrappedTail(r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, scroll: usize, color: theme.Color) !void {
     if (rect.h < r.atlas.line_height or rect.w <= 0) return;
     r.clip = rect;
     const columns: usize = @intFromFloat(@max(1, rect.w / r.atlas.advance));
     const rows: usize = @intFromFloat(rect.h / r.atlas.line_height);
     var spans: std.ArrayList([]const u8) = .empty;
-    var start: usize = 0;
-    var pos: usize = 0;
-    var column: usize = 0;
-    while (pos < bytes.len) {
-        if (bytes[pos] == '\n' or column >= columns) {
-            try spans.append(frame, bytes[start..pos]);
-            if (bytes[pos] == '\n') pos += 1;
-            start = pos;
-            column = 0;
-            continue;
-        }
-        pos = text.next(bytes, pos);
-        column += 1;
-    }
-    try spans.append(frame, bytes[start..]);
+    try wrap.spans(frame, bytes, columns, &spans);
     const end = spans.items.len -| @min(scroll, spans.items.len -| 1);
     const begin = end -| rows;
     for (spans.items[begin..end], 0..) |span, row| try r.text(rect.x, rect.y + @as(f32, @floatFromInt(row)) * r.atlas.line_height, span, color);

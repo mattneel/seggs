@@ -334,7 +334,7 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
         8 => {
             // The starter workflow is described before the fixture replaces it,
             // so both the shape of a workflow and the round trip are reported.
-            if (app.run) |*starter| {
+            if (app.activeRun()) |starter| {
                 const current = starter.current();
                 std.log.info("run {s}: {d} steps, {d} artifacts, current={s}", .{
                     starter.name,
@@ -367,7 +367,6 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
     // does not depend on how fast a machine starts a process.
     if (!fixture_step_sent and frame >= 10) {
         if (app.agentReady(app.active)) {
-            if (app.run) |*existing| existing.deinit();
             const steps = [_]runs.Step{
                 .{ .name = "ask", .produces = .plan, .action = .{ .agent = .{ .harness = app.active, .request = "Say hello" } } },
                 .{ .name = "git --version", .produces = .checks, .action = .{ .command = &.{ "git", "--version" } } },
@@ -375,10 +374,16 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
                 // what separates a workflow's progress from its acceptance.
                 .{ .name = "approve", .produces = .review, .action = .approval },
             };
-            app.run = runs.Run.init(app.allocator, "fixture", &steps) catch |err| {
+            var fixture = runs.Run.init(app.allocator, "fixture", &steps) catch |err| {
                 std.log.err("run: fixture {s}", .{@errorName(err)});
                 return;
             };
+            app.runs.append(app.allocator, fixture) catch |err| {
+                fixture.deinit();
+                std.log.err("run: fixture {s}", .{@errorName(err)});
+                return;
+            };
+            app.run_index = app.runs.items.len - 1;
             fixture_step_sent = true;
             app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
         } else if (frame > 200) {
@@ -391,7 +396,7 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
     // before it is no longer running: a pipeline that fired everything at once
     // would not be a pipeline.
     if (fixture_step_sent and !run_reported) {
-        if (app.run) |*active| {
+        if (app.activeRun()) |active| {
             if (active.current()) |step| {
                 if (step.state == .waiting) {
                     app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
@@ -414,7 +419,7 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
     // Every step has to have produced something: an agent's answer, a command's
     // output with its exit status, and a person's decision.
     if (fixture_step_sent and !run_reported) {
-        const active = app.run orelse return;
+        const active = app.activeRun() orelse return;
         if (active.artifacts.items.len < 3) {
             if (frame > 400) std.log.err("run {s}: {d} steps, no answer recorded", .{ active.name, active.steps.len });
             return;

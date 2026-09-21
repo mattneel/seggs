@@ -12,4 +12,5 @@ test {
     _ = @import("acp/protocol.zig");
     _ = @import("agents/registry.zig");
     _ = @import("ui/layout.zig");
+    _ = @import("ui/wrap.zig");
 }

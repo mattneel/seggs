@@ -93,9 +93,11 @@ def main() -> None:
     # drawing comes from the editor through the library's own abstract
     # Graphics2D interface. build.zig compiles those sources, which is what
     # keeps a desktop toolkit out of a headless build.
-    source, commit = checkout("MicroTex", PINS["MicroTex"]["repository"], PINS["MicroTex"]["commit"])
-    resolved["MicroTex"] = {**PINS["MicroTex"], "commit": commit}
-    print(f"MicroTex source: {source}")
+    for name in ("tinyxml2", "MicroTex"):
+        pin = PINS[name]
+        source, commit = checkout(name, pin.get("repository"), pin.get("commit") or pin.get("tag"))
+        resolved[name] = {**pin, "commit": commit}
+        print(f"{name} source: {source}")
     (ROOT / ".deps/resolved.json").write_text(json.dumps(resolved, indent=2) + "\n")
     print(f"SDL SDK prefix: {prefix}")
     print("Zig toolchain, Vulkan driver, and system fonts remain external prerequisites.")

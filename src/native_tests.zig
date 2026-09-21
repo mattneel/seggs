@@ -595,7 +595,6 @@ test "shaper glyph indices select the same glyph as the codepoint" {
             if (mismatches <= 5) std.debug.print("{c}: cp {d}x{d} vs index {d}x{d}\n", .{ @as(u8, @intCast(cp)), by_codepoint.*.w, by_codepoint.*.h, by_index.*.w, by_index.*.h });
         }
     }
-    std.debug.print("PROBE mismatched glyphs: {d}\n", .{mismatches});
     try std.testing.expectEqual(@as(usize, 0), mismatches);
 }
 

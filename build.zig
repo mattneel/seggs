@@ -177,7 +177,7 @@ pub fn build(b: *std.Build) void {
     // The list is explicit rather than globbed for the reason the Yoga list
     // above is: bumping the pin then fails here rather than silently compiling a
     // partial engine and rendering wrong.
-    const microtex_root = b.path(".deps/MicroTex");
+    const microtex_root = b.path(".deps/src/MicroTex");
     const microtex_lib = b.addLibrary(.{ .name = "microtex", .root_module = b.createModule(.{
         .target = target,
         .optimize = optimize,
@@ -186,6 +186,15 @@ pub fn build(b: *std.Build) void {
     }) });
     microtex_lib.root_module.addIncludePath(microtex_root.path(b, "src"));
     microtex_lib.root_module.addIncludePath(microtex_root.path(b, "src/graphic"));
+    // The engine's one dependency that is not itself. Vendored and compiled
+    // here rather than looked up with pkg-config, because the gate builds on
+    // Linux, macOS, and Windows and the package is present on none of them.
+    microtex_lib.root_module.addIncludePath(b.path(".deps/src/tinyxml2"));
+    microtex_lib.root_module.addCSourceFiles(.{
+        .root = b.path(".deps/src/tinyxml2"),
+        .flags = &.{"-std=c++17"},
+        .files = &.{"tinyxml2.cpp"},
+    });
     microtex_lib.root_module.addCSourceFiles(.{
         .root = microtex_root,
         .flags = &.{"-std=c++17"},
@@ -270,10 +279,6 @@ pub fn build(b: *std.Build) void {
             "src/render.cpp",
         },
     });
-    // The one system dependency the engine has, alongside a C++17 compiler.
-    // MicroTex parses its resource XML with it; the repository treats it the way
-    // it treats FreeType for SDL_ttf, as a documented system package.
-    microtex_lib.root_module.linkSystemLibrary("tinyxml2", .{ .use_pkg_config = .force });
 
     app.addImport("yoga", yoga_module);
     // QuickJS-NG bindings use splitType, which needs LLVM codegen in Zig 0.16.
@@ -293,7 +298,6 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c++17"},
         .files = &.{"src/ui/microtex_shim.cpp"},
     });
-    exe.root_module.linkSystemLibrary("tinyxml2", .{ .use_pkg_config = .force });
     exe.root_module.link_libcpp = true;
     // The C surface of the shim, so Zig can call it without a C++ compiler in
     // the loop: the same translate-c step the Yoga module above uses.
@@ -356,7 +360,6 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c++17"},
         .files = &.{"src/ui/microtex_shim.cpp"},
     });
-    native_test.root_module.linkSystemLibrary("tinyxml2", .{ .use_pkg_config = .force });
     native_test.root_module.link_libcpp = true;
     native_test.root_module.addImport("microtex", microtex_module);
     native_test.root_module.addImport("native", native);

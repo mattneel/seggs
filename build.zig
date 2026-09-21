@@ -177,13 +177,6 @@ pub fn build(b: *std.Build) void {
     // The list is explicit rather than globbed for the reason the Yoga list
     // above is: bumping the pin then fails here rather than silently compiling a
     // partial engine and rendering wrong.
-    // Checked while configuring rather than left to the compiler: a missing
-    // checkout means the bootstrap that fetches these did not run, and the
-    // compiler's own error names a file without naming the remedy.
-    for ([_][]const u8{ ".deps/src/MicroTex", ".deps/src/tinyxml2" }) |directory| {
-        std.Io.Dir.cwd().access(b.graph.io, directory, .{}) catch
-            std.debug.panic("{s} is missing. Run `python3 tools/bootstrap.py --sources-only`.", .{directory});
-    }
     const microtex_root = b.path(".deps/src/MicroTex");
     const microtex_lib = b.addLibrary(.{ .name = "microtex", .root_module = b.createModule(.{
         .target = target,
@@ -191,6 +184,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .link_libcpp = true,
     }) });
+    // A step of this library rather than of the configure. The sources it
+    // compiles are fetched, not present, and a missing checkout must fail the
+    // target that needs it: `zig build test` builds none of this and runs on a
+    // machine that has only the toolchain. The compiler's own error names a
+    // file; this names what to run.
+    const check_sources = b.addSystemCommand(&.{ python, "tools/check_sources.py" });
+    microtex_lib.step.dependOn(&check_sources.step);
     microtex_lib.root_module.addIncludePath(microtex_root.path(b, "src"));
     microtex_lib.root_module.addIncludePath(microtex_root.path(b, "src/graphic"));
     // The engine's one dependency that is not itself. Vendored and compiled

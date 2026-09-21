@@ -17,6 +17,9 @@ const ghostty = @import("ghostty");
 const theme = @import("ui/theme.zig");
 const runs = @import("editor/runs.zig");
 
+/// The dividers between docks, which is what a reader drags to resize one.
+const Divider = enum { explorer, agents, terminal };
+
 /// A context row in the inspector is its name and, under it, what it would
 /// carry. The height follows the line metrics rather than a number chosen for
 /// one font size, because the interface does not get to decide how tall a line
@@ -154,6 +157,10 @@ pub const App = struct {
     /// what a terminal in an editor is for.
     terminal: ?vt.Terminal = null,
     shell: ?pty.Pty = null,
+    /// What the reader has dragged a dock to, if anything.
+    resize: layout.Layout.Resize = .{},
+    dragging_divider: ?Divider = null,
+
     /// What the pointer has dragged over in the terminal, when it has.
     terminal_selection: ?TerminalSelection = null,
     terminal_dragging: bool = false,
@@ -520,9 +527,12 @@ pub const App = struct {
             c.SDL_EVENT_MOUSE_BUTTON_UP => {
                 self.drag = false;
                 self.terminal_dragging = false;
+                self.dragging_divider = null;
                 if (self.selection_anchor == self.workspace.activeDocument().cursor) self.selection_anchor = null;
             },
-            c.SDL_EVENT_MOUSE_MOTION => if (self.terminal_dragging) {
+            c.SDL_EVENT_MOUSE_MOTION => if (self.dragging_divider) |divider| {
+                self.dragDivider(divider, ev.motion.x, ev.motion.y);
+            } else if (self.terminal_dragging) {
                 if (self.terminal_selection) |*selection| selection.cursor = self.terminalCell(ev.motion.x, ev.motion.y);
             } else if (!self.drag) self.hoverPanel(ev.motion.x, ev.motion.y) else {
                 self.workspace.activeDocument().cursor = self.positionAt(ev.motion.x, ev.motion.y);
@@ -1125,6 +1135,13 @@ pub const App = struct {
 
     fn mouseDown(self: *App, x: f32, y: f32) !void {
         if (self.overlay != .none) return;
+        // A divider is the first thing the pointer can mean: everything else
+        // lives inside a dock, and the line between two of them belongs to
+        // neither.
+        if (self.dividerAt(x, y)) |divider| {
+            self.dragging_divider = divider;
+            return;
+        }
         // The terminal's own strip belongs to the interface rather than to the
         // shell: a tab is not a click the program gets to see.
         if (self.terminalOpen() and self.geometry.terminal.contains(x, y)) {
@@ -1313,17 +1330,17 @@ pub const App = struct {
         try self.publishSnapshot(frame);
         self.char_width = r.atlas.advance;
         self.line_height = r.atlas.line_height;
-        self.geometry = layout.Layout.calculate(
+        self.geometry = layout.Layout.calculateResized(
             r.width,
             r.height,
             self.sidebar,
             .{ .line_height = self.line_height, .char_width = self.char_width },
             if (self.terminalOpen()) self.terminal_fraction else 0,
+            self.resize,
         );
         const g = self.geometry;
         try r.rect(.{ .x = 0, .y = 0, .w = r.width, .h = r.height }, theme.background);
-        try r.rect(g.title, theme.panel);
-        try r.text(16, 11, "SEGGS", theme.accent);
+
         try r.text(116, 11, "/ agent-native workspace", theme.muted);
         try r.text(@max(400, r.width - 174), 11, "SDL3 GPU / ACP", theme.accent);
         _ = try self.drawPanel(r, frame, "activity", g.activity);
@@ -1380,7 +1397,7 @@ pub const App = struct {
         // itself keeps drawing the text, because that is the document rather
         // than chrome around it.
         _ = try self.drawPanel(r, frame, "tabs", .{ .x = bounds.x, .y = bounds.y, .w = bounds.w, .h = 36 });
-        _ = try self.drawPanel(r, frame, "header", .{ .x = bounds.x, .y = bounds.y + 36, .w = bounds.w, .h = 30 });
+
         const loc = self.cursorLocation();
         const viewport = self.editorRect();
         r.clip = viewport;
@@ -1539,6 +1556,38 @@ pub const App = struct {
         if (from == to) return;
         self.shells.move(from, to);
         self.status("Terminal {d} of {d}.", .{ self.shells.active + 1, count });
+    }
+
+    /// Which divider a point is on. The band is a few pixels either side,
+    /// because a divider one pixel wide is a divider nobody can hit.
+    pub fn dividerAt(self: *const App, x: f32, y: f32) ?Divider {
+        const g = self.geometry;
+        const grab: f32 = 4;
+        if (g.explorer.w > 0 and y >= g.explorer.y and y < g.explorer.y + g.explorer.h and
+            x >= g.explorer.x + g.explorer.w - grab and x <= g.explorer.x + g.explorer.w + grab)
+            return .explorer;
+        if (g.agents.w > 0 and y >= g.agents.y and y < g.agents.y + g.agents.h and
+            x >= g.agents.x - grab and x <= g.agents.x + grab)
+            return .agents;
+        if (g.terminal.h > 0 and x >= g.terminal.x and x < g.terminal.x + g.terminal.w and
+            y >= g.terminal.y - grab and y <= g.terminal.y + grab)
+            return .terminal;
+        return null;
+    }
+
+    /// Drag a divider to where the pointer is. The layout decides what that
+    /// means: a drag past a limit lands on the limit.
+    fn dragDivider(self: *App, divider: Divider, x: f32, y: f32) void {
+        const g = self.geometry;
+        switch (divider) {
+            .explorer => self.resize.explorer = @max(0, x - g.explorer.x),
+            .agents => self.resize.agents = @max(0, g.agents.x + g.agents.w - x),
+            .terminal => {
+                const body = @max(1, g.explorer.h);
+                const above = g.terminal.y + g.terminal.h - y;
+                self.terminal_fraction = @max(0.05, @min(0.9, above / body));
+            },
+        }
     }
 
     /// A cell the pointer is over, clamped to the screen.
@@ -2677,7 +2726,11 @@ pub const App = struct {
         const empty = try std.fmt.bufPrint(&placeholder, "Ask {s}…", .{client.preset.name});
         try wrappedTail(r, frame, prompt_box.inset(8), if (self.prompt_text.items.len == 0) empty else self.prompt_text.items, 0, if (self.prompt_text.items.len == 0) theme.muted else theme.text);
         r.clip = bounds;
-        try r.text(bounds.x + 14, bounds.y + bounds.h - 27, "click to attach · click a name to pipe", theme.muted);
+        // The hint is a line, not a paragraph: cut to the width it has, like
+        // every other row in this panel.
+        var hint: [128]u8 = undefined;
+        const room: usize = @intFromFloat(@max(4, (bounds.w - 28) / r.atlas.advance));
+        try r.text(bounds.x + 14, bounds.y + bounds.h - 27, wrap.elide(&hint, "click to attach · click a name to pipe", room), theme.muted);
     }
 
     /// A short, honest description of what a context row would carry. The

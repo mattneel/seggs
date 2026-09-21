@@ -39,7 +39,7 @@ METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
-ANSWER_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, (\S+) from (\S+), (\d+) bytes")
+ANSWER_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, (\S+) from (.+?), (\d+) bytes")
 
 INSPECTOR_LINE = re.compile(r"inspector: selection=false")
 
@@ -675,12 +675,17 @@ def check_run(binary: str) -> None:
     require(int(started.group(2)) == 3, f"the run holds {started.group(2)} steps, expected the three the starter workflow defines")
     require(int(started.group(3)) >= 1, "the run started without the artifact it is supposed to carry")
     require(started.group(4) == "plan", f"the run's current step is {started.group(4)}, expected the first one")
-    require(answered is not None, "a step was sent to a harness and nothing was recorded")
-    require(int(answered.group(2)) == 1, f"the run recorded {answered.group(2)} steps, expected the one it has")
+    require(answered is not None, "a step was sent and nothing was recorded")
+    require(int(answered.group(2)) == 2, f"the run recorded {answered.group(2)} steps, expected the two it has")
+    require(int(answered.group(3)) == 2, f"the run holds {answered.group(3)} artifact(s), expected one per step")
+    # The last step is a command, so its artifact carries what a command says:
+    # the exit status is the evidence an agent's summary cannot replace.
+    require(answered.group(4) == "checks", f"the last artifact is a {answered.group(4)}, expected a command's checks")
+    require(answered.group(5).startswith("git"), f"the artifact came from {answered.group(5)}, expected the command step")
     require(int(answered.group(6)) > 0, "the recorded artifact is empty: a step that says nothing did not run")
     print(
         f"run: {started.group(1)} started with {started.group(2)} steps and {started.group(3)} artifact(s) at {started.group(4)}, "
-        f"then {answered.group(4)} from {answered.group(5)} recorded {answered.group(6)} bytes"
+        f"then a harness answered and {answered.group(5)} recorded {answered.group(6)} bytes of {answered.group(4)}"
     )
 
 

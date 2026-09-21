@@ -309,11 +309,24 @@ fn exerciseRun(app: *App, frame: usize) void {
     // The harness has to be up before a step can be sent to it, and its answer
     // arrives when it arrives: both are polled for rather than assumed, so this
     // does not depend on how fast a machine starts a process.
+    // The run is driven one step at a time, and each step is sent when the one
+    // before it is no longer running: a pipeline that fired everything at once
+    // would not be a pipeline.
+    if (fixture_step_sent and !run_reported) {
+        if (app.run) |*active| {
+            if (active.current()) |step| {
+                if (step.state == .waiting) {
+                    app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
+                }
+            }
+        }
+    }
     if (!fixture_step_sent and frame >= 10) {
         if (app.agentReady(app.active)) {
             if (app.run) |*existing| existing.deinit();
             const steps = [_]runs.Step{
-                .{ .name = "ask", .produces = .plan, .harness = app.active, .request = "Say hello" },
+                .{ .name = "ask", .produces = .plan, .action = .{ .agent = .{ .harness = app.active, .request = "Say hello" } } },
+                .{ .name = "git --version", .produces = .checks, .action = .{ .command = &.{ "git", "--version" } } },
             };
             app.run = runs.Run.init(app.allocator, "fixture", &steps) catch |err| {
                 std.log.err("run: fixture {s}", .{@errorName(err)});
@@ -330,7 +343,9 @@ fn exerciseRun(app: *App, frame: usize) void {
     const active = if (app.run) |*value| value else return;
     // The fixture has one step and starts from nothing, so a single artifact is
     // the answer: the record that a step ran and a harness replied.
-    if (active.artifacts.items.len == 0) {
+    // Both steps have to have produced something: an agent's answer and a
+    // command's output with its exit status.
+    if (active.artifacts.items.len < 2) {
         if (frame == 240) {
             std.log.err("run {s}: {d} steps, no answer recorded", .{ active.name, active.steps.len });
         }

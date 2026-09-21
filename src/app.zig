@@ -11,6 +11,7 @@ const Renderer = @import("gpu/renderer.zig").Renderer;
 const layout = @import("ui/layout.zig");
 const vt = @import("services/vt.zig");
 const pty = @import("services/pty.zig");
+const process = @import("services/process.zig");
 const ghostty = @import("ghostty");
 const theme = @import("ui/theme.zig");
 const runs = @import("editor/runs.zig");
@@ -1638,16 +1639,57 @@ pub const App = struct {
     pub fn runStep(self: *App) !void {
         const run = if (self.run) |*value| value else return error.NoRun;
         const step = run.current() orelse return error.RunFinished;
-        if (step.harness >= self.clients.len) return error.NoSuchAgent;
-        const client = &self.clients[step.harness];
-        if (client.state != .ready) return error.AgentNotReady;
-        step.turns_mark = client.completed_turns;
-        step.transcript_mark = client.transcript.items.len;
-        const message = try run.promptFor(self.allocator, step, step.request);
-        defer self.allocator.free(message);
-        try client.prompt(message);
-        step.state = .running;
-        self.status("Run {s}: {s} sent to {s}.", .{ run.name, step.name, client.preset.name });
+        switch (step.action) {
+            .agent => |agent| {
+                if (agent.harness >= self.clients.len) return error.NoSuchAgent;
+                const client = &self.clients[agent.harness];
+                if (client.state != .ready) return error.AgentNotReady;
+                step.turns_mark = client.completed_turns;
+                step.transcript_mark = client.transcript.items.len;
+                const message = try run.promptFor(self.allocator, step, agent.request);
+                defer self.allocator.free(message);
+                try client.prompt(message);
+                step.state = .running;
+                self.status("Run {s}: {s} sent to {s}.", .{ run.name, step.name, client.preset.name });
+            },
+            .command => |argv| {
+                // The command runs where the work is, and its exit status is
+                // part of the artifact: a step that failed is not a step that
+                // finished, and the run stops rather than feeding a hopeful
+                // summary to the next step.
+                var outcome = process.run(self.allocator, self.workspace.root, argv) catch |err| {
+                    run.fail(step);
+                    self.status("Run {s}: {s} could not run: {s}", .{ run.name, step.name, @errorName(err) });
+                    return;
+                };
+                defer outcome.deinit(self.allocator);
+                var body: std.ArrayList(u8) = .empty;
+                defer body.deinit(self.allocator);
+                for (argv, 0..) |word, index| {
+                    if (index > 0) try body.append(self.allocator, ' ');
+                    try body.appendSlice(self.allocator, word);
+                }
+                var header: [32]u8 = undefined;
+                try body.appendSlice(self.allocator, try std.fmt.bufPrint(&header, "\nexit {d}\n", .{outcome.exit}));
+                try body.appendSlice(self.allocator, outcome.stdout);
+                if (outcome.stderr.len > 0) {
+                    try body.appendSlice(self.allocator, "\n[stderr]\n");
+                    try body.appendSlice(self.allocator, outcome.stderr);
+                }
+                try run.record(step, body.items);
+                if (!outcome.ok()) {
+                    run.fail(step);
+                    self.status("Run {s}: {s} exited {d}.", .{ run.name, step.name, outcome.exit });
+                } else {
+                    self.status("Run {s}: {s} passed.", .{ run.name, step.name });
+                }
+            },
+            .approval => {
+                step.state = .running;
+                run.state = .waiting_for_approval;
+                self.status("Run {s}: {s} waits for you.", .{ run.name, step.name });
+            },
+        }
     }
 
     /// Record what a finished step produced. A turn that ended is not a
@@ -1656,8 +1698,13 @@ pub const App = struct {
     fn advanceRun(self: *App) void {
         const run = if (self.run) |*value| value else return;
         const step = run.current() orelse return;
-        if (step.state != .running or step.harness >= self.clients.len) return;
-        const client = &self.clients[step.harness];
+        if (step.state != .running) return;
+        const harness = switch (step.action) {
+            .agent => |agent| agent.harness,
+            else => return,
+        };
+        if (harness >= self.clients.len) return;
+        const client = &self.clients[harness];
         // The conversation is bounded, so an offset only means anything while
         // nothing has been dropped: a transcript shorter than the mark has
         // wrapped, and what remains is the tail.

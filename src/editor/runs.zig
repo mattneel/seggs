@@ -34,12 +34,29 @@ pub const Kind = enum {
     }
 };
 
-/// One invocation. Steps name a harness by index rather than by handle: the
-/// engine does not own processes, so a run outlives any panel that shows it.
+/// What a step does. The engine does not own processes or harnesses, so a step
+/// describes its action and the caller performs it: that is what lets a run
+/// outlive any panel that shows it.
+pub const Action = union(enum) {
+    /// One turn with a harness, named by index into the caller's list.
+    agent: struct {
+        harness: usize,
+        request: []const u8,
+    },
+    /// A command, run where the run's workspace is. Its exit status is part of
+    /// the evidence, so a failure downstream can tell a real result from a
+    /// hopeful one.
+    command: []const []const u8,
+    /// A human decision. Nothing downstream starts until it is made.
+    approval,
+};
+
+/// One invocation.
 pub const Step = struct {
     name: []const u8,
-    /// What this step hands to the harness, and therefore what it needs first.
+    /// What this step hands on, and therefore what it needs first.
     produces: Kind,
+    action: Action = .approval,
     /// Which harness, by index into the caller's list. A command step ignores
     /// it.
     harness: usize = 0,

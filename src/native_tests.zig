@@ -24,7 +24,10 @@ const ext_ui = @import("ext/ui.zig");
 // Importing the module runs the tests it declares.
 test {
     std.testing.refAllDecls(ext_ui);
+    _ = process;
 }
+
+const process = @import("services/process.zig");
 
 const Allocator = std.mem.Allocator;
 

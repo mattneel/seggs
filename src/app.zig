@@ -25,6 +25,7 @@ fn inspectorRowHeight(line_height: f32) f32 {
 }
 const review = @import("editor/review.zig");
 const wrap = @import("ui/wrap.zig");
+const shell_integration = @import("services/shell.zig");
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
@@ -406,8 +407,26 @@ pub const App = struct {
         if (self.inspector_context[1]) file = try document.snapshot(self.allocator);
         defer if (file) |body| self.allocator.free(body);
 
+        // The terminal's last command is a result with a command line, when the
+        // shell reported one. A screen with no markers attached as a command
+        // would be a claim about what ran that nothing supports, so it is
+        // attached as what it is: the screen.
+        var command: ?[]u8 = null;
         var output: ?[]u8 = null;
-        if (self.inspector_context[2]) output = self.terminalScreen(self.allocator) catch null;
+        if (self.inspector_context[2]) {
+            if (self.terminal) |*terminal| {
+                if (terminal.lastCommand(self.allocator) catch null) |result| {
+                    var owned = result;
+                    command = owned.command;
+                    output = owned.output;
+                    owned.command = &.{};
+                    owned.output = &.{};
+                } else {
+                    output = self.terminalScreen(self.allocator) catch null;
+                }
+            }
+        }
+        defer if (command) |body| self.allocator.free(body);
         defer if (output) |body| self.allocator.free(body);
 
         const diagnostics = try self.diagnosticContext();
@@ -418,6 +437,7 @@ pub const App = struct {
             .selection = selection,
             .file = file,
             .diagnostics = diagnostics,
+            .command = command,
             .output = output,
         }, self.prompt_text.items);
     }
@@ -1345,8 +1365,32 @@ pub const App = struct {
             return;
         }
         if (self.shell == null) {
-            const shell_path: []const u8 = if (std.c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
-            self.shell = pty.Pty.spawn(self.allocator, &.{shell_path}) catch |err| {
+            // libc's getenv, not a shim: this is the same call the rest of the
+            // platform layer makes, and the one that actually reads the
+            // environment the process was started with.
+            const shell_path: []const u8 = if (c.getenv("SHELL")) |value| std.mem.span(value) else "/bin/sh";
+            // The shell is asked to mark its own commands, so a command result
+            // is read from the emulator rather than inferred from the shape of
+            // the screen. A shell the integration does not know is run as it is.
+            var plan = shell_integration.integrate(self.allocator, shell_path) catch |err| {
+                // A shell that cannot be asked to mark its commands still runs;
+                // the terminal just reads its screen as text, and says why.
+                self.status("terminal: no command markers ({s})", .{@errorName(err)});
+                return;
+            };
+            defer if (plan) |*value| value.deinit(self.allocator);
+            if (plan == null) self.status("terminal: {s} reports no command boundaries", .{std.fs.path.basename(shell_path)});
+            if (plan) |value| {
+                if (value.variable) |variable| {
+                    const name = self.allocator.dupeSentinel(u8, variable.name, 0) catch null;
+                    defer if (name) |bytes| self.allocator.free(bytes);
+                    const setting = self.allocator.dupeSentinel(u8, variable.value, 0) catch null;
+                    defer if (setting) |bytes| self.allocator.free(bytes);
+                    if (name != null and setting != null) _ = c.setenv(name.?, setting.?, 1);
+                }
+            }
+            const shell_argv: []const []const u8 = if (plan) |value| value.argv else &.{shell_path};
+            self.shell = pty.Pty.spawn(self.allocator, shell_argv) catch |err| {
                 self.status("terminal: {s}", .{@errorName(err)});
                 return;
             };
@@ -1736,6 +1780,16 @@ pub const App = struct {
     /// What a harness has said, for reporting and tests.
     pub fn agentWords(self: *const App, index: usize) []const u8 {
         return self.clients[index].transcript.items;
+    }
+
+    /// The terminal's last command, as the shell reported it. Null when the
+    /// shell reports nothing, which is not the same as an empty command: one is
+    /// a terminal that does not know, the other is a command that did nothing.
+    pub fn terminalCommand(self: *App, allocator: std.mem.Allocator) !?[]u8 {
+        const terminal = if (self.terminal) |*value| value else return null;
+        const result = (try terminal.lastCommand(allocator)) orelse return null;
+        allocator.free(result.output);
+        return result.command;
     }
 
     /// Whether a harness is up and able to take a turn.
@@ -2232,7 +2286,8 @@ pub const App = struct {
             },
             else => {
                 const terminal = if (self.terminal) |*value| value else return "no terminal";
-                return std.fmt.bufPrint(&self.inspector_scratch[2], "{d} rows of screen", .{terminal.rows()}) catch "terminal";
+                _ = terminal;
+                return "last command";
             },
         }
     }

@@ -25,9 +25,11 @@ const ext_ui = @import("ext/ui.zig");
 test {
     std.testing.refAllDecls(ext_ui);
     _ = process;
+    _ = shell_integration;
 }
 
 const process = @import("services/process.zig");
+const shell_integration = @import("services/shell.zig");
 
 const Allocator = std.mem.Allocator;
 

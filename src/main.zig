@@ -307,6 +307,19 @@ fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {
     // The echoed command can wrap across rows and split any word in it, so the
     // proof is a string only running the command can produce: the loop's last
     // line, whose text the command line spells differently.
+    // The shell was asked to mark its own commands, so the terminal should know
+    // which one printed this, and the fixture checks that rather than assuming
+    // it: a marker that never arrived reads as a screen of text.
+    // The shell was asked to mark its own commands. Whether it did is the
+    // difference between a terminal result that knows what produced it and a
+    // screen of text, so the fixture reports which one it got.
+    if (app.terminalCommand(a) catch null) |command| {
+        defer a.free(command);
+        const trimmed = std.mem.trim(u8, command, " \r\n");
+        std.log.info("terminal: the shell marked its command: {s}", .{trimmed});
+    } else {
+        std.log.info("terminal: this shell reports no command boundaries; the screen is what it is", .{});
+    }
     const answered = std.mem.indexOf(u8, text, "history-30") != null;
     const printed = std.mem.indexOf(u8, text, "seggs-terminal") != null;
     if (answered and printed) {

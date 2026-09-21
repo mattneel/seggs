@@ -39,6 +39,8 @@ METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
+COMMAND_LINE = re.compile(r"terminal: (the shell marked its command: (.+)|this shell reports no command boundaries)")
+
 REVIEW_LINE = re.compile(r"review: (\d+) change\(s\) waiting, accepted=(true|false)")
 ANSWER_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, (\S+) from (.+?), (\d+) bytes")
 
@@ -638,8 +640,16 @@ def check_terminal(binary: str) -> None:
     must appear there, which no single component could fake.
     """
     out = Path("/tmp/seggs-terminal.ppm")
-    command = display_command([binary, "--windowed", "--frames", "500", "--exercise-terminal", "--screenshot", str(out)], app_env())
-    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    # The shell is asked to mark its own commands, so the check names one the
+    # integration knows when it is installed: the marked path is what gets
+    # exercised, rather than whichever shell the runner happened to export.
+    env = app_env()
+    for candidate in ("/usr/bin/bash", "/bin/bash"):
+        if os.path.exists(candidate):
+            env["SHELL"] = candidate
+            break
+    command = display_command([binary, "--windowed", "--frames", "500", "--exercise-terminal", "--screenshot", str(out)], env)
+    result = subprocess.run(command, check=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     output = app_output(result)
     if TERMINAL_LINE.search(output) is None:
         print("terminal run output:")
@@ -647,6 +657,12 @@ def check_terminal(binary: str) -> None:
             print(f"  {line}")
     require(TERMINAL_LINE.search(output) is not None, "the terminal did not carry the shell's answer")
     require(ATLAS_LINE.search(output) is not None, "the frame loop did not finish with the terminal open")
+    marked = COMMAND_LINE.search(output)
+    if marked is None:
+        for line in output.splitlines()[-8:]:
+            print(f"  {line}")
+    require(marked is not None, "the terminal fixture reported nothing about command boundaries")
+    print(f"terminal: {marked.group(0)[:100]}")
     # The dock is drawn, not just emulated: a screen that reads text back while
     # the panel stays blank is the failure this check exists to catch.
     width, height, pixels = parse_ppm(out)

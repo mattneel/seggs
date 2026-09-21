@@ -20,6 +20,10 @@ pub const Terminal = struct {
     /// must keep its own rather than borrowing one the next cell overwrites.
     grapheme_storage: [max_cells][max_graphemes]u32 = undefined,
     cell_storage: [max_cells]Cell = undefined,
+    /// Raw cell values, one per column of the row being visited. The library
+    /// hands these back by value into storage the caller owns.
+    raw_storage: [max_cells]g.GhosttyCell = undefined,
+
     /// Scratch for the one library call that rewrites its input.
     paste_scratch: std.ArrayList(u8) = .empty,
     key_encoder: g.GhosttyKeyEncoder = null,
@@ -32,10 +36,30 @@ pub const Terminal = struct {
     pub const Dirty = enum { clean, partial, full };
 
     /// One cell of the grid, as the renderer wants it.
+    /// What a cell is part of, as the shell marked it. A shell that reports its
+    /// own command boundaries with OSC 133 turns a screen of text into a list
+    /// of prompts, commands, and results; one that does not leaves every cell
+    /// ordinary output, which is why nothing here guesses.
+    pub const Semantic = enum { output, input, prompt };
+
     pub const Cell = struct {
         /// The grapheme's codepoints. Empty means the cell drew nothing.
         codepoints: []const u32,
         style: g.GhosttyStyle,
+        semantic: Semantic = .output,
+    };
+
+    /// The last command on screen and what it printed, taken from the cells the
+    /// shell marked rather than from a guess about where a prompt ends.
+    pub const CommandResult = struct {
+        command: []u8,
+        output: []u8,
+
+        pub fn deinit(self: *CommandResult, a: Allocator) void {
+            a.free(self.command);
+            a.free(self.output);
+            self.* = undefined;
+        }
     };
 
     pub const Cursor = struct {
@@ -164,6 +188,13 @@ pub const Terminal = struct {
             var count: usize = 0;
             while (g.ghostty_render_state_row_cells_next(self.row_cells)) {
                 if (count == max_cells) break;
+                // The raw cell carries what the shell said about this cell, and
+                // it is a different question from what the cell looks like.
+                var raw: g.GhosttyCell = self.raw_storage[count];
+                var semantic: g.GhosttyCellSemanticContent = @intCast(g.GHOSTTY_CELL_SEMANTIC_OUTPUT);
+                if (g.ghostty_render_state_row_cells_get(self.row_cells, g.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, @ptrCast(&raw)) == g.GHOSTTY_SUCCESS) {
+                    _ = g.ghostty_cell_get(raw, g.GHOSTTY_CELL_DATA_SEMANTIC_CONTENT, @ptrCast(&semantic));
+                }
                 var grapheme_len: u32 = 0;
                 _ = g.ghostty_render_state_row_cells_get(self.row_cells, g.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, @ptrCast(&grapheme_len));
                 // Sized structs again: the style is read through one, so the
@@ -175,9 +206,13 @@ pub const Terminal = struct {
                 if (grapheme_len != 0) {
                     const take = @min(grapheme_len, max_graphemes);
                     _ = g.ghostty_render_state_row_cells_get(self.row_cells, g.GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, @ptrCast(&self.grapheme_storage[count]));
-                    self.cell_storage[count] = .{ .codepoints = self.grapheme_storage[count][0..take], .style = style };
+                    self.cell_storage[count] = .{
+                        .codepoints = self.grapheme_storage[count][0..take],
+                        .style = style,
+                        .semantic = semanticOf(semantic),
+                    };
                 } else {
-                    self.cell_storage[count] = .{ .codepoints = &.{}, .style = style };
+                    self.cell_storage[count] = .{ .codepoints = &.{}, .style = style, .semantic = semanticOf(semantic) };
                 }
                 count += 1;
             }
@@ -338,6 +373,87 @@ pub const Terminal = struct {
         var query = g.GhosttyTerminalModeConfig{ .mode = which, .value = false };
         _ = g.ghostty_terminal_get(self.handle, g.GHOSTTY_TERMINAL_DATA_MODE, @ptrCast(&query));
         return query.value;
+    }
+
+    /// The last command the shell marked, and what it printed. Null when the
+    /// shell has not marked anything: text that merely looks like a prompt is
+    /// not a command, and the difference is the whole point of the markers.
+    pub fn lastCommand(self: *Terminal, a: Allocator) !?CommandResult {
+        const Collector = struct {
+            list: Allocator,
+            /// Every row is written out at full width so a row's text can be
+            /// taken by its number, and so a command keeps the columns it was
+            /// typed in.
+            width: usize,
+            /// One entry per row: was any cell part of a command, and was any
+            /// part of its output?
+            commands: std.ArrayList(u16) = .empty,
+            results: std.ArrayList(u16) = .empty,
+            text: std.ArrayList(u8) = .empty,
+
+            fn visit(collector: *@This(), row: u16, cells: []const Cell) anyerror!void {
+                var is_command = false;
+                var is_result = false;
+                var wrote = false;
+                var column: usize = collector.width;
+                for (cells) |cell| {
+                    if (column == 0) break;
+                    switch (cell.semantic) {
+                        .input => is_command = true,
+                        .output => is_result = true,
+                        .prompt => {},
+                    }
+                    const byte: u8 = if (cell.codepoints.len == 0 or cell.codepoints[0] > 0x7f)
+                        ' '
+                    else
+                        @intCast(cell.codepoints[0]);
+                    try collector.text.append(collector.list, byte);
+                    column -= 1;
+                    if (cell.codepoints.len != 0) wrote = true;
+                }
+                while (column > 0) : (column -= 1) try collector.text.append(collector.list, ' ');
+                if (is_command) try collector.commands.append(collector.list, row);
+                // A row that is part of a command is not part of its output,
+                // however the shell tagged the rest of the line.
+                if (is_result and !is_command and wrote) try collector.results.append(collector.list, row);
+            }
+        };
+        var collector: Collector = .{ .list = a, .width = self.cols() };
+        defer collector.commands.deinit(a);
+        defer collector.results.deinit(a);
+        defer collector.text.deinit(a);
+        try self.visitRows(&collector, Collector.visit);
+        if (collector.commands.items.len == 0) return null;
+        // The last command on screen, and the output that followed it: anything
+        // before it belongs to a command that already ran.
+        const last = collector.commands.items[collector.commands.items.len - 1];
+        var command: std.ArrayList(u8) = .empty;
+        errdefer command.deinit(a);
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(a);
+        // A command long enough to wrap occupies consecutive rows, so the whole
+        // of it is the run of them that ends at the last one: anything earlier
+        // belongs to a command that already ran.
+        const width = self.cols();
+        var first = last;
+        while (first > 0) {
+            var contiguous = false;
+            for (collector.commands.items) |row| {
+                if (row == first - 1) contiguous = true;
+            }
+            if (!contiguous) break;
+            first -= 1;
+        }
+        for (collector.commands.items) |row| {
+            if (row < first or row > last) continue;
+            try command.appendSlice(a, collector.text.items[@as(usize, row) * width ..][0..width]);
+        }
+        for (collector.results.items) |row| {
+            if (row <= last) continue;
+            try output.appendSlice(a, collector.text.items[@as(usize, row) * width ..][0..width]);
+            try output.append(a, '\n');
+        }
+        return .{ .command = try command.toOwnedSlice(a), .output = try output.toOwnedSlice(a) };
     }
 
     /// Move the viewport through scrollback. Negative scrolls up into history,
@@ -635,4 +751,34 @@ test "the scrollbar reports history once the screen overflows" {
     // Five lines on a three-line screen: two rows are history the bar has to
     // account for, which is what makes it worth drawing.
     try std.testing.expect(bar.total > bar.len);
+}
+
+fn semanticOf(value: g.GhosttyCellSemanticContent) Terminal.Semantic {
+    return switch (value) {
+        g.GHOSTTY_CELL_SEMANTIC_INPUT => .input,
+        g.GHOSTTY_CELL_SEMANTIC_PROMPT => .prompt,
+        else => .output,
+    };
+}
+
+test "a shell that marks its commands gives a result, and one that does not gives nothing" {
+    var terminal = try Terminal.init(std.testing.allocator, 40, 6);
+    defer terminal.deinit();
+    // What a shell with OSC 133 emits: a prompt, a command the person typed and
+    // ended with Enter, the output, and the command finishing.
+    terminal.write("\x1b]133;A\x07$ \x1b]133;B\x07zig build test\r\n\x1b]133;C\x07error: 3 things\r\n\x1b]133;D;1\x07");
+    try terminal.update();
+    var result = (try terminal.lastCommand(std.testing.allocator)) orelse return error.TestExpectedResult;
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, result.command, "zig build test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "error: 3 things") != null);
+
+    // The same text without the markers is just text: a prompt that was never
+    // announced is not a boundary, and guessing one would be inventing
+    // evidence about what a command did.
+    var plain = try Terminal.init(std.testing.allocator, 40, 6);
+    defer plain.deinit();
+    plain.write("$ zig build test\r\nerror: 3 things\r\n");
+    try plain.update();
+    try std.testing.expect((try plain.lastCommand(std.testing.allocator)) == null);
 }

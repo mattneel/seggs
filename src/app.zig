@@ -31,6 +31,8 @@ const shell_integration = @import("services/shell.zig");
 const terminals = @import("services/terminals.zig");
 const tree_widget = @import("ui/tree.zig");
 const menu_widget = @import("ui/menu.zig");
+const tool_call = @import("ui/tool_call.zig");
+const ToolCall = @import("acp/tool_call.zig").ToolCall;
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
@@ -38,6 +40,17 @@ const default_help = "No agent starts automatically.\n\nClick a tab, or press Ct
 
 /// A panel and the box it occupied, recorded while drawing.
 const PanelRect = struct { name: []const u8, bounds: Rect };
+
+/// Whether a tool call is open, by the lane it belongs to and the agent's id for
+/// the call. The records themselves are replaced as a call progresses, so what
+/// the reader answered is kept here rather than on the record, and ids are the
+/// agent's own: two lanes can name a call the same thing.
+const CallExpansion = struct { lane: usize, id: []u8, expanded: bool };
+
+/// Where a call's chip was drawn this frame, so a click on one is a click on the
+/// call. The id borrows the frame's arena, which lives until the frame after
+/// next is drawn, and a click is answered well before that.
+const CallHit = struct { lane: usize, id: []const u8, bounds: Rect };
 
 /// A named node an extension described, and the panel it belongs to. One list
 /// per frame answers clicks, hover, and focus order, so none of them need a
@@ -190,6 +203,13 @@ pub const App = struct {
     /// markdown did not parse. A transcript that cannot be styled is still read;
     /// saying so once is a report, saying it every frame is noise.
     transcript_plain: bool = false,
+    /// Which tool calls the reader has opened, by the agent's id for the call.
+    /// Only the reader's own answers live here: a call nobody has clicked
+    /// follows its state, so a failure arrives open and nothing else does.
+    call_expansions: std.ArrayListUnmanaged(CallExpansion) = .empty,
+    /// Where each call's chip was drawn, so a click can be routed to the call it
+    /// landed on. Rebuilt on every transcript draw.
+    call_hits: std.ArrayListUnmanaged(CallHit) = .empty,
     selection_anchor: ?usize = null,
     drag: bool = false,
     follow_cursor: bool = true,
@@ -284,6 +304,9 @@ pub const App = struct {
         self.panel_nodes.deinit(self.allocator);
         self.focus_order.deinit(self.allocator);
         self.hover_id.deinit(self.allocator);
+        for (self.call_expansions.items) |entry| self.allocator.free(entry.id);
+        self.call_expansions.deinit(self.allocator);
+        self.call_hits.deinit(self.allocator);
     }
 
     /// The status bar's current message, for callers outside the interface.
@@ -1286,6 +1309,13 @@ pub const App = struct {
         if (g.activity.contains(x, y)) {
             if (y < 105) self.sidebar = !self.sidebar else self.focus = .prompt;
         } else if (g.agents.contains(x, y)) {
+            // A call's chip is the one thing in the transcript that answers a
+            // click: what a click on a call means is the detail it carried.
+            if (self.callHitAt(x, y)) |id| {
+                self.focus = .prompt;
+                try self.toggleCall(id);
+                return;
+            }
             // The strip is the dock's navigation rather than a request: a tab
             // shows a lane, its `x` stops that lane, and the `+` at the end
             // opens the list of templates.
@@ -2539,6 +2569,49 @@ pub const App = struct {
         return self.clients[index].transcript.items;
     }
 
+    /// A lane's tool calls as one line, for reporting and tests: what each
+    /// chip shows and what it is about. A chip is drawn rather than written
+    /// into the transcript it sits in, so this is how a caller outside the
+    /// interface reads one.
+    pub fn agentToolCalls(self: *const App, index: usize, a: std.mem.Allocator) ![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        const calls = self.clients[index].toolCalls();
+        for (calls, 0..) |call, position| {
+            if (position > 0) try out.appendSlice(a, " | ");
+            try out.appendSlice(a, tool_call.kindLabel(call.kind));
+            try out.append(a, ' ');
+            try out.appendSlice(a, tool_call.stateMark(call.state));
+            try out.append(a, ':');
+            try out.appendSlice(a, call.subject);
+        }
+        return out.toOwnedSlice(a);
+    }
+
+    /// How many tool calls a lane's transcript holds.
+    pub fn agentCallCount(self: *const App, index: usize) usize {
+        return self.clients[index].toolCalls().len;
+    }
+
+    /// Whether a lane's call is drawn open, for the callers that click one.
+    pub fn callIsExpanded(self: *const App, index: usize, id: []const u8) bool {
+        for (self.clients[index].toolCalls()) |call| {
+            if (std.mem.eql(u8, call.id, id)) return self.callExpanded(index, call);
+        }
+        return false;
+    }
+
+    /// A point inside a call's chip, for callers outside the interface that
+    /// have to click one without a pointer device.
+    pub fn toolCallPoint(self: *const App, id: []const u8) ?struct { x: f32, y: f32 } {
+        for (self.call_hits.items) |hit| {
+            if (hit.lane != self.active or !std.mem.eql(u8, hit.id, id)) continue;
+            // Left of the subject, so the click lands on the chip itself rather
+            // than on the text beside it.
+            return .{ .x = hit.bounds.x + 24, .y = hit.bounds.y + hit.bounds.h / 2 };
+        }
+        return null;
+    }
+
     /// The terminal's last command, as the shell reported it. Null when the
     /// shell reports nothing, which is not the same as an empty command: one is
     /// a terminal that does not know, the other is a command that did nothing.
@@ -3102,8 +3175,11 @@ pub const App = struct {
             // A registered panel owns this space, so the interface does not
             // carry a copy of what an extension would say.
         } else {
-            const bytes = if (client.transcript.items.len == 0) default_help else client.transcript.items;
-            try self.drawTranscript(r, frame, run, bytes);
+            // The help stands in only when a lane has nothing at all to show: a
+            // lane whose first act was a call already has a transcript.
+            const calls = client.toolCalls();
+            const bytes = if (client.transcript.items.len == 0 and calls.len == 0) default_help else client.transcript.items;
+            try self.drawTranscript(r, frame, run, bytes, calls);
         }
 
         r.clip = bounds;
@@ -3133,15 +3209,20 @@ pub const App = struct {
         try r.text(bounds.x + 14, bounds.y + bounds.h - 27, wrap.elide(&hint, "click to type · Ctrl+Shift+Enter picks a destination", room), theme.muted);
     }
 
-    /// The transcript, as markdown.
+    /// The transcript, as markdown with the calls in it.
     ///
     /// What an agent says is prose, so it is read as prose rather than as a
     /// terminal's output: a heading is a heading, a list is a list, and a
-    /// fenced diff is drawn in the colours a diff is read in. The bytes are
-    /// still the bytes - when the parse fails the panel falls back to the plain
-    /// wrapped text it drew before, because a transcript that cannot be styled
-    /// is still a transcript.
-    fn drawTranscript(self: *App, r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8) !void {
+    /// fenced diff is drawn in the colours a diff is read in. A tool call is
+    /// not prose either, and it carries the offset into these bytes where it
+    /// happened: the prose is read in the chunks between those offsets and each
+    /// call is drawn between them, so the reading order is the buffer's own and
+    /// a call never interrupts a paragraph it did not interrupt there.
+    ///
+    /// The bytes are still the bytes - a chunk that will not parse as markdown
+    /// is wrapped plainly, because a transcript that cannot be styled is still
+    /// a transcript.
+    fn drawTranscript(self: *App, r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, calls: []const ToolCall) !void {
         if (rect.h < self.line_height or rect.w <= 0) return;
         const outer = r.clip;
         defer r.clip = outer;
@@ -3151,26 +3232,128 @@ pub const App = struct {
         // panel-coloured surface, a panel-coloured block is the same rectangle
         // as the space around it.
         try r.rect(rect, theme.background);
+        const columns: usize = @intFromFloat(@max(1, rect.w / self.char_width));
+        // The chips drawn last frame are not where the ones drawn now are, so
+        // the list of them starts here.
+        self.call_hits.clearRetainingCapacity();
+        if (calls.len == 0) {
+            // Nothing is placed among the prose, so the panel is the one it has
+            // always been, down to the plain wrapping it falls back to.
+            return self.drawProse(r, frame, rect, bytes, columns);
+        }
+
+        const metrics = tool_call.Metrics{ .advance = self.char_width };
+        var rows: std.ArrayList(Row) = .empty;
+        var failure: ?anyerror = null;
+        var at: usize = 0;
+        for (calls) |call| {
+            const stop = @min(call.at, bytes.len);
+            if (stop > at) try appendProse(frame, bytes[at..stop], columns, self.char_width, &rows, &failure);
+            at = stop;
+            try self.appendCall(frame, self.active, call, rect.w, metrics, &rows);
+        }
+        if (at < bytes.len) try appendProse(frame, bytes[at..], columns, self.char_width, &rows, &failure);
+        self.reportTranscript(failure);
+        try self.drawRows(r, frame, rect, rows.items);
+    }
+
+    /// A transcript with nothing placed in it: the prose as markdown, or the
+    /// plain wrap it falls back to when the markdown will not parse.
+    fn drawProse(self: *App, r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, columns: usize) !void {
         const blocks = markdown.parse(frame, bytes) catch |err| {
-            // A transcript that cannot be parsed is said once rather than once
-            // a frame: the frame after it is the same transcript.
-            if (!self.transcript_plain) {
-                self.transcript_plain = true;
-                self.status("Transcript: markdown ({s}); showing it plainly.", .{@errorName(err)});
-            }
+            self.reportTranscript(err);
             return wrappedTail(r, frame, rect, bytes, self.transcript_scroll, theme.text);
         };
         self.transcript_plain = false;
-        const columns: usize = @intFromFloat(@max(1, rect.w / self.char_width));
         const rows = try transcriptRows(frame, blocks, columns, self.char_width);
-        try self.drawRows(r, rect, rows);
+        try self.drawRows(r, frame, rect, rows);
+    }
+
+    /// Say that the transcript is being shown plainly, once: saying it every
+    /// frame is noise, and saying it never is a lie about what is on screen.
+    fn reportTranscript(self: *App, failure: ?anyerror) void {
+        const err = failure orelse {
+            self.transcript_plain = false;
+            return;
+        };
+        if (self.transcript_plain) return;
+        self.transcript_plain = true;
+        self.status("Transcript: markdown ({s}); showing it plainly.", .{@errorName(err)});
+    }
+
+    /// One call's rows: the chip's own row, then the rows its body occupies.
+    /// Those carry nothing of their own, because the module that knows what a
+    /// call looks like draws the whole block.
+    fn appendCall(self: *App, frame: std.mem.Allocator, lane: usize, call: ToolCall, width: f32, metrics: tool_call.Metrics, rows: *std.ArrayList(Row)) !void {
+        const expanded = self.callExpanded(lane, call);
+        const lines = try tool_call.rows(frame, call, width, expanded, metrics);
+        try rows.append(frame, .{ .call = call, .expanded = expanded, .lines = lines });
+        for (1..lines) |_| try rows.append(frame, .{ .continuation = true });
+    }
+
+    /// Whether a call is open: what the reader answered, or, for a call nobody
+    /// has clicked, its state. A failure arrives open, because a failure the
+    /// reader has to open to see is one that gets missed.
+    fn callExpanded(self: *const App, lane: usize, call: ToolCall) bool {
+        for (self.call_expansions.items) |entry| {
+            if (entry.lane == lane and std.mem.eql(u8, entry.id, call.id)) return entry.expanded;
+        }
+        return call.state == .failed;
+    }
+
+    /// The call a click landed on, when it landed on one. The chip belongs to
+    /// the lane it was drawn for: a click that arrives after the interface has
+    /// moved to another lane is not about this lane's calls.
+    fn callHitAt(self: *const App, x: f32, y: f32) ?[]const u8 {
+        for (self.call_hits.items) |hit| {
+            if (hit.lane != self.active) continue;
+            if (hit.bounds.contains(x, y)) return hit.id;
+        }
+        return null;
+    }
+
+    /// Open or close a call, by the agent's id for it: the record is replaced
+    /// every time the call progresses, so the reader's answer is kept against
+    /// the id rather than against the record.
+    fn toggleCall(self: *App, id: []const u8) !void {
+        const lane = self.active;
+        const live = self.clients[lane].toolCalls();
+        var current: ?ToolCall = null;
+        for (live) |call| {
+            if (std.mem.eql(u8, call.id, id)) current = call;
+        }
+        // A call that has dropped out of its lane's transcript has nothing left
+        // to open, and neither has the answer about it: the two go together.
+        var index: usize = 0;
+        while (index < self.call_expansions.items.len) {
+            const entry = self.call_expansions.items[index];
+            if (entry.lane == lane and std.mem.eql(u8, entry.id, id)) {
+                index += 1;
+                continue;
+            }
+            if (hasCall(self.clients[entry.lane].toolCalls(), entry.id)) {
+                index += 1;
+                continue;
+            }
+            self.allocator.free(self.call_expansions.swapRemove(index).id);
+        }
+        const call = current orelse return;
+        for (self.call_expansions.items) |*entry| {
+            if (entry.lane == lane and std.mem.eql(u8, entry.id, id)) {
+                entry.expanded = !entry.expanded;
+                return;
+            }
+        }
+        const owned = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(owned);
+        try self.call_expansions.append(self.allocator, .{ .lane = lane, .id = owned, .expanded = !self.callExpanded(lane, call) });
     }
 
     /// Draw the transcript's rows, scrolled the way the panel has always
     /// scrolled: `transcript_scroll` counts display rows back from the end, so
-    /// zero shows the newest lines and the top of the content is the end of
-    /// the scroll.
-    fn drawRows(self: *App, r: *Renderer, rect: Rect, rows: []const Row) !void {
+    /// zero shows the newest lines and the top of the content is the end of the
+    /// scroll.
+    fn drawRows(self: *App, r: *Renderer, frame: std.mem.Allocator, rect: Rect, rows: []const Row) !void {
         const viewport: usize = @intFromFloat(@max(1, rect.h / self.line_height));
         const limit = rows.len -| viewport;
         // The wheel clamps against this: it is the one number that says how
@@ -3179,11 +3362,32 @@ pub const App = struct {
         const scroll = @min(self.transcript_scroll, limit);
         const end = rows.len -| scroll;
         const begin = end -| viewport;
-        for (rows[begin..end], 0..) |row, index| {
-            const y = rect.y + @as(f32, @floatFromInt(index)) * self.line_height;
+        // A call is drawn from its own chip row, and that row can be above the
+        // window while the body it opened is not. Those rows belong to the
+        // call, so the walk starts at the chip rather than at the window: the
+        // part above the window is placed at a negative offset, where the
+        // panel's clip takes it, and the part in the window is drawn. Starting
+        // at the window instead would leave a hole where the body is.
+        var start = begin;
+        while (start > 0 and rows[start].continuation) start -= 1;
+        for (rows[start..end], 0..) |row, offset| {
+            const index = start + offset;
+            const above: i64 = @as(i64, @intCast(index)) - @as(i64, @intCast(begin));
+            const y = rect.y + @as(f32, @floatFromInt(above)) * self.line_height;
             if (row.background) |colour| try r.rect(.{ .x = rect.x, .y = y, .w = rect.w, .h = self.line_height }, colour);
             if (row.rule) try r.rect(.{ .x = rect.x, .y = y + self.line_height / 2, .w = rect.w, .h = 1 }, theme.border);
             if (row.bar) try r.rect(.{ .x = rect.x + self.char_width / 2, .y = y, .w = 2, .h = self.line_height }, theme.border);
+            if (row.call) |call| {
+                // Only a chip the window shows answers a click: a row above the
+                // fold is not under the pointer.
+                if (index >= begin and index < end) {
+                    const id = try frame.dupe(u8, call.id);
+                    try self.call_hits.append(self.allocator, .{ .lane = self.active, .id = id, .bounds = .{ .x = rect.x, .y = y, .w = rect.w, .h = self.line_height } });
+                }
+                try tool_call.draw(call, r, .{ .x = rect.x, .y = y }, rect.w, self.line_height, row.expanded, .{ .advance = self.char_width }, frame);
+                continue;
+            }
+            if (index < begin) continue;
             var pen = rect.x + row.indent;
             for (row.spans) |span| pen = try drawSpan(r, pen, y, span.text, span.fg);
         }
@@ -3319,6 +3523,17 @@ const Row = struct {
     rule: bool = false,
     /// A mark down the left edge, for a quotation.
     bar: bool = false,
+    /// A tool call drawn from this row down: the chip, and its body when the
+    /// reader has it open. A call is not text, so it is drawn by the module
+    /// that knows what one looks like rather than built out of runs.
+    call: ?ToolCall = null,
+    expanded: bool = false,
+    /// How many rows the call occupies. The rows after this one are its own and
+    /// carry nothing, which is what keeps the row grid the drawing walks.
+    lines: usize = 0,
+    /// Whether this row is one of the rows a call above it occupies. The
+    /// drawing walks back over these to find the call a row belongs to.
+    continuation: bool = false,
 };
 
 /// A place in a block's runs: which run, and where in it. Wrapping counts
@@ -3367,12 +3582,39 @@ const Shape = struct {
     }
 };
 
-/// Turn parsed blocks into the rows the panel draws.
+/// The rows of one parsed document, for the transcript that has no calls in it.
+fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32) ![]const Row {
+    var rows: std.ArrayList(Row) = .empty;
+    try transcriptBlocks(a, blocks, columns, advance, &rows);
+    return rows.toOwnedSlice(a);
+}
+
+/// Append the rows of one stretch of prose. A stretch the reader will not parse
+/// is wrapped plainly and the failure is reported, but its rows are still rows:
+/// what is around it is drawn either way.
+fn appendProse(a: std.mem.Allocator, bytes: []const u8, columns: usize, advance: f32, rows: *std.ArrayList(Row), failure: *?anyerror) !void {
+    const blocks = markdown.parse(a, bytes) catch |err| {
+        failure.* = err;
+        return wrappedRows(a, try spansOf(a, bytes, theme.text), .{ .columns = columns, .advance = advance }, rows);
+    };
+    try transcriptBlocks(a, blocks, columns, advance, rows);
+}
+
+/// Whether a call is one of the calls a lane is showing, which is what says its
+/// chip is still somewhere in the transcript.
+fn hasCall(calls: []const ToolCall, id: []const u8) bool {
+    for (calls) |call| {
+        if (std.mem.eql(u8, call.id, id)) return true;
+    }
+    return false;
+}
+
+/// Turn parsed blocks into the rows the panel draws, appending them to what is
+/// already there.
 ///
 /// The column a block wraps at is the panel's, less whatever its own marker
 /// takes, so a continuation line starts where the text above it does.
-fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32) ![]const Row {
-    var rows: std.ArrayList(Row) = .empty;
+fn transcriptBlocks(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32, rows: *std.ArrayList(Row)) !void {
     for (blocks) |block| {
         const shape = Shape{ .columns = columns, .advance = advance };
         switch (block.kind) {
@@ -3380,7 +3622,7 @@ fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns:
             // be read as a heading. Past the panel's edge it is clipped, which
             // is what the row's clip is for.
             .heading => try rows.append(a, .{ .spans = try spansOf(a, headingText(block), theme.accent) }),
-            .paragraph => try wrappedRows(a, try inlineSpans(a, block.inlines, theme.text, 0), shape, &rows),
+            .paragraph => try wrappedRows(a, try inlineSpans(a, block.inlines, theme.text, 0), shape, rows),
             .bullet => {
                 const marker = bulletMarker(block.text);
                 // A number the agent wrote is part of the item, so it stays; an
@@ -3389,7 +3631,7 @@ fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns:
                 const token = if (marker.token.len > 0 and std.ascii.isDigit(marker.token[0])) marker.token else "•";
                 const width = countCells(token) + 1;
                 const first = rows.items.len;
-                try wrappedRows(a, try inlineSpans(a, block.inlines, theme.text, marker.after), .{ .columns = columns, .advance = advance, .indent = width }, &rows);
+                try wrappedRows(a, try inlineSpans(a, block.inlines, theme.text, marker.after), .{ .columns = columns, .advance = advance, .indent = width }, rows);
                 if (rows.items.len > first) {
                     const label = try std.fmt.allocPrint(a, "{s} ", .{token});
                     rows.items[first].spans = try withMarker(a, rows.items[first].spans, label, theme.muted);
@@ -3400,14 +3642,13 @@ fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns:
                 // the agent wrote is taken off the text rather than drawn next
                 // to it.
                 const first = rows.items.len;
-                try wrappedRows(a, try inlineSpans(a, block.inlines, theme.muted, afterQuote(block.text)), .{ .columns = columns, .advance = advance, .indent = 2 }, &rows);
+                try wrappedRows(a, try inlineSpans(a, block.inlines, theme.muted, afterQuote(block.text)), .{ .columns = columns, .advance = advance, .indent = 2 }, rows);
                 for (rows.items[first..]) |*row| row.bar = true;
             },
             .rule => try rows.append(a, .{ .rule = true }),
-            .code => try codeRows(a, block, columns, advance, &rows),
+            .code => try codeRows(a, block, columns, advance, rows),
         }
     }
-    return rows.toOwnedSlice(a);
 }
 
 /// Wrap coloured runs the way `wrap.spans` wraps one string, and append one row
@@ -3611,15 +3852,11 @@ fn diffRows(a: std.mem.Allocator, file: diff.File, shape: Shape, out: *std.Array
 
 /// The colour a diff line is read in. The two that matter are its own roles: an
 /// added line is not a keyword and a removed one is not an error message, so
-/// neither borrows the accent or the warning colour.
+/// neither borrows the accent or the warning colour. A diff that arrived with a
+/// tool call is read the same way, which is why the mapping lives with the call
+/// that draws one.
 fn diffColor(kind: diff.LineKind) theme.Color {
-    return switch (kind) {
-        .added => theme.added,
-        .removed => theme.removed,
-        .hunk => theme.accent,
-        .meta => theme.muted,
-        .context => theme.text,
-    };
+    return tool_call.diffColor(kind);
 }
 
 /// The fence's language tag in the scanner's vocabulary. A tag that names

@@ -119,6 +119,7 @@ Its fragment option divides stdout writes to exercise stream framing.
 | --- | --- |
 | Ordinary text | Echo with the mock's lane name |
 | `permission` | Request one-time permission without any file access |
+| `tools` | Send the call shapes a chip draws: a read, an edit with a diff, a failed command, and a running one |
 | `slow` | Keep the turn active for cancellation |
 
 The native smoke target uses three independent fixture processes.

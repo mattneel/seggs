@@ -1,6 +1,7 @@
 const std = @import("std");
 const c = @import("native");
 const rpc = @import("protocol.zig");
+const tool_call = @import("tool_call.zig");
 const Transport = @import("transport.zig").Transport;
 const Agent = @import("../agents/registry.zig").Agent;
 const files = @import("../platform/files.zig");
@@ -76,6 +77,12 @@ pub const Client = struct {
     last_error: ?[]u8 = null,
     completed_turns: usize = 0,
     tool_events: usize = 0,
+    /// The tool calls the transcript carries, in arrival order. Each one knows
+    /// the byte offset it landed at, which is how the interface places a chip
+    /// in the prose rather than breaking the flow with it. Bounded by
+    /// `tool_call.max_calls`, oldest dropped first, so a session that runs for
+    /// hours cannot grow a list without bound.
+    tool_calls: std.ArrayList(tool_call.ToolCall) = .empty,
     terminals: std.StringArrayHashMapUnmanaged(*Terminal) = .empty,
     terminal_counter: usize = 0,
     auth_methods: std.ArrayList(AuthMethod) = .empty,
@@ -88,6 +95,8 @@ pub const Client = struct {
         self.stop();
         if (self.session_cwd) |cwd| self.allocator.free(cwd);
         self.session_cwd = null;
+        self.clearToolCalls();
+        self.tool_calls.deinit(self.allocator);
         self.transcript.deinit(self.allocator);
         self.clearAuth();
         self.auth_methods.deinit(self.allocator);
@@ -100,9 +109,14 @@ pub const Client = struct {
         // Bound transcript memory. Trim only at UTF-8 boundaries.
         const limit = 512 * 1024;
         if (bytes.len >= limit) {
-            self.transcript.clearRetainingCapacity();
             var trim_at = bytes.len - limit;
             while (trim_at < bytes.len and bytes[trim_at] & 0xc0 == 0x80) : (trim_at += 1) {}
+            // Everything the buffer held, and the front of what is arriving,
+            // leaves here. A recorded offset is a position in these same bytes,
+            // so they move with the drop - before the bytes are appended, so a
+            // call recorded at the end of the old transcript is moved too.
+            tool_call.shiftAt(self.tool_calls.items, self.transcript.items.len + trim_at);
+            self.transcript.clearRetainingCapacity();
             try self.transcript.appendSlice(self.allocator, bytes[trim_at..]);
             return;
         }
@@ -112,8 +126,93 @@ pub const Client = struct {
             const keep = self.transcript.items.len - drop;
             std.mem.copyForwards(u8, self.transcript.items[0..keep], self.transcript.items[drop..]);
             self.transcript.items.len = keep;
+            // The front of the transcript is gone: every chip moves up with it,
+            // and one that was nearer than the drop lands at the front.
+            tool_call.shiftAt(self.tool_calls.items, drop);
         }
         try self.transcript.appendSlice(self.allocator, bytes);
+    }
+
+    /// Record a tool call in place of the JSON dump the transcript used to
+    /// carry. The chip holds the detail, so the transcript keeps one line
+    /// saying a call happened and what it was about: it is what a reader
+    /// searching the transcript finds, and it is the marker the call's offset
+    /// points at.
+    ///
+    /// A call the reader cannot make sense of is still an event, so an update
+    /// the parser refuses keeps the line and loses only the chip.
+    fn recordToolCall(self: *Client, update: rpc.Value) !void {
+        var parsed = tool_call.parse(self.allocator, update) catch |err| {
+            // The allocator giving up is the client's problem rather than the
+            // call's; a refusal of the call itself is not.
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            try self.append("\n[Tool] ");
+            try self.append(rpc.str(update, "title"));
+            try self.append("\n");
+            return;
+        };
+        var ours = true;
+        errdefer if (ours) tool_call.deinit(&parsed, self.allocator);
+        // An update is partial: what it does not say about the call, the call
+        // already said, and the line names the same thing the chip does rather
+        // than going blank on a status change.
+        const stored = self.storedCall(parsed.id);
+        const kind = if (parsed.kind != .other) parsed.kind else if (stored) |call| call.kind else .other;
+        const subject = if (parsed.subject.len != 0)
+            parsed.subject
+        else if (stored) |call|
+            call.subject
+        else
+            "";
+        // Where the line lands is where the chip belongs: the offset is the
+        // transcript's length as the call arrives, so it points at the newline
+        // the line opens with - prose up to it ends the previous line, and the
+        // chip is drawn there.
+        parsed.at = self.transcript.items.len;
+        // The record goes in before the line does, so a drop the write makes
+        // moves its offset along with every other one.
+        try self.updateToolCall(parsed);
+        ours = false;
+        try self.append("\n[");
+        try self.append(@tagName(kind));
+        try self.append("]");
+        if (subject.len != 0) {
+            try self.append(" ");
+            try self.append(subject);
+        }
+        try self.append("\n");
+    }
+
+    /// The call with this id, or null: the record an update folds into and the
+    /// one whose words a partial update borrows.
+    fn storedCall(self: *const Client, id: []const u8) ?tool_call.ToolCall {
+        if (id.len == 0) return null;
+        var index = self.tool_calls.items.len;
+        while (index > 0) {
+            index -= 1;
+            const call = self.tool_calls.items[index];
+            if (std.mem.eql(u8, call.id, id)) return call;
+        }
+        return null;
+    }
+
+    /// The tool calls recorded so far, in arrival order. Each one knows the
+    /// transcript offset it belongs at, which is where the interface places its
+    /// chip.
+    pub fn toolCalls(self: *const Client) []const tool_call.ToolCall {
+        return self.tool_calls.items;
+    }
+
+    /// Store a call, or the update to one already stored. An update replaces
+    /// the record with the same id in place, so a chip stays where it landed
+    /// while the call it describes progresses; see `tool_call.merge`.
+    pub fn updateToolCall(self: *Client, parsed: tool_call.ToolCall) !void {
+        try tool_call.merge(&self.tool_calls, self.allocator, parsed);
+    }
+
+    fn clearToolCalls(self: *Client) void {
+        for (self.tool_calls.items) |*call| tool_call.deinit(call, self.allocator);
+        self.tool_calls.clearRetainingCapacity();
     }
 
     fn sendOwned(self: *Client, bytes: []u8) !void {
@@ -424,16 +523,7 @@ pub const Client = struct {
                     if (std.mem.eql(u8, rpc.str(content, "type"), "text")) try self.append(rpc.str(content, "text"));
                 } else if (std.mem.eql(u8, kind, "tool_call") or std.mem.eql(u8, kind, "tool_call_update")) {
                     self.tool_events += 1;
-                    try self.append("\n[Tool] ");
-                    try self.append(rpc.str(update, "title"));
-                    try self.append(" ");
-                    try self.append(rpc.str(update, "status"));
-                    // Preserve full structured content for inspection in the transcript.
-                    const encoded = try std.json.Stringify.valueAlloc(self.allocator, update, .{});
-                    defer self.allocator.free(encoded);
-                    try self.append("\n");
-                    try self.append(encoded);
-                    try self.append("\n");
+                    try self.recordToolCall(update);
                 } else if (std.mem.eql(u8, kind, "plan")) {
                     const encoded = try std.json.Stringify.valueAlloc(self.allocator, update, .{});
                     defer self.allocator.free(encoded);
@@ -747,4 +837,96 @@ test "a working harness is up, and only a gone one is not" {
     try std.testing.expectEqualStrings("WORKING", Client.State.busy.label());
     try std.testing.expectEqualStrings("READY", Client.State.ready.label());
     try std.testing.expectEqualStrings("OFFLINE", Client.State.failed.label());
+}
+
+/// A harness that never runs: these tests drive the transcript and the records
+/// a lane keeps, and neither needs a process behind it.
+fn testClient(a: std.mem.Allocator) Client {
+    return Client.init(a, .{ .id = "test", .name = "Test", .argv = &.{"test-agent"} }, "/tmp");
+}
+
+fn parseUpdate(a: std.mem.Allocator, text: []const u8) !std.json.Parsed(rpc.Value) {
+    return std.json.parseFromSlice(rpc.Value, a, text, .{ .allocate = .alloc_always });
+}
+
+test "a tool call writes one line, and its record points at it" {
+    const a = std.testing.allocator;
+    var client = testClient(a);
+    defer client.deinit();
+
+    const first = try parseUpdate(a,
+        \\{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Read file","kind":"read","status":"pending","locations":[{"path":"src/app.zig"}]}
+    );
+    defer first.deinit();
+    try client.recordToolCall(first.value);
+    try std.testing.expectEqual(@as(usize, 1), client.toolCalls().len);
+    const call = client.toolCalls()[0];
+    try std.testing.expectEqualStrings("t1", call.id);
+    try std.testing.expectEqual(tool_call.Kind.read, call.kind);
+    // The line is the marker a reader searches for, and the record's offset is
+    // where it starts. What the call arrived as is nowhere in the transcript.
+    try std.testing.expectEqualStrings("\n[read] src/app.zig\n", client.transcript.items[call.at..]);
+    try std.testing.expect(std.mem.indexOf(u8, client.transcript.items, "toolCallId") == null);
+
+    // An update as an agent writes one: the id and what changed, nothing else.
+    const second = try parseUpdate(a,
+        \\{"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}
+    );
+    defer second.deinit();
+    try client.recordToolCall(second.value);
+    try std.testing.expectEqual(@as(usize, 1), client.toolCalls().len);
+    // The chip stays where it landed, and the line still names the call the
+    // chip is about rather than going blank on a status change.
+    try std.testing.expectEqual(call.at, client.toolCalls()[0].at);
+    try std.testing.expectEqual(tool_call.State.completed, client.toolCalls()[0].state);
+    try std.testing.expectEqualStrings("src/app.zig", client.toolCalls()[0].subject);
+    try std.testing.expect(std.mem.endsWith(u8, client.transcript.items, "\n[read] src/app.zig\n"));
+
+    // A call the parser refuses is still an event, and it never takes the lane
+    // down with it.
+    const refused = try parseUpdate(a,
+        \\{"sessionUpdate":"tool_call","toolCallId":"t2","title":"A string is not a call","content":"not parts"}
+    );
+    defer refused.deinit();
+    try client.recordToolCall(refused.value);
+    try std.testing.expectEqual(@as(usize, 1), client.toolCalls().len);
+    try std.testing.expect(std.mem.endsWith(u8, client.transcript.items, "\n[Tool] A string is not a call\n"));
+}
+
+test "a transcript that drops its front takes the recorded offsets with it" {
+    const a = std.testing.allocator;
+    var client = testClient(a);
+    defer client.deinit();
+
+    // A call that lands well into the transcript, so its offset has room to
+    // move rather than only to clamp.
+    const lead = try a.alloc(u8, 300 * 1024);
+    defer a.free(lead);
+    @memset(lead, 'l');
+    try client.append(lead);
+
+    const line = "\n[read] src/app.zig\n";
+    const frame = try parseUpdate(a,
+        \\{"sessionUpdate":"tool_call","toolCallId":"t1","title":"Read file","kind":"read","status":"pending","locations":[{"path":"src/app.zig"}]}
+    );
+    defer frame.deinit();
+    try client.recordToolCall(frame.value);
+    const at = client.toolCalls()[0].at;
+    try std.testing.expectEqual(lead.len, at);
+    try std.testing.expectEqualStrings(line, client.transcript.items[at..]);
+
+    // Enough filler to push the transcript past its bound by exactly a hundred
+    // kilobytes: the offset moves up by that much, and it still points at the
+    // line, which is the one thing a chip cannot get wrong.
+    const limit = 512 * 1024;
+    const drop = 100 * 1024;
+    const filler = try a.alloc(u8, limit + drop - client.transcript.items.len);
+    defer a.free(filler);
+    @memset(filler, 'f');
+    try client.append(filler);
+    // The offset moved by exactly the drop, and it is still the start of the
+    // line it was recorded for: a chip that lands anywhere else is the failure
+    // this test exists to catch.
+    try std.testing.expectEqual(at - drop, client.toolCalls()[0].at);
+    try std.testing.expect(std.mem.startsWith(u8, client.transcript.items[at - drop ..], line));
 }

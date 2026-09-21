@@ -249,10 +249,41 @@ class MockAgent:
             return "\nterminal-ok"
         return f"\nterminal-failed:exit={exit_code}:output={output!r}"
 
+    def tool_calls(self, turn: Turn) -> str:
+        """The shapes a call chip has to draw: a read that finished, an edit
+        carrying the diff it made, a command that failed, and a command still
+        running. Four kinds, and the four states a chip colours."""
+        session = turn.session_id
+        self.update(session, {"sessionUpdate": "tool_call", "toolCallId": "mock-read", "title": "Read src/app.zig", "kind": "read", "status": "pending", "locations": [{"path": "src/app.zig"}]})
+        self.update(session, {"sessionUpdate": "tool_call_update", "toolCallId": "mock-read", "status": "completed", "locations": [{"path": "src/app.zig"}]})
+        # An edit is what a diff arrives on: the pair of texts and the path are
+        # the whole of what the reader is shown, so the fixture sends them
+        # rather than a file the editor would have to read itself.
+        self.update(session, {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "mock-edit",
+            "title": "Edit src/ui/tool_call.zig",
+            "kind": "edit",
+            "status": "in_progress",
+            "locations": [{"path": "src/ui/tool_call.zig"}],
+            "content": [{
+                "type": "diff",
+                "path": "src/ui/tool_call.zig",
+                "oldText": "const Renderer = @import(\"../gpu/renderer.zig\").Renderer;\nconst Allocator = std.mem.Allocator;\n",
+                "newText": "const Renderer = @import(\"../gpu/renderer.zig\").Renderer;\nconst Rect = @import(\"layout.zig\").Rect;\nconst Allocator = std.mem.Allocator;\n",
+            }],
+        })
+        self.update(session, {"sessionUpdate": "tool_call_update", "toolCallId": "mock-edit", "status": "completed"})
+        self.update(session, {"sessionUpdate": "tool_call", "toolCallId": "mock-fail", "title": "Run zig build verify", "kind": "execute", "status": "in_progress", "rawInput": {"command": "zig build verify"}, "content": [{"type": "content", "content": {"type": "text", "text": "error: the build failed"}}]})
+        self.update(session, {"sessionUpdate": "tool_call_update", "toolCallId": "mock-fail", "status": "failed", "rawOutput": {"exitCode": 1, "output": "error: the build failed"}})
+        self.update(session, {"sessionUpdate": "tool_call", "toolCallId": "mock-run", "title": "Run zig build test", "kind": "execute", "status": "in_progress", "rawInput": {"command": "zig build test"}})
+        return "\ntool-calls=4"
+
     def complete(self, turn: Turn) -> None:
         try:
             self.update(turn.session_id, {"sessionUpdate": "plan", "entries": [{"content": "Echo the prompt without workspace access", "priority": "medium", "status": "in_progress"}]})
             permission = self.permission(turn) if turn.text.startswith("permission") else ""
+            calls = self.tool_calls(turn) if turn.text.startswith("tools") else ""
             if turn.text.startswith("fsread "):
                 fs_result = self.fs_read(turn)
             elif turn.text.startswith("fswrite "):
@@ -261,7 +292,7 @@ class MockAgent:
                 fs_result = self.terminal_run(turn)
             else:
                 fs_result = ""
-            response = f"mock[{self.name}] {turn.text}\n{permission}{fs_result}"
+            response = f"mock[{self.name}] {turn.text}\n{permission}{fs_result}{calls}"
             for offset in range(0, len(response), 7):
                 if turn.cancelled.is_set() or self.closed.is_set():
                     break

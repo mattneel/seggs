@@ -45,6 +45,7 @@ fn run(init: std.process.Init) !void {
     var exercise_tabs = false;
     var exercise_markdown = false;
     var exercise_transcript = false;
+    var exercise_toolcalls = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -80,6 +81,8 @@ fn run(init: std.process.Init) !void {
             exercise_markdown = true;
         } else if (std.mem.eql(u8, arg, "--exercise-transcript")) {
             exercise_transcript = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-toolcalls")) {
+            exercise_toolcalls = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -241,6 +244,7 @@ fn run(init: std.process.Init) !void {
         if (exercise_tabs) exerciseTabs(&app, frames);
         if (exercise_markdown) exerciseMarkdown(&app, frames);
         if (exercise_transcript) exerciseTranscript(&app, frames);
+        if (exercise_toolcalls) exerciseToolCalls(&app, frames);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -761,6 +765,99 @@ fn exerciseTranscript(app: *App, frame: usize) void {
     if (transcript_oversize and frame == 60) {
         std.log.info("transcript: an oversize transcript says: {s}", .{app.statusText()});
     }
+}
+
+/// Whether the call turn has been sent, reported, and clicked.
+var calls_sent = false;
+var calls_drawn = false;
+var calls_clicked = false;
+var call_reported = false;
+var call_open_before = false;
+
+/// The frame the click on a call happens on. It is late enough that a run which
+/// stops before it captures the chips closed, which is what makes the click's
+/// effect a difference in pixels rather than a claim.
+const call_click_frame: usize = 100;
+
+/// A transcript of tool calls, drawn as the chips a reader scans.
+///
+/// The turn is the one the fixture's `tools` prefix answers with: a read that
+/// finished, an edit carrying a diff, a command that failed, and a command still
+/// running, which is the four states a chip colours. The report names what each
+/// chip shows, and the click opens the edit rather than describing it, so the
+/// surface a reader uses is exercised instead of only drawn.
+fn exerciseToolCalls(app: *App, frame: usize) void {
+    const mock = app.agentIndex("Local mock") orelse {
+        std.log.err("calls: no local mock profile", .{});
+        return;
+    };
+    if (frame == 6) {
+        app.active = mock;
+        app.startAgent() catch |err| std.log.err("calls: {s}", .{@errorName(err)});
+        return;
+    }
+    if (!calls_sent) {
+        if (!app.agentReady(mock)) {
+            if (frame > 400) std.log.err("calls: the harness never came up", .{});
+            return;
+        }
+        calls_sent = true;
+        app.prompt_text.clearRetainingCapacity();
+        app.prompt_text.appendSlice(app.allocator, "tools: show what a call looks like") catch |err| {
+            std.log.err("calls: {s}", .{@errorName(err)});
+            return;
+        };
+        app.pipeTo(mock) catch |err| std.log.err("calls: {s}", .{@errorName(err)});
+        return;
+    }
+    if (!calls_drawn) {
+        // The turn is done when the harness is idle again and every call it
+        // sent has arrived: a chip still on the wire is not one to report.
+        if (app.agentState(mock) != .ready) {
+            if (frame > 600) std.log.err("calls: the harness never finished the turn", .{});
+            return;
+        }
+        if (app.agentCallCount(mock) < 4) {
+            if (frame > 600) std.log.err("calls: the turn produced {d} tool call(s)", .{app.agentCallCount(mock)});
+            return;
+        }
+        const summary = app.agentToolCalls(mock, app.allocator) catch return;
+        defer app.allocator.free(summary);
+        calls_drawn = true;
+        std.log.info("calls: {d} drawn, {s}", .{ app.agentCallCount(mock), summary });
+        return;
+    }
+    if (!calls_clicked) {
+        if (frame < call_click_frame) return;
+        calls_clicked = true;
+        call_open_before = app.callIsExpanded(mock, "mock-edit");
+        // A click is delivered the way SDL delivers one, so what moves the chip
+        // is the interface's own routing rather than a call into it.
+        const point = app.toolCallPoint("mock-edit") orelse {
+            std.log.err("calls: the edit's chip was not drawn, so the click had nothing to land on", .{});
+            return;
+        };
+        var ev = std.mem.zeroes(c.SDL_Event);
+        ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+        ev.button.button = c.SDL_BUTTON_LEFT;
+        ev.button.clicks = 1;
+        ev.button.x = point.x;
+        ev.button.y = point.y;
+        if (!c.SDL_PushEvent(&ev)) std.log.warn("calls: the click was not delivered", .{});
+        return;
+    }
+    if (!call_reported and frame >= call_click_frame + 2) {
+        call_reported = true;
+        std.log.info("calls: the click on the edit changed open {s} -> {s}", .{
+            openWord(call_open_before),
+            openWord(app.callIsExpanded(mock, "mock-edit")),
+        });
+    }
+}
+
+/// Whether a call is open, as the report words it.
+fn openWord(open: bool) []const u8 {
+    return if (open) "true" else "false";
 }
 
 /// What the agent strip reported: the lane a tab click moved the interface to,

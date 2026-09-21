@@ -21,6 +21,9 @@ test {
     _ = @import("editor/runs.zig");
     _ = @import("acp/framing.zig");
     _ = @import("acp/protocol.zig");
+    // A tool call as a record with an offset into the transcript, so a chip
+    // lands where the call happened rather than at the end.
+    _ = @import("acp/tool_call.zig");
     _ = @import("agents/registry.zig");
     _ = @import("ui/layout.zig");
     _ = @import("ui/wrap.zig");

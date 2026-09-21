@@ -68,6 +68,13 @@ APP_ACTION = re.compile(r"app action: (\S+)")
 EDITOR_OPEN = re.compile(r"open: status is now Opened (.+)")
 IME_COMPOSITION = re.compile(r"ime: composition (\d+) cell\(s\), selection (\d+)\.\.(\d+)")
 IME_COMMIT = re.compile(r"ime: committed, document (\d+) -> (\d+) byte\(s\)")
+# The tool call chips the transcript drew, and what the click on one did. The
+# words are the chip's own, so a chip that stopped naming its kind or its state
+# fails here rather than only looking different.
+CALLS_LINE = re.compile(r"calls: (\d+) drawn, (.+)")
+CALL_CLICK_LINE = re.compile(r"calls: the click on the (\S+) changed open (true|false) -> (true|false)")
+CALL_CHIP_WORDS = ("read \u2713", "edit \u2713", "run \u2717", "run \u25cf")
+CALL_FRAMES = 130
 # The composition is drawn in the theme's amber; nothing else in a session
 # without a pending agent request uses that color.
 AMBER = (200, 170, 225, 160)
@@ -842,6 +849,35 @@ def check_density(binary: str) -> None:
     print(f"density: scale {step[4]}, logical {step[0]}x{step[1]} with a {step[2]}x{step[3]} backbuffer, transitions survived")
 
 
+def check_tool_calls(binary: str) -> None:
+    """A tool call is an object in the transcript, not a paragraph of JSON.
+
+    The fixture's turn carries the shapes a chip has to draw - a read that
+    finished, an edit carrying a diff, a command that failed, and a command still
+    running - and then clicks one. What the gate reads is what a reader would:
+    the words the chips showed, and that the click changed whether the call is
+    open. A chip that stopped naming its state, or one that no click can open,
+    is what this fails on.
+    """
+    command = display_command([binary, "--windowed", "--frames", str(CALL_FRAMES), "--exercise-toolcalls"], app_env())
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+    drawn = CALLS_LINE.search(output)
+    require(drawn is not None, "no tool call chips were drawn")
+    count = int(drawn.group(1))
+    require(count >= len(CALL_CHIP_WORDS), f"expected every call shape, saw {count} chip(s)")
+    shown = drawn.group(2)
+    for word in CALL_CHIP_WORDS:
+        require(word in shown, f"no chip showed {word!r}: {shown}")
+    click = CALL_CLICK_LINE.search(output)
+    require(click is not None, "the click on a call was never reported")
+    require(
+        click.group(2) == "false" and click.group(3) == "true",
+        f"the click left {click.group(1)} open {click.group(2)} -> {click.group(3)}",
+    )
+    print(f"tool calls: {count} chips drawn ({shown}); the click opened the {click.group(1)}")
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         print("usage: screenshot_check.py <seggs-binary>", file=sys.stderr)
@@ -870,10 +906,11 @@ def main() -> int:
         check_run(binary)
         check_compose(binary)
         check_tabs(binary)
+        check_tool_calls(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1
-    print("PASS: renders agree, glyphs draw at the reported scale and baseline, composition draws and commits, extension panels take events and reload, fallback covers uncovered scripts, window transitions hold")
+    print("PASS: renders agree, glyphs draw at the reported scale and baseline, composition draws and commits, extension panels take events and reload, fallback covers uncovered scripts, window transitions hold, tool calls draw as chips and open on a click")
     return 0
 
 

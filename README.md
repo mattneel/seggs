@@ -119,6 +119,7 @@ zig build run -- --config config/mock.json
 5. Press Ctrl+Shift+Enter to send the prompt to all ready mocks.
 
 A prompt that starts with `permission` exercises the permission interface.
+A prompt that starts with `tools` exercises the transcript's tool call chips.
 A prompt that starts with `slow` exercises cancellation.
 The mock never accesses workspace files.
 

@@ -7,7 +7,8 @@ The Zig 0.17.0 toolchain is present, and the dependency bootstrap built SDL 3.4.
 Native compilation, core tests, the ACP transport test, and shader compilation are verified.
 The renderer renders and presents frames under software Vulkan (lavapipe) and Xvfb.
 Hardware Vulkan, Metal, macOS, and Windows remain unverified.
-The included Linux CI workflow is a validation definition, not evidence of a completed run.
+The CI workflow covers Linux, macOS, and Windows as a validation definition; no
+completed run of it is evidence in this document.
 
 The Python fixture suite passed 11 tests.
 That result validates the fixture's protocol behavior and subprocess scenarios.
@@ -16,10 +17,13 @@ The renderer path is verified with a software Vulkan driver; hardware GPU presen
 
 ## Editor
 
-The app edits one UTF-8 document at a time.
-The initial welcome buffer has no save-as operation.
-A user must open an existing file before a normal save.
-The app refuses a file switch when the active document has unsaved changes.
+The app edits one UTF-8 document at a time, with several open: each buffer keeps
+its own document and save baseline, so switching away and back does not lose
+unsaved work.
+The initial welcome buffer has no save-as operation, so a user must open an
+existing file before a normal save.
+Reloading from disk is refused while the buffer has unsaved changes, and so is
+closing it.
 
 The atlas rasterizes printable ASCII up front and any other codepoint on first use, through the primary face and then the registered fallback chain. A script no available face covers draws the placeholder glyph and is counted.
 Grapheme segmentation follows UAX #29 except rule GB11 (emoji ZWJ sequences), which needs the separate Extended_Pictographic property.
@@ -69,20 +73,54 @@ It has no idle-frame suppression or damage tracking.
 The transcript wraps again each frame.
 The prompt supports append, backspace, and paste, not a complete cursor model.
 
+## Transcript and liveness
+
+The transcript reads Markdown, not a Markdown implementation: headings,
+bullets, quotes, rules, fenced code, and the four inline runs, with a line it
+does not recognise kept verbatim as a paragraph rather than dropped. Tables,
+links, images, and nested block structure are not read as such. Inline bold and
+italic are parsed and their markers taken off, but the text is drawn plain,
+because the atlas holds one face - as with a theme's `fontStyle`, weight and
+slant are not faked with colour. A fenced block goes through the editor's own
+tokenizer for the languages it knows (Zig, C and C++, Python, JavaScript and
+TypeScript); any other language draws as plain text rather than wrongly. A
+message over a megabyte, or one that would produce more than 4096 blocks, is
+refused by name and shown wrapped instead of styled.
+
+A call's chip is one line: its title and subject are bounded and elided, so a
+chip says what the call was rather than everything it carried - the fields
+behind it are where the detail is. The reader's open or closed answer for a call
+lives in memory for the session, and exporting a transcript is a client API that
+no interface control calls yet.
+
+Liveness is sampled rather than reported: the App compares each lane's counters
+once a frame, so a turn's duration is accurate to a frame rather than to the
+moment the prompt went out, and a stall is only visible while a turn is in
+flight - an idle lane reports its state and no silence. The line is fitted to
+the columns the dock can draw, and a line with no room loses a whole part, the
+subject before the duration, because the end of a stalled line is the number the
+reader came for.
+
 ## ACP coverage
 
 The scaffold implements a capability-limited ACP v1 stdio client.
 It does not guarantee compatibility with every ACP agent or extension.
 It supports one active session per configured process and one prompt per session.
-A broadcast skips non-ready lanes.
+A request names one lane: there is no broadcast, and a lane that is not ready
+refuses a prompt rather than queueing it, which the editor reports by name.
 
 Missing ACP features include:
 
-- Client-driven authentication and session resume.
-- Editor-backed terminal services.
+- Session resume, and choosing an authentication method from the interface: a
+  preset may name the method to use, and a harness that needs a login has the
+  methods it offers reported rather than a prompt that asks which one.
 - Image, audio, and embedded resource prompts.
 - A config-option selector UI (the client parses and sets `configOptions` but does not render a selector).
-- Structured diff review and tool-specific rich renderers.
+- Tool-specific rich renderers. A tool call is drawn as a chip with its fields
+  and its diff, and the review surface lists proposed changes, but neither knows
+  what a particular tool's output means; and the ACP client does not route agent
+  edits into the review queue, so what is waiting there came from a test, a gate,
+  or the person.
 - Remote transports and extension-specific RPC methods.
 
 Permissions apply only to requests that a harness exposes through ACP.
@@ -113,9 +151,24 @@ scrollback, which is what applications expect.
 
 The terminal needs a PTY, so it exists where `forkpty` does: Windows has no
 terminal dock, and `services/pty.zig` names a type there that refuses rather
-than a declaration the linker would have to find. The dock starts the user's
-shell from `SHELL`, or `/bin/sh`, and the editor has no setting for choosing
-another one yet.
+than a declaration the linker would have to find. The dock starts a shell from
+`/etc/shells` when the reader picks one, and the reader's `SHELL` or `/bin/sh`
+otherwise: there is no preference for which shell a new tab gets, and an entry
+in `/etc/shells` is dropped when the path it names is not there, so the list can
+be shorter than the file.
+
+The editor's shortcut table is consulted before the dock sees a key, so a
+program running in the terminal cannot be sent the keys the editor claims: there
+is no way to deliver Ctrl+C as an interrupt from the dock, and a Ctrl key with
+no editor meaning does nothing there rather than reaching the shell. Typed text
+and the keys a terminal sends are unaffected.
+
+A shell that reports its own command boundaries with OSC 133 (bash and zsh are
+handed a snippet that makes them) leaves the terminal knowing the last command
+and what it printed, and `App.terminalCommand` hands that out; no interface
+control uses it yet, so a command's output has to be selected by hand to travel
+anywhere. A shell the integration does not know runs as it always did, and the
+terminal then has a screen of text and no idea which command produced it.
 
 ## Platform and IDE scope
 
@@ -144,6 +197,11 @@ drawn in. A context per extension limits the damage to that extension's own
 requests, and the reload report says which bundle failed, but there is no
 preemption and no memory ceiling per extension.
 
+A panel is only drawn for a region the editor asks for, and the editor asks for
+four: `activity`, `tabs`, `transcript`, and `status`. A panel registered under
+any other name draws nothing, and the shipped bundles still register `explorer`,
+`header`, and `lanes` panels from the interface those regions belonged to.
+
 ## Themes
 
 `--theme <path>` loads a theme in the native format described in
@@ -160,6 +218,13 @@ What is not covered:
   keyed by a semantic tokenizer's kinds and this editor classifies lexically.
   Vim, Emacs, Sublime, and the terminal formats (`.itermcolors`, Windows
   Terminal, ghostty) have no importer.
+- **A theme without a terminal palette still sends the placeholder one.** The
+  push into a live shell is skipped only when no theme was loaded at all, so a
+  `.tmTheme`, or a VS Code theme that sets no `terminal.background` or
+  `terminal.foreground`, hands the terminal the document default: sixteen ANSI
+  entries that are all the background colour. A program that prints in colour -
+  a prompt, `ls`, a diff - then prints in the colour of the paper. With no theme
+  loaded the emulator keeps its own palette, which is a real one.
 - **Bold and italic are parsed and not drawn.** The atlas has one face, so a
   theme's `fontStyle` reaches the scope list and stops there. What a reader
   gains from inline markup is that the markers are stripped; weight and slant

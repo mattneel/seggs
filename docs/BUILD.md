@@ -21,8 +21,15 @@ sudo apt-get install -y \
   build-essential cmake git pkg-config python3 \
   libfreetype6-dev libx11-dev libxext-dev libxrandr-dev \
   libxcursor-dev libxfixes-dev libxi-dev libxss-dev libxrender-dev \
-  glslang-tools libvulkan-dev mesa-vulkan-drivers fonts-dejavu-core
+  libxtst-dev glslang-tools libvulkan-dev mesa-vulkan-drivers \
+  vulkan-validationlayers fonts-dejavu-core fonts-wqy-zenhei
 ```
+
+`libxtst-dev` is an SDL X11 dependency. `vulkan-validationlayers` is what lets
+the screenshot gate run the app under the Khronos layer rather than report the
+renders unchecked, and `fonts-wqy-zenhei` is the CJK face the glyph-fallback
+check draws with. `fonts-dejavu-core` is the monospace face the editor itself
+draws with; `xvfb`, below, supplies the display.
 
 The bootstrap enables X11 and disables Wayland to limit the baseline dependencies.
 A Wayland desktop can use XWayland.
@@ -153,11 +160,16 @@ The temporary-file save path also needs Windows path-encoding validation.
 
 ## Dependencies
 
-`build.zig.zon` pins the toolchain, [zignal](https://github.com/arrufat/zignal)
-(pure-Zig TrueType parsing for glyph selection), and
-[quickjs-ng](https://github.com/mattneel/zig-quickjs-ng) (the extension host).
-Both are pinned to a commit archive with a checksum, so a clean checkout builds
-without any local setup.
+`build.zig.zon` pins [zignal](https://github.com/arrufat/zignal) (pure-Zig
+TrueType parsing for glyph selection),
+[quickjs-ng bindings](https://github.com/mattneel/zig-quickjs-ng) (the extension
+host), and [Yoga](https://github.com/facebook/yoga) (layout for interface an
+extension describes). Each is pinned to a commit archive with a checksum, so a
+clean checkout builds without any local setup.
+
+The Zig toolchain is pinned separately: `.zigversion` and
+`minimum_zig_version` name the version, and `dependencies.json` names it
+alongside the SDL and Ghostty pins that `tools/bootstrap.py` builds.
 
 Development builds of Zig have no release manifest, so `tools/zig-checksums.json`
 records the expected sha256 for the pinned toolchain. Adding a platform means
@@ -175,7 +187,8 @@ npm run build
 ```
 
 esbuild writes one IIFE script per source into `extensions/dist/`, which the
-app loads at startup by resolving that directory under the workspace root.
+app loads at startup by resolving that directory under the workspace root, and
+reloads when the directory changes while it runs.
 `npm run typecheck` checks the sources against `extensions/types/seggs.d.ts`.
 
 The QuickJS-NG bindings use `splitType`, which needs LLVM codegen, so the

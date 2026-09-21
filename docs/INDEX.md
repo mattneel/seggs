@@ -15,6 +15,12 @@ with the files and terminals they ask for.
   grapheme-aware movement.
 - Runs independent agent sessions with their own transcripts, a review queue for
   proposed edits, and permission requests that are explicit and one-shot.
+- Renders the transcript as Markdown, with a fenced diff drawn as a diff and tool
+  calls drawn as chips where they happened, each opening to its fields and diff.
+- Runs shells in a dock of tabs beside the editor: every dock resizes by dragging
+  its divider, and one widget draws every list the interface opens.
+- Repaints the whole interface, the terminal, and syntax colouring from a theme
+  document, a TextMate `.tmTheme`, or a VS Code colour theme.
 - Serves agent requests through a capability broker: editor-backed file reads and
   writes, and client-owned terminals with bounded output.
 - Speaks to a language server for diagnostics and navigation, a debug adapter for
@@ -28,6 +34,7 @@ with the files and terminals they ask for.
 | --- | --- |
 | Build and run it | [Build](BUILD.md) |
 | Understand the design | [Architecture](ARCHITECTURE.md) |
+| Change the colours | [Architecture: themes](ARCHITECTURE.md#themes), then [what an import misses](LIMITATIONS.md#themes) |
 | Write an extension | [SeggsC](EXTENSIONS.md) |
 | Point an agent at it | [Agent setup](AGENTS.md) |
 | Check what is verified | [Validation](VALIDATION.md) |

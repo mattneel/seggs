@@ -49,6 +49,8 @@ are in `extensions/types/seggs.d.ts`.
   agents: { id: string; name: string; state: string; running: boolean }[];
   active: number;
   status: string;
+  sidebar: boolean;
+  focus: string;
   files: { root: string; entries: string[]; selected: string; scroll: number };
   buffers: { names: string[]; active: number };
   editor: { file: string; line: number; column: number; bytes: number; dirty: boolean };
@@ -58,17 +60,20 @@ are in `extensions/types/seggs.d.ts`.
 ## Regions
 
 The interface offers named rectangles and an extension fills them by registering
-a panel under that name. Regions drawn today:
+a panel under that name. Regions the editor asks for today:
 
 | Region | Space |
 | --- | --- |
 | `activity` | The rail down the left edge, at every window size. |
-| `explorer` | The file list, when the sidebar is open. |
 | `tabs` | The tab strip above the document. |
-| `header` | The line under the tabs, showing cursor and size. |
-| `lanes` | The agent list at the top of the agents pane. |
-| `transcript` | The space below the lanes, when the active agent has nothing to show. |
+| `transcript` | The agent dock's empty-transcript space, when the active lane has nothing to show. |
 | `status` | The status bar across the bottom. |
+
+A name that is not in that list is never asked for, and a panel registered under
+it draws nothing: the editor draws its own file tree, and the dock's lane strip
+draws itself, so neither is a region today. The bundles in `extensions/src` still
+register `explorer`, `header`, and `lanes` panels, which is why a reader of those
+files may expect more regions than there are.
 
 The document itself — its text, line numbers, and highlighting — is drawn by the
 editor rather than described by a panel: it is the file, not chrome around it.
@@ -80,7 +85,10 @@ frame and is reported once per call.
 
 ## Description
 
-A node is an object with a `type`, style keys, and `children`:
+A node is an object with a `type`, style keys, and `children`. The example below
+uses the `lanes` name to show the shape of a description; the region passed to
+`seggs.ui.panel` has to be one the editor asks for, and the list above is the
+current set.
 
 ```ts
 seggs.ui.panel("lanes", () => ({
@@ -105,7 +113,8 @@ seggs.ui.panel("lanes", () => ({
 | --- | --- |
 | `type` | `row`, `column`, `box`, or `text`. Defaults to `column`. |
 | `id` | Name reported by events. Required for `focusable` nodes to be useful. |
-| `text`, `color` | Content and text color of a `text` leaf. |
+| `text` | Content of a `text` leaf. |
+| `color` | Optional colour of a `text` leaf or a `box` fill, named as a theme role. It is resolved when the node is drawn rather than captured when the panel is described, so a panel follows the live theme; a node with no `color` draws in `text`. |
 | `background` | Fill drawn behind a container before its children. |
 | `width`, `height`, `minWidth`, `maxWidth` | Fixed sizes in device pixels. |
 | `heightPercent` | Share of the parent's height. |
@@ -123,10 +132,9 @@ A `text` leaf is measured against the same cell grid the renderer draws on, so a
 measured node occupies exactly the space its text fills.
 
 A provider is told the size of its region, so a panel can decide what fits: the
-file list drops its footer when the region is short, and the agent lanes drop
-their state text when the column is narrow. Regions themselves come and go with
-the window: below 1040 points the file list is dropped, below 880 the agent
-column joins it, and the editor takes the space.
+shipped activity rail shows only the rows its height holds. Regions themselves
+come and go with the window: below 1040 device pixels the file list is dropped,
+below 880 the agent column joins it, and the editor takes the space.
 
 ## Events
 
@@ -204,7 +212,7 @@ Descriptions are untrusted input:
 | Event subscriptions | 32 |
 | Queued actions | 32 |
 | Panel name | 64 bytes |
-| Action id | 64 bytes |
+| Action id | 512 bytes |
 
 Exceeding a limit rejects that panel or request; it does not affect the rest of
 the interface.

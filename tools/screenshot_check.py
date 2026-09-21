@@ -39,6 +39,8 @@ METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
+COMPOSE_LINE = re.compile(r"compose (\S+): (\d+) steps, (.+)")
+
 COMMAND_LINE = re.compile(r"terminal: (the shell marked its command: (.+)|this shell reports no command boundaries)")
 
 REVIEW_LINE = re.compile(r"review: (\d+) change\(s\) waiting, accepted=(true|false)")
@@ -716,6 +718,26 @@ def check_run(binary: str) -> None:
     )
 
 
+def check_compose(binary: str) -> None:
+    """A workflow reads left to right, and says what travels along it.
+
+    The Compose perspective is the same run seen as a sequence rather than as a
+    list. The fixture reports the sequence it drew, so the check follows the
+    workflow itself rather than the pixels of one layout.
+    """
+    command = display_command([binary, "--windowed", "--frames", "30", "--exercise-compose"], app_env())
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+    composed = COMPOSE_LINE.search(output)
+    if composed is None:
+        for line in output.splitlines()[-8:]:
+            print(f"  {line}")
+    require(composed is not None, "composing a run reported nothing")
+    steps = [word.strip() for word in composed.group(3).split("|")]
+    require(steps == ["plan", "implement", "review"], f"the strip reads {steps}, expected the starter workflow in order")
+    print(f"compose: {composed.group(1)} as {composed.group(3)}")
+
+
 def check_density(binary: str) -> None:
     """A display reporting a scale other than one must still render.
 
@@ -764,6 +786,7 @@ def main() -> int:
         check_density(binary)
         check_terminal(binary)
         check_run(binary)
+        check_compose(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1

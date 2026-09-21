@@ -50,13 +50,13 @@ pub const App = struct {
     /// What the centre of the window is about. A perspective is a view of the
     /// same workspace and run, not a separate application: switching keeps the
     /// open file and the selected run.
-    const Perspective = enum { code, review };
+    const Perspective = enum { code, review, compose };
 
     /// What the left dock navigates. The roadmap's rail is the long version of
     /// this; two things to look at is where it starts.
     const Dock = enum { files, runs };
     const Overlay = enum { none, files, commands, quit };
-    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes", "Show runs" };
+    const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes", "Show runs", "Compose the run" };
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
     workspace: Workspace,
@@ -94,6 +94,7 @@ pub const App = struct {
     /// Which surface the centre shows, and which change is selected in it.
     perspective: Perspective = .code,
     review_selected: usize = 0,
+    compose_selected: usize = 0,
 
     /// Scratch for the inspector's own labels, so drawing does not allocate.
     inspector_scratch: [3][64]u8 = undefined,
@@ -613,6 +614,9 @@ pub const App = struct {
                     try self.workspace.activeDocument().redo();
                     self.selection_anchor = null;
                     self.follow_cursor = true;
+                },
+                c.SDLK_W => {
+                    if (shift) self.perspective = if (self.perspective == .compose) .code else .compose;
                 },
                 c.SDLK_A => {
                     // A run waiting for a person takes precedence over the
@@ -1186,6 +1190,7 @@ pub const App = struct {
                         7 => try self.startRun(),
                         8 => self.perspective = if (self.perspective == .review) .code else .review,
                         9 => self.dock = if (self.dock == .runs) .files else .runs,
+                        10 => self.perspective = if (self.perspective == .compose) .code else .compose,
                         else => unreachable,
                     }
                     return;
@@ -1236,10 +1241,10 @@ pub const App = struct {
             }
             try self.drawDockSwitch(r);
         }
-        if (self.perspective == .review) {
-            try self.drawReview(r, frame);
-        } else {
-            try self.drawEditor(r);
+        switch (self.perspective) {
+            .code => try self.drawEditor(r),
+            .review => try self.drawReview(r, frame),
+            .compose => try self.drawCompose(r, frame),
         }
         if (self.terminal_open) try self.drawTerminal(r);
         try self.drawInspector(r, frame);
@@ -1746,9 +1751,9 @@ pub const App = struct {
     /// a run is the task rather than the tool that happens to do it.
     pub fn startRun(self: *App) !void {
         const steps = [_]runs.Step{
-            .{ .name = "plan", .produces = .plan, .harness = 0, .request = "Produce an implementation plan for the code below." },
-            .{ .name = "implement", .produces = .implementation, .harness = 1, .request = "Implement the plan. Describe the change you made." },
-            .{ .name = "review", .produces = .review, .harness = 2, .request = "Review the implementation against the plan." },
+            .{ .name = "plan", .produces = .plan, .action = .{ .agent = .{ .harness = 0, .request = "Produce an implementation plan for the code below." } } },
+            .{ .name = "implement", .produces = .implementation, .action = .{ .agent = .{ .harness = 1, .request = "Implement the plan. Describe the change you made." } } },
+            .{ .name = "review", .produces = .review, .action = .{ .agent = .{ .harness = 2, .request = "Review the implementation against the plan." } } },
         };
         var run = try runs.Run.init(self.allocator, std.fs.path.basename(self.workspace.activePath() orelse "workspace"), &steps);
         errdefer run.deinit();
@@ -2045,6 +2050,79 @@ pub const App = struct {
         }
         if (self.runs.items.len == 0) {
             try r.text(bounds.x + 12, bounds.y + 36, "No runs yet.", theme.muted);
+        }
+    }
+
+    /// The Compose perspective: the run's steps as a sequence, with the
+    /// artifact each joint carries. A pipeline reads left to right the way the
+    /// pipeline does; a graph earns its keep when a workflow branches, and a
+    /// strip pretending to be a graph would be worse than an honest one.
+    fn drawCompose(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
+        const bounds = self.geometry.editor;
+        r.clip = bounds;
+        try r.rect(bounds, theme.background);
+        try r.text(bounds.x + 24, bounds.y + 20, "COMPOSE", theme.text);
+        const run = self.activeRun() orelse {
+            try r.text(bounds.x + 24, bounds.y + 46, "No run to compose. Start one from the palette.", theme.muted);
+            return;
+        };
+        var header: [160]u8 = undefined;
+        const title = try std.fmt.bufPrint(&header, "{s} · {s}", .{
+            run.name,
+            switch (run.state) {
+                .running => "running",
+                .waiting_for_approval => "waiting for you",
+                .done => "done",
+                .failed => "failed",
+            },
+        });
+        try r.text(bounds.x + 108, bounds.y + 20, title, theme.accent);
+        try r.text(bounds.x + 24, bounds.y + 46, "Left to right, the way it runs. Each joint carries what the step before it produced.", theme.muted);
+
+        const count: f32 = @floatFromInt(@max(1, run.steps.len));
+        const gap: f32 = 44;
+        const available = bounds.w - 48 - gap * (count - 1);
+        const box_w = @max(96, @min(180, available / count));
+        const box_h: f32 = 88;
+        var x = bounds.x + 24;
+        const y = bounds.y + 96;
+        for (run.steps, 0..) |step, index| {
+            const chosen = index == self.compose_selected;
+            try r.rect(.{ .x = x, .y = y, .w = box_w, .h = box_h }, theme.panel);
+            try r.rect(.{ .x = x, .y = y, .w = 3, .h = box_h }, switch (step.state) {
+                .waiting => theme.border,
+                .running => theme.accent,
+                .done => theme.muted,
+                .failed => theme.red,
+            });
+            try wrapped(r, frame, .{ .x = x + 12, .y = y + 10, .w = box_w - 24, .h = r.atlas.line_height }, step.name, if (chosen) theme.accent else theme.text);
+            const who = switch (step.action) {
+                .agent => |agent| if (agent.harness < self.clients.len) self.clients[agent.harness].preset.name else "harness",
+                .command => "command",
+                .approval => "you",
+            };
+            try r.text(x + 12, y + 12 + r.atlas.line_height, who, theme.muted);
+            const state = switch (step.state) {
+                .waiting => "○ waiting",
+                .running => "● running",
+                .done => "✓ done",
+                .failed => "✗ failed",
+            };
+            try r.text(x + 12, y + box_h - 24, state, switch (step.state) {
+                .waiting => theme.muted,
+                .running => theme.accent,
+                .done => theme.text,
+                .failed => theme.red,
+            });
+            x += box_w;
+            if (index + 1 < run.steps.len) {
+                // The joint, and what travels over it: a pipe that says what it
+                // carries is the whole idea, and one that does not is decoration.
+                try r.text(x + 16, y + box_h / 2 - 8, "│", theme.accent);
+                const carries = run.steps[index + 1].produces.label();
+                try r.text(x + gap / 2 - r.atlas.advance * 2, y + box_h + 8, carries, theme.muted);
+                x += gap;
+            }
         }
     }
 

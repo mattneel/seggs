@@ -40,6 +40,7 @@ fn run(init: std.process.Init) !void {
     var exercise_click = false;
     var exercise_terminal = false;
     var exercise_run = false;
+    var exercise_compose = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -67,6 +68,8 @@ fn run(init: std.process.Init) !void {
             exercise_terminal = true;
         } else if (std.mem.eql(u8, arg, "--exercise-run")) {
             exercise_run = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-compose")) {
+            exercise_compose = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -205,6 +208,7 @@ fn run(init: std.process.Init) !void {
         if (exercise_click) exerciseClick(&app, frames);
         if (exercise_terminal) exerciseTerminal(&app, frames, frame_arena.allocator());
         if (exercise_run) exerciseRun(&app, frames, frame_arena.allocator());
+        if (exercise_compose) exerciseCompose(&app, frames);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
@@ -475,6 +479,35 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
         defer a.free(bytes);
         const landed = std.mem.startsWith(u8, bytes, "// accepted through the review surface");
         std.log.info("review: {d} change(s) waiting, accepted={}", .{ app.review.count(), landed });
+    }
+}
+
+/// The Compose perspective: a run's steps as the sequence it will execute, with
+/// what travels between them.
+fn exerciseCompose(app: *App, frame: usize) void {
+    switch (frame) {
+        6 => app.startRun() catch |err| std.log.err("compose: {s}", .{@errorName(err)}),
+        10 => app.perspective = .compose,
+        24 => {
+            const active = app.activeRun() orelse {
+                std.log.err("compose: nothing to compose", .{});
+                return;
+            };
+            var names: [128]u8 = undefined;
+            var written: usize = 0;
+            for (active.steps, 0..) |step, index| {
+                if (index > 0 and written < names.len) {
+                    const joiner = " | ";
+                    @memcpy(names[written..][0..joiner.len], joiner);
+                    written += joiner.len;
+                }
+                const take = @min(step.name.len, names.len - written);
+                @memcpy(names[written..][0..take], step.name[0..take]);
+                written += take;
+            }
+            std.log.info("compose {s}: {d} steps, {s}", .{ active.name, active.steps.len, names[0..written] });
+        },
+        else => {},
     }
 }
 

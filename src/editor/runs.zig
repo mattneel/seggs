@@ -56,13 +56,10 @@ pub const Step = struct {
     name: []const u8,
     /// What this step hands on, and therefore what it needs first.
     produces: Kind,
+    /// What this step does. There is no default that quietly succeeds: a step
+    /// that names nothing is a step that waits for a person, which is the one
+    /// action that cannot be wrong by accident.
     action: Action = .approval,
-    /// Which harness, by index into the caller's list. A command step ignores
-    /// it.
-    harness: usize = 0,
-    /// What this step is asked to do, in the workflow's own words. The engine
-    /// keeps it so a run can be described without a transcript being open.
-    request: []const u8 = "",
     /// What the harness had finished when this step was sent, and where its
     /// words stood. A turn counter answers *whether* the step is done; the
     /// offset is used to take the answer, and is checked against a transcript
@@ -178,9 +175,9 @@ pub const Run = struct {
 test "a run hands each step what the last one produced" {
     const a = std.testing.allocator;
     const steps = [_]Step{
-        .{ .name = "plan", .produces = .plan, .harness = 0, .request = "Produce an implementation plan" },
-        .{ .name = "implement", .produces = .implementation, .harness = 1, .request = "Implement the plan" },
-        .{ .name = "review", .produces = .review, .harness = 2, .request = "Review the change" },
+        .{ .name = "plan", .produces = .plan, .action = .{ .agent = .{ .harness = 0, .request = "Produce an implementation plan" } } },
+        .{ .name = "implement", .produces = .implementation, .action = .{ .agent = .{ .harness = 1, .request = "Implement the plan" } } },
+        .{ .name = "review", .produces = .review, .action = .{ .agent = .{ .harness = 2, .request = "Review the change" } } },
     };
     var run = try Run.init(a, "parser fix", &steps);
     defer run.deinit();
@@ -220,8 +217,8 @@ test "a run hands each step what the last one produced" {
 test "a failed step stops the run instead of feeding the next one" {
     const a = std.testing.allocator;
     const steps = [_]Step{
-        .{ .name = "zig build test", .produces = .checks, .request = "Run the suite" },
-        .{ .name = "review", .produces = .review, .harness = 1, .request = "Review the result" },
+        .{ .name = "zig build test", .produces = .checks, .action = .{ .command = &.{ "zig", "build", "test" } } },
+        .{ .name = "review", .produces = .review, .action = .{ .agent = .{ .harness = 1, .request = "Review the result" } } },
     };
     var run = try Run.init(a, "verify", &steps);
     defer run.deinit();

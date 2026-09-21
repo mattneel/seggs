@@ -143,3 +143,32 @@ blocks the editor: panels are asked for a description during the frame they are
 drawn in. A context per extension limits the damage to that extension's own
 requests, and the reload report says which bundle failed, but there is no
 preemption and no memory ceiling per extension.
+
+## Themes
+
+`--theme <path>` loads a theme in the native format described in
+`src/ui/theme.zig`, or a TextMate `.tmTheme` or VS Code colour theme, which are
+recognised by their contents rather than their extension. Import is one-way:
+nothing writes either format back, and no format is read at runtime. A theme
+changes the editor's colours, the terminal palette, and syntax colouring.
+
+What is not covered:
+
+- **Only two importers, and neither is complete.** A `.tmTheme` carries no
+  ANSI palette, so its terminal half is left at the default rather than
+  invented. A VS Code theme's `semanticTokenColors` is not read, because it is
+  keyed by a semantic tokenizer's kinds and this editor classifies lexically.
+  Vim, Emacs, Sublime, and the terminal formats (`.itermcolors`, Windows
+  Terminal, ghostty) have no importer.
+- **Bold and italic are parsed and not drawn.** The atlas has one face, so a
+  theme's `fontStyle` reaches the scope list and stops there. What a reader
+  gains from inline markup is that the markers are stripped; weight and slant
+  are not faked with colour.
+- **Scope coverage is lexical.** Syntax colouring comes from the editor's own
+  scanner, which knows comments, strings, numbers, keywords, and decorators and
+  answers with those names. A theme's rule for `entity.name.function` or
+  `variable.parameter` matches nothing, because nothing here produces those
+  scopes, and such a rule is silently unused.
+- **A theme loaded at startup does not follow a display change**, and only the
+  twelve chrome roles plus the two diff roles are themeable: the layout,
+  spacing, and font size are not part of the format.

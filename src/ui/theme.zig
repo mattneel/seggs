@@ -74,6 +74,12 @@ const default_purple: Color = rgb(0xc6a0f6);
 const default_amber: Color = rgb(0xf5c57d);
 const default_red: Color = rgb(0xf38ba8);
 const default_blue: Color = rgb(0x91b9ff);
+/// Diff colours, deliberately louder and less pastel than the palette's own
+/// green and red: an added line should not read as a keyword, and a removed one
+/// should not read as a warning. These are the two roles the interface needs
+/// that no editor theme file carries.
+const default_added: Color = rgb(0x7ee787);
+const default_removed: Color = rgb(0xff7b72);
 
 /// The palette every draw call reads. These are variables rather than constants
 /// because a theme is a runtime choice, and they keep their names so a site
@@ -91,6 +97,11 @@ pub var purple: Color = default_purple;
 pub var amber: Color = default_amber;
 pub var red: Color = default_red;
 pub var blue: Color = default_blue;
+/// A diff's added and removed lines, kept away from `accent` and `red`: a diff
+/// is read for what changed, and borrowing the accent makes every added line
+/// shout in the same voice as everything else that is highlighted.
+pub var added: Color = default_added;
+pub var removed: Color = default_removed;
 
 /// The interface's roles, one field per palette name above and named the same,
 /// so `apply` is a straight list and a document names roles rather than hex
@@ -109,6 +120,11 @@ pub const Chrome = struct {
     amber: Color = default_amber,
     red: Color = default_red,
     blue: Color = default_blue,
+    /// A diff's added and removed lines. No editor theme names these - they are
+    /// ours, because a transcript is where diffs turn up - so an imported theme
+    /// leaves them at these defaults rather than telling us something wrong.
+    added: Color = default_added,
+    removed: Color = default_removed,
 };
 
 /// What a terminal needs: its own background and foreground, the cursor and
@@ -183,6 +199,8 @@ pub fn apply(t: Theme) void {
     amber = t.chrome.amber;
     red = t.chrome.red;
     blue = t.chrome.blue;
+    added = t.chrome.added;
+    removed = t.chrome.removed;
     current = t;
 }
 
@@ -348,6 +366,8 @@ fn parseChrome(value: std.json.Value) !Chrome {
     if (object.get("amber")) |colour| chrome.amber = try parseColor(colour);
     if (object.get("red")) |colour| chrome.red = try parseColor(colour);
     if (object.get("blue")) |colour| chrome.blue = try parseColor(colour);
+    if (object.get("added")) |colour| chrome.added = try parseColor(colour);
+    if (object.get("removed")) |colour| chrome.removed = try parseColor(colour);
     return chrome;
 }
 
@@ -465,7 +485,8 @@ test "the default theme round-trips through a document" {
         \\    "background": "#101216", "panel": "#16191f", "raised": "#1d222b",
         \\    "selected": "#263b36", "border": "#2b3039", "text": "#dce2ed",
         \\    "muted": "#8c97aa", "accent": "#8ee8b4", "purple": "#c6a0f6",
-        \\    "amber": "#f5c57d", "red": "#f38ba8", "blue": "#91b9ff"
+        \\    "amber": "#f5c57d", "red": "#f38ba8", "blue": "#91b9ff",
+        \\    "added": "#7ee787", "removed": "#ff7b72"
         \\  },
         \\  "terminal": {
         \\    "background": "#101216", "foreground": "#dce2ed",

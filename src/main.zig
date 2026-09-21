@@ -275,6 +275,7 @@ var terminal_answered = false;
 var run_reported = false;
 var fixture_step_sent = false;
 var approval_sent = false;
+var approval_held: usize = 0;
 var review_proposed = false;
 var review_reported = false;
 var review_held: usize = 0;
@@ -406,7 +407,12 @@ fn exerciseRun(app: *App, frame: usize, a: std.mem.Allocator) void {
         // The person in the fixture presses the key a person would press,
         // rather than calling the approval directly: the binding is part of
         // what has to work.
+        // A person does not answer in the frame the question is asked, and the
+        // inbox is only visible while the question stands: the fixture waits
+        // long enough for that to be true.
         if (app.runWaiting() and !approval_sent) {
+            approval_held += 1;
+            if (approval_held < 90) return;
             approval_sent = true;
             var ev = std.mem.zeroes(c.SDL_Event);
             ev.type = c.SDL_EVENT_KEY_DOWN;

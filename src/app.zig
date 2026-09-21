@@ -1057,11 +1057,19 @@ pub const App = struct {
                 return;
             }
             if (self.dock == .runs) {
-                const offset = @max(0, y - dock.y - 36);
-                const index: usize = @intFromFloat(offset / 48);
-                if (index < self.runs.items.len) {
-                    self.run_index = index;
-                    self.status("Run {s} selected.", .{self.runs.items[index].name});
+                // The inbox sits above the runs, and answering it is a keystroke
+                // rather than a click: what a row can do here is select its run.
+                var inbox: std.ArrayList(Decision) = .empty;
+                defer inbox.deinit(self.allocator);
+                self.decisions(&inbox) catch {};
+                const lead: f32 = if (inbox.items.len > 0) 18 + @as(f32, @floatFromInt(inbox.items.len)) * 38 + 28 else 0;
+                const offset = y - dock.y - 36 - lead;
+                if (offset >= 0) {
+                    const index: usize = @intFromFloat(offset / 48);
+                    if (index < self.runs.items.len) {
+                        self.run_index = index;
+                        self.status("Run {s} selected.", .{self.runs.items[index].name});
+                    }
                 }
                 return;
             }
@@ -1202,7 +1210,7 @@ pub const App = struct {
         _ = try self.drawPanel(r, "activity", g.activity);
         if (g.explorer.w > 0) {
             if (self.dock == .runs) {
-                try self.drawRuns(r);
+                try self.drawRuns(r, frame);
             } else {
                 _ = try self.drawPanel(r, "explorer", g.explorer);
             }
@@ -1880,18 +1888,92 @@ pub const App = struct {
         }
     }
 
+    /// One thing waiting on a person, with what it belongs to. A decision that
+    /// does not say which run it is about is a decision somebody has to go
+    /// looking for.
+    const Decision = struct {
+        what: []const u8,
+        scope: []const u8,
+        key: []const u8,
+    };
+
+    /// Everything waiting on a person, decisions before routine progress: this
+    /// is the inbox, and it is the first thing the dock shows.
+    fn decisions(self: *App, out: *std.ArrayList(Decision)) !void {
+        for (self.clients) |client| {
+            if (client.permission != null) {
+                try out.append(self.allocator, .{
+                    .what = client.permissionTitle(),
+                    .scope = client.preset.name,
+                    .key = "Alt+Y / Alt+N",
+                });
+            }
+        }
+        for (self.runs.items) |*run| {
+            if (run.state != .waiting_for_approval) continue;
+            const step = run.current();
+            try out.append(self.allocator, .{
+                .what = if (step) |value| value.name else "approval",
+                .scope = run.name,
+                .key = "Ctrl+Shift+A",
+            });
+        }
+        if (self.review.count() > 0) {
+            try out.append(self.allocator, .{
+                .what = "changes to review",
+                .scope = "waiting",
+                .key = "Ctrl+Shift+R",
+            });
+        }
+    }
+
     /// The runs this session knows about. A run that needs a person says so
     /// rather than looking like the ones that are merely working.
-    fn drawRuns(self: *App, r: *Renderer) !void {
+    fn drawRuns(self: *App, r: *Renderer, frame: std.mem.Allocator) !void {
         const bounds = self.geometry.explorer;
         r.clip = bounds;
         try r.rect(bounds, theme.panel);
         var y = bounds.y + 36;
+
+        var inbox: std.ArrayList(Decision) = .empty;
+        defer inbox.deinit(self.allocator);
+        try self.decisions(&inbox);
+        if (inbox.items.len > 0) {
+            try r.text(bounds.x + 12, y, "NEEDS YOU", theme.amber);
+            y += 18;
+            for (inbox.items) |decision| {
+                if (y + 58 > bounds.y + bounds.h) break;
+                var label: [160]u8 = undefined;
+                const what = try std.fmt.bufPrint(&label, "{s} · {s}", .{ decision.what, decision.scope });
+                // A decision says which run it is about, and wraps if it has to:
+                // a truncated question is one somebody has to go looking for.
+                r.clip = bounds;
+                try wrapped(r, frame, .{
+                    .x = bounds.x + 12,
+                    .y = y,
+                    .w = bounds.w - 24,
+                    .h = r.atlas.line_height * 2,
+                }, what, theme.text);
+                try r.text(bounds.x + 12, y + r.atlas.line_height * 2, decision.key, theme.muted);
+                y += r.atlas.line_height * 2 + 24;
+            }
+            r.clip = bounds;
+            y += 8;
+            try r.text(bounds.x + 12, y, "RUNS", theme.muted);
+            y += 18;
+        }
+
         for (self.runs.items, 0..) |*run, index| {
             if (y + 44 > bounds.y + bounds.h) break;
             const chosen = index == self.run_index;
-            if (chosen) try r.rect(.{ .x = bounds.x + 4, .y = y - 4, .w = bounds.w - 8, .h = 42 }, theme.raised);
-            try r.text(bounds.x + 12, y, run.name, if (chosen) theme.accent else theme.text);
+            if (chosen) try r.rect(.{ .x = bounds.x + 4, .y = y - 4, .w = bounds.w - 8, .h = 44 }, theme.raised);
+            r.clip = bounds;
+            try wrapped(r, frame, .{
+                .x = bounds.x + 12,
+                .y = y,
+                .w = bounds.w - 24,
+                .h = r.atlas.line_height,
+            }, run.name, if (chosen) theme.accent else theme.text);
             const step = run.current();
             var state: [80]u8 = undefined;
             const label = try std.fmt.bufPrint(&state, "{s} · {s}", .{
@@ -1903,7 +1985,8 @@ pub const App = struct {
                     .failed => "failed",
                 },
             });
-            try r.text(bounds.x + 12, y + 20, label, if (run.state == .waiting_for_approval) theme.amber else theme.muted);
+            r.clip = bounds;
+            try r.text(bounds.x + 12, y + r.atlas.line_height, label, if (run.state == .waiting_for_approval) theme.amber else theme.muted);
             y += 48;
         }
         if (self.runs.items.len == 0) {
@@ -2211,6 +2294,11 @@ fn countLines(bytes: []const u8) usize {
 /// Text drawn from the top of a rect, wrapping at its width.
 fn wrapped(r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, color: theme.Color) !void {
     if (rect.h < r.atlas.line_height or rect.w <= 0) return;
+    // Text is clipped to the rect it is drawn in, and the clip is put back
+    // afterwards: a caller that draws the next line itself has no way to know
+    // this one moved the boundary.
+    const outer = r.clip;
+    defer r.clip = outer;
     r.clip = rect;
     const columns: usize = @intFromFloat(@max(1, rect.w / r.atlas.advance));
     var spans: std.ArrayList([]const u8) = .empty;
@@ -2223,6 +2311,8 @@ fn wrapped(r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8
 
 fn wrappedTail(r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, scroll: usize, color: theme.Color) !void {
     if (rect.h < r.atlas.line_height or rect.w <= 0) return;
+    const outer = r.clip;
+    defer r.clip = outer;
     r.clip = rect;
     const columns: usize = @intFromFloat(@max(1, rect.w / r.atlas.advance));
     const rows: usize = @intFromFloat(rect.h / r.atlas.line_height);

@@ -38,6 +38,11 @@ pub const Client = struct {
     session_id: ?[]u8 = null,
     next_id: u64 = 1,
     pending: ?Request = null,
+
+    /// ACP requires an absolute working directory, and a caller may hand in a
+    /// relative one. It is resolved once, when the first session opens, and
+    /// released with the client.
+    session_cwd: ?[]u8 = null,
     permission: ?Permission = null,
     transcript: std.ArrayList(u8) = .empty,
     config: std.ArrayList(ConfigOption) = .empty,
@@ -54,6 +59,8 @@ pub const Client = struct {
 
     pub fn deinit(self: *Client) void {
         self.stop();
+        if (self.session_cwd) |cwd| self.allocator.free(cwd);
+        self.session_cwd = null;
         self.transcript.deinit(self.allocator);
         self.clearAuth();
         self.auth_methods.deinit(self.allocator);
@@ -112,7 +119,11 @@ pub const Client = struct {
     fn beginSession(self: *Client) !void {
         const next = self.next_id;
         self.next_id += 1;
-        try self.sendOwned(try rpc.request(self.allocator, next, "session/new", .{ .cwd = self.cwd, .mcpServers = [0]struct {}{} }));
+        if (self.session_cwd == null) {
+            self.session_cwd = files.realTarget(self.allocator, self.cwd) catch null;
+        }
+        const cwd = self.session_cwd orelse self.cwd;
+        try self.sendOwned(try rpc.request(self.allocator, next, "session/new", .{ .cwd = cwd, .mcpServers = [0]struct {}{} }));
         self.pending = .{ .id = next, .kind = .new_session, .deadline = c.SDL_GetTicks() + 60_000 };
         self.state = .new_session;
     }

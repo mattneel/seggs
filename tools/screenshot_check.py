@@ -39,6 +39,7 @@ METRICS_LINE = re.compile(r"atlas: advance ([0-9.]+), line height ([0-9.]+)")
 EXTENSION_LINE = re.compile(r"extensions: (\d+) loaded")
 PANEL_CLICK = re.compile(r"click: status is now panel (\S+): clicked (.+)")
 RUN_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, current=(\S+)")
+ANSWER_LINE = re.compile(r"run (\S+): (\d+) steps, (\d+) artifacts, (\S+) from (\S+), (\d+) bytes")
 
 INSPECTOR_LINE = re.compile(r"inspector: selection=false")
 
@@ -654,25 +655,33 @@ def check_terminal(binary: str) -> None:
 
 
 def check_run(binary: str) -> None:
-    """A run exists without a panel being open.
+    """A run exists without a panel being open, and a step actually runs.
 
     The engine's vocabulary - a workflow, a run, a step, an artifact - is the
-    product model, so the fixture starts one and reports what it holds: the
-    steps it will execute and the artifact it started from.
+    product model. The fixture describes the starter workflow, then sends one
+    step to a harness that is really running and records what comes back, so
+    the check covers both the shape of a workflow and the round trip.
     """
-    command = display_command([binary, "--windowed", "--frames", "24", "--exercise-run"], app_env())
+    command = display_command([binary, "--windowed", "--frames", "260", "--exercise-run"], app_env())
     result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
     output = app_output(result)
     started = RUN_LINE.search(output)
-    if started is None:
+    answered = ANSWER_LINE.search(output)
+    if started is None or answered is None:
         print("run output:")
-        for line in output.splitlines()[-8:]:
+        for line in output.splitlines()[-10:]:
             print(f"  {line}")
     require(started is not None, "starting a run reported nothing")
     require(int(started.group(2)) == 3, f"the run holds {started.group(2)} steps, expected the three the starter workflow defines")
     require(int(started.group(3)) >= 1, "the run started without the artifact it is supposed to carry")
     require(started.group(4) == "plan", f"the run's current step is {started.group(4)}, expected the first one")
-    print(f"run: {started.group(1)} started with {started.group(2)} steps, {started.group(3)} artifact(s), current {started.group(4)}")
+    require(answered is not None, "a step was sent to a harness and nothing was recorded")
+    require(int(answered.group(2)) == 1, f"the run recorded {answered.group(2)} steps, expected the one it has")
+    require(int(answered.group(6)) > 0, "the recorded artifact is empty: a step that says nothing did not run")
+    print(
+        f"run: {started.group(1)} started with {started.group(2)} steps and {started.group(3)} artifact(s) at {started.group(4)}, "
+        f"then {answered.group(4)} from {answered.group(5)} recorded {answered.group(6)} bytes"
+    )
 
 
 def check_density(binary: str) -> None:

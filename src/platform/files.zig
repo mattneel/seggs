@@ -37,11 +37,12 @@ pub fn read(a: Allocator, path: []const u8, limit: usize) ![]u8 {
     return bytes;
 }
 
-/// Resolve `path` so a save through a symlink replaces the file the link names
-/// instead of replacing the link itself. A path that does not resolve yet, and
-/// every path on Windows, keeps its literal form so a new file is still created
-/// where the caller asked.
-fn realTarget(a: Allocator, path: []const u8) ![]u8 {
+/// Resolve `path` to an absolute one: so a save through a symlink replaces the
+/// file the link names instead of the link itself, and so a protocol that
+/// requires an absolute path receives one. A path that does not resolve yet,
+/// and every path on Windows, keeps its literal form so a new file is still
+/// created where the caller asked.
+pub fn realTarget(a: Allocator, path: []const u8) ![]u8 {
     if (builtin.os.tag == .windows) return a.dupe(u8, path);
     const path_z = try a.dupeSentinel(u8, path, 0);
     defer a.free(path_z);

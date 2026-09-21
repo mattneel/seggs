@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("native");
 const App = @import("app.zig").App;
+const runs = @import("editor/runs.zig");
 const Renderer = @import("gpu/renderer.zig").Renderer;
 const Host = @import("ext/host.zig").Host;
 const registry = @import("agents/registry.zig");
@@ -264,7 +265,6 @@ fn writeExtensionReport(a: std.mem.Allocator, root: []const u8, host: *Host) voi
 /// event to an extension handler is exercised rather than assumed.
 /// Prove the terminal end to end: the dock starts a real shell, the editor
 /// types a command into it, and the shell's answer comes back through the
-/// emulator onto the screen.
 /// A shell answers when it answers, so the screen is polled from the frame the
 /// command is typed until the answer is there: a fixed frame would make this
 /// pass or fail on how fast the machine running it is.
@@ -272,27 +272,87 @@ const terminal_first_read = 120;
 const terminal_last_read = 480;
 
 var terminal_answered = false;
+var run_reported = false;
+var fixture_step_sent = false;
 
 /// A run starts from what is on screen, and its steps are the report: this
 /// exercise starts one and says what the inspector would show.
 fn exerciseRun(app: *App, frame: usize) void {
     switch (frame) {
-        6 => app.startRun() catch |err| std.log.err("run: {s}", .{@errorName(err)}),
-        20 => {
-            const active = if (app.run) |*value| value else {
-                std.log.err("run: never started", .{});
+        6 => {
+            app.startRun() catch |err| std.log.err("run: {s}", .{@errorName(err)});
+            // And a run whose step a harness can actually answer, so the
+            // round trip is exercised rather than described.
+            const mock = app.agentIndex("Local mock") orelse {
+                std.log.err("run: no local mock profile", .{});
                 return;
             };
-            const current = active.current();
-            std.log.info("run {s}: {d} steps, {d} artifacts, current={s}", .{
-                active.name,
-                active.steps.len,
-                active.artifacts.items.len,
-                if (current) |step| step.name else "none",
-            });
+            app.active = mock;
+            app.startAgent() catch |err| std.log.err("run: mock {s}", .{@errorName(err)});
         },
+        8 => {
+            // The starter workflow is described before the fixture replaces it,
+            // so both the shape of a workflow and the round trip are reported.
+            if (app.run) |*starter| {
+                const current = starter.current();
+                std.log.info("run {s}: {d} steps, {d} artifacts, current={s}", .{
+                    starter.name,
+                    starter.steps.len,
+                    starter.artifacts.items.len,
+                    if (current) |step| step.name else "none",
+                });
+            }
+        },
+
         else => {},
     }
+    // The harness has to be up before a step can be sent to it, and its answer
+    // arrives when it arrives: both are polled for rather than assumed, so this
+    // does not depend on how fast a machine starts a process.
+    if (!fixture_step_sent and frame >= 10) {
+        if (app.agentReady(app.active)) {
+            if (app.run) |*existing| existing.deinit();
+            const steps = [_]runs.Step{
+                .{ .name = "ask", .produces = .plan, .harness = app.active, .request = "Say hello" },
+            };
+            app.run = runs.Run.init(app.allocator, "fixture", &steps) catch |err| {
+                std.log.err("run: fixture {s}", .{@errorName(err)});
+                return;
+            };
+            fixture_step_sent = true;
+            app.runStep() catch |err| std.log.err("run: step {s}", .{@errorName(err)});
+        } else if (frame > 200) {
+            std.log.err("run: no harness was ready to take a step", .{});
+            return;
+        }
+    }
+    if (frame < 40 or frame > 240 or run_reported) return;
+    const active = if (app.run) |*value| value else return;
+    // The fixture has one step and starts from nothing, so a single artifact is
+    // the answer: the record that a step ran and a harness replied.
+    if (active.artifacts.items.len == 0) {
+        if (frame == 240) {
+            std.log.err("run {s}: {d} steps, no answer recorded", .{ active.name, active.steps.len });
+        }
+        return;
+    }
+    run_reported = true;
+    const answer = active.artifacts.items[active.artifacts.items.len - 1];
+    // The answer's size is the evidence that a harness said something: a step
+    // that recorded an empty artifact did not run.
+    var start: usize = 0;
+    while (start < answer.body.len and (answer.body[start] == '\n' or answer.body[start] == '\r')) : (start += 1) {}
+    var line: usize = start;
+    while (line < answer.body.len and answer.body[line] != '\n' and answer.body[line] != '\r') : (line += 1) {}
+    std.log.info("run {s}: {d} steps, {d} artifacts, {s} from {s}, {d} bytes: {s}", .{
+        active.name,
+        active.steps.len,
+        active.artifacts.items.len,
+        answer.kind.label(),
+        answer.source,
+        answer.body.len,
+        answer.body[start..line],
+    });
 }
 
 fn exerciseTerminal(app: *App, frame: usize, a: std.mem.Allocator) void {

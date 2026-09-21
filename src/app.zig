@@ -276,6 +276,7 @@ pub const App = struct {
         self.drainActions();
         self.pumpTerminal();
         for (self.clients) |*client| client.pump();
+        self.advanceRun();
         const now = c.SDL_GetTicks();
         if (now -| self.last_watch > 1000) {
             self.last_watch = now;
@@ -390,7 +391,7 @@ pub const App = struct {
         return list;
     }
 
-    fn startAgent(self: *App) !void {
+    pub fn startAgent(self: *App) !void {
         try self.clients[self.active].start();
         self.focus = .prompt;
         self.status("Started {s}.", .{self.clients[self.active].preset.name});
@@ -1581,9 +1582,9 @@ pub const App = struct {
     /// a run is the task rather than the tool that happens to do it.
     pub fn startRun(self: *App) !void {
         const steps = [_]runs.Step{
-            .{ .name = "plan", .produces = .plan, .harness = 0 },
-            .{ .name = "implement", .produces = .implementation, .harness = 1 },
-            .{ .name = "review", .produces = .review, .harness = 2 },
+            .{ .name = "plan", .produces = .plan, .harness = 0, .request = "Produce an implementation plan for the code below." },
+            .{ .name = "implement", .produces = .implementation, .harness = 1, .request = "Implement the plan. Describe the change you made." },
+            .{ .name = "review", .produces = .review, .harness = 2, .request = "Review the implementation against the plan." },
         };
         if (self.run) |*existing| existing.deinit();
         var run = try runs.Run.init(self.allocator, std.fs.path.basename(self.workspace.activePath() orelse "workspace"), &steps);
@@ -1599,6 +1600,88 @@ pub const App = struct {
         });
         self.run = run;
         self.status("Run {s}: {d} steps.", .{ run.name, run.steps.len });
+    }
+
+    /// The state of a harness, for callers that have to wait for it.
+    pub fn agentState(self: *const App, index: usize) Client.State {
+        return self.clients[index].state;
+    }
+
+    /// How much a harness has said so far.
+    pub fn agentTranscript(self: *const App, index: usize) usize {
+        return self.clients[index].transcript.items.len;
+    }
+
+    /// What a harness has said, for reporting and tests.
+    pub fn agentWords(self: *const App, index: usize) []const u8 {
+        return self.clients[index].transcript.items;
+    }
+
+    /// Whether a harness is up and able to take a turn.
+    pub fn agentReady(self: *const App, index: usize) bool {
+        if (index >= self.clients.len) return false;
+        return self.clients[index].state == .ready;
+    }
+
+    /// Position of a harness by name, or null when this session has no such
+    /// profile.
+    pub fn agentIndex(self: *const App, name: []const u8) ?usize {
+        for (self.clients, 0..) |client, index| {
+            if (std.mem.eql(u8, client.preset.name, name)) return index;
+        }
+        return null;
+    }
+
+    /// Send the current step of the run to its harness. The step is marked
+    /// running here and recorded when the harness finishes its turn: asking is
+    /// not the same as being answered.
+    pub fn runStep(self: *App) !void {
+        const run = if (self.run) |*value| value else return error.NoRun;
+        const step = run.current() orelse return error.RunFinished;
+        if (step.harness >= self.clients.len) return error.NoSuchAgent;
+        const client = &self.clients[step.harness];
+        if (client.state != .ready) return error.AgentNotReady;
+        step.turns_mark = client.completed_turns;
+        step.transcript_mark = client.transcript.items.len;
+        const message = try run.promptFor(self.allocator, step, step.request);
+        defer self.allocator.free(message);
+        try client.prompt(message);
+        step.state = .running;
+        self.status("Run {s}: {s} sent to {s}.", .{ run.name, step.name, client.preset.name });
+    }
+
+    /// Record what a finished step produced. A turn that ended is not a
+    /// verdict: the artifact is the text the harness returned, and what it
+    /// means is for the next step or for the developer.
+    fn advanceRun(self: *App) void {
+        const run = if (self.run) |*value| value else return;
+        const step = run.current() orelse return;
+        if (step.state != .running or step.harness >= self.clients.len) return;
+        const client = &self.clients[step.harness];
+        // The conversation is bounded, so an offset only means anything while
+        // nothing has been dropped: a transcript shorter than the mark has
+        // wrapped, and what remains is the tail.
+        const from = if (client.transcript.items.len >= step.transcript_mark) step.transcript_mark else 0;
+        const answer = client.transcript.items[from..];
+        // A turn that finished is the signal; a lane that failed on the way is
+        // not, because a harness may stumble and answer anyway. Only a lane
+        // that is gone ends the step.
+        const finished = client.completed_turns > step.turns_mark and answer.len > 0;
+        if (!finished) {
+            if (client.state == .failed or client.state == .offline) {
+                std.log.err("run: {s} failed: client state={s} turns={d} mark={d} words={d}", .{
+                    step.name, @tagName(client.state), client.completed_turns, step.turns_mark, answer.len,
+                });
+                run.fail(step);
+                self.status("Run {s}: {s} failed.", .{ run.name, step.name });
+            }
+            return;
+        }
+        run.record(step, answer) catch |err| {
+            self.status("Run {s}: {s}.", .{ run.name, @errorName(err) });
+            return;
+        };
+        self.status("Run {s}: {s} finished.", .{ run.name, step.name });
     }
 
     /// The signature action: send what the composer holds, with the context

@@ -26,10 +26,52 @@ using namespace tex;
 
 namespace {
 
-// wchar_t is four bytes everywhere this builds, which is what lets a run of
-// codepoints cross the C boundary without conversion. UTF-16 platforms would
-// need a surrogate pass here, so the assumption is checked rather than assumed.
-static_assert(sizeof(wchar_t) == 4, "the codepoint bridge assumes a 4-byte wchar_t");
+// The engine lays mathematics out in `std::wstring`, whose element is four
+// bytes on the platforms this grew up on and two on Windows, and the C surface
+// in this repository speaks UTF-32. The two agree where wchar_t is wide and
+// need a surrogate pass where it is not, so the conversion is written out
+// rather than assumed away.
+static std::wstring toWide(const uint32_t *cps, size_t count) {
+    std::wstring out;
+    out.reserve(count);
+    if (sizeof(wchar_t) == 4) {
+        for (size_t i = 0; i < count; i++) out.push_back(static_cast<wchar_t>(cps[i]));
+        return out;
+    }
+    for (size_t i = 0; i < count; i++) {
+        const uint32_t cp = cps[i];
+        if (cp <= 0xFFFF) {
+            out.push_back(static_cast<wchar_t>(cp));
+            continue;
+        }
+        const uint32_t rest = cp - 0x10000;
+        out.push_back(static_cast<wchar_t>(0xD800 + (rest >> 10)));
+        out.push_back(static_cast<wchar_t>(0xDC00 + (rest & 0x3FF)));
+    }
+    return out;
+}
+
+static std::vector<uint32_t> toCodepoints(const std::wstring &text) {
+    std::vector<uint32_t> out;
+    out.reserve(text.size());
+    if (sizeof(wchar_t) == 4) {
+        for (size_t i = 0; i < text.size(); i++) out.push_back(static_cast<uint32_t>(text[i]));
+        return out;
+    }
+    for (size_t i = 0; i < text.size(); i++) {
+        const uint32_t unit = static_cast<uint16_t>(text[i]);
+        if (unit >= 0xD800 and unit <= 0xDBFF and i + 1 < text.size()) {
+            const uint32_t low = static_cast<uint16_t>(text[i + 1]);
+            if (low >= 0xDC00 and low <= 0xDFFF) {
+                out.push_back(0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00));
+                i++;
+                continue;
+            }
+        }
+        out.push_back(unit);
+    }
+    return out;
+}
 
 // A font is an identity here: size and style, with no file and no toolkit
 // handle. The renderer owns the actual face and rasterizes glyphs itself, so a
@@ -150,8 +192,8 @@ public:
 
     void drawText(const std::wstring &c, float x, float y) override {
         if (_cb->draw_text == nullptr || _font == nullptr) return;
-        const auto *cps = reinterpret_cast<const uint32_t *>(c.data());
-        _cb->draw_text(_cb->ctx, cps, c.size(), x, y, _font->getSize(), _styleOf(_font), &_xform);
+        const std::vector<uint32_t> cps = toCodepoints(c);
+        _cb->draw_text(_cb->ctx, cps.data(), cps.size(), x, y, _font->getSize(), _styleOf(_font), &_xform);
     }
 
     void drawLine(float x1, float y1, float x2, float y2) override {
@@ -283,8 +325,7 @@ struct ParsedFormula {
 void *seggs_tex_parse(const uint32_t *tex, size_t count, int width, float text_size,
                       float line_space, uint32_t fg) {
     if (tex == nullptr) return nullptr;
-    const auto *wide = reinterpret_cast<const wchar_t *>(tex);
-    const std::wstring source(wide, count);
+    const std::wstring source = toWide(tex, count);
     TeXRender *render = LaTeX::parse(source, width, text_size, line_space, fg);
     if (render == nullptr) return nullptr;
     return static_cast<void *>(new ParsedFormula{render, fg});

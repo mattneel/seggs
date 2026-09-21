@@ -1785,6 +1785,11 @@ pub const App = struct {
         };
         // The editor polls the shell; a blocking read would stall the frame.
         if (self.shells.activeSession()) |session| session.shell.setNonBlocking() catch {};
+        // A terminal opened after the theme was loaded still has to be drawn
+        // with it: the emulator starts from its own defaults, so a session that
+        // does not receive the palette here shows the wrong colours until
+        // something else happens to push them across.
+        self.applyTerminalPalette();
         self.terminal_shown = true;
         self.focus = .terminal;
         self.status("Terminal {d} of {d}.", .{ index + 1, self.shells.count() });

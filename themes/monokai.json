@@ -1,0 +1,36 @@
+{
+  "name": "Monokai",
+  "chrome": {
+    "background": "#272822",
+    "panel": "#1e1f1c",
+    "raised": "#3e3d32",
+    "selected": "#49483e",
+    "border": "#3e3d32",
+    "text": "#f8f8f2",
+    "muted": "#75715e",
+    "accent": "#a6e22e",
+    "purple": "#ae81ff",
+    "amber": "#f4bf75",
+    "red": "#f92672",
+    "blue": "#66d9ef"
+  },
+  "terminal": {
+    "background": "#272822",
+    "foreground": "#f8f8f2",
+    "cursor": "#f8f8f0",
+    "selection": "#49483e",
+    "ansi": [
+      "#272822", "#f92672", "#a6e22e", "#f4bf75",
+      "#66d9ef", "#ae81ff", "#a1efe4", "#f8f8f2",
+      "#75715e", "#f92672", "#a6e22e", "#f4bf75",
+      "#66d9ef", "#ae81ff", "#a1efe4", "#f9f8f5"
+    ]
+  },
+  "syntax": [
+    { "scope": "comment", "fg": "#75715e", "italic": true },
+    { "scope": "string.quoted", "fg": "#e6db74" },
+    { "scope": "keyword.control", "fg": "#f92672" },
+    { "scope": "constant.numeric", "fg": "#ae81ff" },
+    { "scope": "storage.type.annotation", "fg": "#a6e22e" }
+  ]
+}

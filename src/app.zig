@@ -26,14 +26,51 @@ const Divider = enum { explorer, agents, terminal };
 const review = @import("editor/review.zig");
 const wrap = @import("ui/wrap.zig");
 const markdown = @import("ui/markdown.zig");
+const math = @import("ui/math.zig");
 const diff = @import("ui/diff.zig");
 const shell_integration = @import("services/shell.zig");
 const terminals = @import("services/terminals.zig");
 const tree_widget = @import("ui/tree.zig");
 const menu_widget = @import("ui/menu.zig");
 const tool_call = @import("ui/tool_call.zig");
+const tool_card = @import("ui/tool_card.zig");
+/// The shapes a call is drawn as, and the registry that picks one. What a call
+/// looks like is decided there; this file only wires it in.
+const tools = @import("ui/tools/index.zig");
 const activity = @import("ui/activity.zig");
+const theme_catalog = @import("ui/theme_catalog.zig");
+const theme_picker = @import("ui/theme_picker.zig");
+/// What a run of reasoning, a plan, a usage row, a session header and the
+/// agent's commands look like. Like the tool shapes, these are data on the way
+/// to the drawer: they answer for their own subject and draw nothing.
+const stream_card = @import("ui/stream_card.zig");
+/// A picture in the transcript: how big it is drawn, and the line that names
+/// what it is. A picture is not text, so it is the one row this file draws
+/// through the renderer's picture path rather than out of runs.
+const image_card = @import("ui/image_card.zig");
+const plan_card = @import("ui/plan_card.zig");
+const usage_card = @import("ui/usage_card.zig");
+const session_cards = @import("ui/session_cards.zig");
+const command_palette = @import("ui/palette.zig");
+/// Which runs the reader has opened, keyed by the run's own handle rather than
+/// by its offset, which the transcript moves as it trims.
+const folds = @import("ui/folds.zig");
 const ToolCall = @import("acp/tool_call.zig").ToolCall;
+const Stream = @import("acp/stream.zig").Stream;
+const Image = @import("acp/image.zig").Image;
+
+/// How many rows a call's embedded terminal takes in the transcript.
+///
+/// A terminal as tall as the panel would push everything else out of the
+/// transcript, and what a reader wants from one here is a look at what a command
+/// printed, not a place to work. The screen is still a real terminal - it keeps
+/// its own scrollback - and the bound is on what is drawn, not on what is kept.
+const embedded_terminal_rows: u16 = 12;
+
+/// The widest a call's embedded terminal may be, whatever the panel's width.
+/// A terminal is a fixed number of columns, and one wider than any real terminal
+/// is a row of empty cells pretending to be a screen.
+const max_terminal_columns: usize = 200;
 
 /// Shown in place of a panel when no extension registered one, so a session
 /// without extensions still explains itself.
@@ -48,10 +85,43 @@ const PanelRect = struct { name: []const u8, bounds: Rect };
 /// agent's own: two lanes can name a call the same thing.
 const CallExpansion = struct { lane: usize, id: []u8, expanded: bool };
 
+/// A call that failed while its lane was cancelling: the reader stopped it, so
+/// it is drawn as cancelled rather than as an error. ACP names four states and
+/// a cancellation and a failure both arrive as `failed`, so the one fact that
+/// tells them apart lives here - kept against the call's id, because the record
+/// is replaced every time the call progresses, and dropped with the call.
+const AbortedCall = struct { lane: usize, id: []u8 };
+
 /// Where a call's chip was drawn this frame, so a click on one is a click on the
 /// call. The id borrows the frame's arena, which lives until the frame after
 /// next is drawn, and a click is answered well before that.
 const CallHit = struct { lane: usize, id: []const u8, bounds: Rect };
+
+/// Where a link's words were drawn, and where they point.
+///
+/// A terminal can only emit an escape sequence and let the program around it
+/// decide what a link is. The pointer here is ours, so a link is drawn at a
+/// place we know and a click on it is a fact rather than a hope - which is the
+/// one place this transcript can do more than the reference rather than match
+/// it.
+const LinkHit = struct { url: []const u8, bounds: Rect };
+
+/// Where a run was drawn, so a click can open it. A run has no agent id, so the
+/// key is the handle the client gave it: the same key the fold state answers
+/// about, because a click that opened one run and a fold that says another is
+/// open is a click that does nothing.
+const StreamHit = struct { lane: usize, seq: usize, bounds: Rect };
+
+/// What the drawing did with one picture, recorded as it was drawn.
+///
+/// A census has to say what became of an image rather than what the record
+/// hoped, and only the frame that drew it knows: a decode can refuse pixels the
+/// capture was happy to keep, and the picture space can be full. Rows live only
+/// inside the frame that built them, so the answer is kept here - the same
+/// reason `transcript_colour` is kept, and for the same kind of question. A
+/// record whose picture leaves the lane's list takes its answer with it, and the
+/// handles are never reused, so a stale answer can never land on another image.
+const ImageState = struct { lane: usize, seq: usize, outcome: image_card.Outcome };
 
 /// A named node an extension described, and the panel it belongs to. One list
 /// per frame answers clicks, hover, and focus order, so none of them need a
@@ -85,6 +155,7 @@ pub const App = struct {
         templates,
         destinations,
         shells,
+        themes,
 
         /// Whether this overlay is a list the menu draws. Quitting is a question
         /// with three answers, not a list of rows.
@@ -102,6 +173,7 @@ pub const App = struct {
                 .templates => "AGENTS",
                 .destinations => "SEND TO",
                 .shells => "SHELLS",
+                .themes => "THEMES",
                 else => "",
             };
         }
@@ -119,9 +191,10 @@ pub const App = struct {
     /// The most bytes one activity line may take. `activity.read` hands back an
     /// empty line when its buffer cannot hold one, so the buffer is sized for
     /// the longest line the module can produce - a stalled line carrying the
-    /// longest subject a tool call holds (`tool_call.max_line_bytes`, the chip's
-    /// own bound) with the words around it - rather than for a typical line. The
-    /// dock narrows it further, to the columns it can actually draw.
+    /// longest subject a tool call holds (a shape's verb, plus a value the
+    /// record bounded at `ToolCall`'s own `max_line_bytes`) with the words
+    /// around it - rather than for a typical line. The dock narrows it further,
+    /// to the columns it can actually draw.
     const activity_line_capacity = 256;
 
     /// What a lane has done since the last frame, and when.
@@ -153,6 +226,11 @@ pub const App = struct {
     };
     const commands = [_][]const u8{ "Toggle explorer", "Focus agent prompt", "Start selected agent", "Stop selected agent", "Toggle fullscreen", "Save current file", "Cancel selected turn", "New run: plan, implement, review", "Review changes", "Show runs", "Compose the run" };
     allocator: std.mem.Allocator,
+    /// The process io, which is what reads a theme file: the catalog scans a
+    /// directory and loads a row through it. Reading a theme is a file read with
+    /// no window in it, and it is the same io the rest of the program was given
+    /// rather than a second one kept for the purpose.
+    io: std.Io,
     window: *c.SDL_Window,
     workspace: Workspace,
     clients: []Client,
@@ -168,6 +246,23 @@ pub const App = struct {
     /// while it is up: every other key belongs to the list.
     menu: menu_widget.Menu = .{},
     menu_items: std.ArrayListUnmanaged(menu_widget.Item) = .empty,
+    /// The theme switcher, while it is up: the catalog's rows and which one is
+    /// showing. Its rows are its own rather than `menu_items`, because a preview
+    /// has to be able to name the row it is showing after the list has closed.
+    themes: ?theme_picker.Picker = null,
+    /// The document a preview is showing, when one is. It lives here rather than
+    /// in the picker because `theme.current` borrows it: what is on screen has
+    /// to outlive the call that put it there, and it is released the moment the
+    /// reader says yes or no.
+    theme_preview: ?theme.Theme = null,
+    /// Whether a harness asked to know what the transcript was drawn in, and the
+    /// answer from the last frame that drew it. The rows of the panel exist only
+    /// inside the frame that built them, so this is the one place the resolved
+    /// colour of already-placed content can be read back - which is how the
+    /// theme exercise sees that content which was on screen before a theme
+    /// change was repainted by it rather than keeping the old colour.
+    transcript_probe: bool = false,
+    transcript_colour: ?theme.Color = null,
     prompt_text: std.ArrayList(u8) = .empty,
     preedit: Preedit = .{},
     /// Extension host, when one is attached. Panels come from it.
@@ -250,12 +345,54 @@ pub const App = struct {
     /// saying so once is a report, saying it every frame is noise.
     transcript_plain: bool = false,
     /// Which tool calls the reader has opened, by the agent's id for the call.
-    /// Only the reader's own answers live here: a call nobody has clicked
-    /// follows its state, so a failure arrives open and nothing else does.
+    /// Only the reader's own answers live here: a call nobody has clicked takes
+    /// the transcript's answer, which starts as "a failure is open and nothing
+    /// else is".
     call_expansions: std.ArrayListUnmanaged(CallExpansion) = .empty,
+    /// The reader's answer for the whole transcript, or null while they have
+    /// not given one. Ctrl+O - the reference's own key for it - sets it and
+    /// drops the per-call answers, so one press moves every call at once.
+    calls_expanded: ?bool = null,
+    /// The calls whose failure was a cancellation. See `AbortedCall`.
+    aborted_calls: std.ArrayListUnmanaged(AbortedCall) = .empty,
     /// Where each call's chip was drawn, so a click can be routed to the call it
     /// landed on. Rebuilt on every transcript draw.
     call_hits: std.ArrayListUnmanaged(CallHit) = .empty,
+    stream_hits: std.ArrayListUnmanaged(StreamHit) = .empty,
+    /// What the last frame did with each picture it drew, by the handle the
+    /// client gave the record. See `ImageState`.
+    image_states: std.ArrayListUnmanaged(ImageState) = .empty,
+    /// The links drawn last frame, for the same reason the chips and runs are:
+    /// where a link is depends on the width, and the width is not known until
+    /// the row is laid out.
+    link_hits: std.ArrayListUnmanaged(LinkHit) = .empty,
+    /// How many rows of each block kind the last transcript frame drew. This is
+    /// the drawing's own count rather than a claim about it: a gate can read it
+    /// and see that a table reached the screen, which is the difference between
+    /// an arm that compiles and an arm that draws.
+    block_census: [@as(usize, @backingInt(markdown.BlockKind.math)) + 1]u32 = @splat(0),
+    /// How many struck runs and links the last frame drew. A block's kind says
+    /// nothing about what is inside it: a paragraph is one count whatever it
+    /// contains, so a struck word or a link that stopped being drawn would leave
+    /// the block census unchanged. These are the inline marks with no second
+    /// signal - a link is also proven by a click landing on it, a strike by
+    /// nothing else.
+    struck_runs: u32 = 0,
+    link_runs: u32 = 0,
+    /// How many embedded terminals the last transcript frame drew. A terminal
+    /// that stopped being drawn - because the screen was dropped when the agent
+    /// released it, say - is a count of zero, which a gate can read.
+    embedded_terminals_drawn: u32 = 0,
+    /// The screens kept for terminals that calls embedded, keyed by the id the
+    /// agent used. They outlive the client's records on purpose.
+    terminal_screens: std.StringArrayHashMapUnmanaged(TerminalScreen) = .empty,
+    /// Which runs the reader has opened. A run is one line until it is, which is
+    /// what keeps a long turn readable while it is still arriving.
+    run_folds: folds.Folds,
+    /// The labels the command palette's rows carry. A palette rebuilt on every
+    /// open allocates its rows each time, so they come from an arena reset with
+    /// the list rather than from the allocator the rest of the editor shares.
+    menu_arena: std.heap.ArenaAllocator,
     selection_anchor: ?usize = null,
     drag: bool = false,
     follow_cursor: bool = true,
@@ -310,7 +447,7 @@ pub const App = struct {
     lsp_command: []const []const u8,
     lsp_client: ?lsp.Client = null,
 
-    pub fn init(a: std.mem.Allocator, window: *c.SDL_Window, config: Config, root: []const u8) !App {
+    pub fn init(a: std.mem.Allocator, io: std.Io, window: *c.SDL_Window, config: Config, root: []const u8) !App {
         var workspace = try Workspace.init(a, root);
         errdefer workspace.deinit();
         const clients = try a.alloc(Client, config.agents.len);
@@ -322,7 +459,7 @@ pub const App = struct {
         errdefer a.free(liveness);
         for (liveness) |*lane| lane.* = .{};
         const cached = try workspace.activeDocument().snapshot(a);
-        var self: App = .{ .allocator = a, .window = window, .workspace = workspace, .clients = clients, .liveness = liveness, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a), .files = tree_widget.Tree.init(a), .shells = terminals.Terminals.init(a) };
+        var self: App = .{ .allocator = a, .io = io, .window = window, .workspace = workspace, .clients = clients, .liveness = liveness, .cached = cached, .fullscreen = config.fullscreen, .lsp_command = config.lsp, .panel_tree = ext_ui.Tree.init(a), .review = review.ReviewQueue.init(a), .files = tree_widget.Tree.init(a), .shells = terminals.Terminals.init(a), .run_folds = folds.Folds.init(a), .menu_arena = std.heap.ArenaAllocator.init(a) };
         try self.rebuildFiles();
         self.status("F5 starts the selected agent. Ctrl+P opens files.", .{});
         return self;
@@ -331,8 +468,12 @@ pub const App = struct {
     pub fn deinit(self: *App) void {
         // The theme document outlives the call that read it, because the
         // palette borrows its strings, so it is released here with everything
-        // else the editor owns.
+        // else the editor owns. A preview is the same kind of document and goes
+        // with it - after the committed one, so nothing the palette points at is
+        // freed first.
         if (self.theme_doc) |loaded| theme.deinit(loaded, self.allocator);
+        if (self.theme_preview) |preview| theme.deinit(preview, self.allocator);
+        if (self.themes) |*picker| picker.deinit();
         // The shell is killed and reaped before the emulator that read it
         // goes away, and the buffer between them with them.
         self.shells.deinit();
@@ -344,6 +485,20 @@ pub const App = struct {
         self.workspace.deinit();
         self.allocator.free(self.cached);
         self.menu_items.deinit(self.allocator);
+        self.menu_arena.deinit();
+        self.run_folds.deinit();
+        self.stream_hits.deinit(self.allocator);
+        self.link_hits.deinit(self.allocator);
+        for (self.terminal_screens.values()) |entry| {
+            entry.screen.deinit();
+            self.allocator.destroy(entry.screen);
+        }
+        // The keys own the ids and nothing else does: each record's `id` points
+        // at its own key, which is what makes one lookup serve both the table
+        // and the feed. Freeing the values' ids here as well would free the same
+        // bytes twice, so the keys are the only place they are released.
+        for (self.terminal_screens.keys()) |table_key| self.allocator.free(table_key);
+        self.terminal_screens.deinit(self.allocator);
         self.prompt_text.deinit(self.allocator);
         self.preedit.deinit(self.allocator);
         for (self.runs.items) |*run| run.deinit();
@@ -358,7 +513,10 @@ pub const App = struct {
         self.hover_id.deinit(self.allocator);
         for (self.call_expansions.items) |entry| self.allocator.free(entry.id);
         self.call_expansions.deinit(self.allocator);
+        for (self.aborted_calls.items) |entry| self.allocator.free(entry.id);
+        self.aborted_calls.deinit(self.allocator);
         self.call_hits.deinit(self.allocator);
+        self.image_states.deinit(self.allocator);
     }
 
     /// The status bar's current message, for callers outside the interface.
@@ -491,6 +649,10 @@ pub const App = struct {
         // that arrived on this frame counts on this frame.
         const t = App.now();
         self.observeLiveness(t);
+        // A call that fails while its lane is cancelling was cancelled rather
+        // than broken, and the lane stops cancelling a frame or two later: the
+        // answer is kept here, while both facts are in hand.
+        self.observeAborts();
         if (t -| self.last_watch > 1000) {
             self.last_watch = t;
             if (self.workspace.externalChanged(self.workspace.activeIndex())) {
@@ -661,7 +823,18 @@ pub const App = struct {
                 self.dragging_divider = null;
                 if (self.selection_anchor == self.workspace.activeDocument().cursor) self.selection_anchor = null;
             },
-            c.SDL_EVENT_MOUSE_MOTION => if (self.dragging_divider) |divider| {
+            c.SDL_EVENT_MOUSE_MOTION => if (self.overlay == .themes) {
+                // The theme list follows the pointer, and no other list does:
+                // passing over a row is what previews its theme, and a preview is
+                // the only thing a list can show without being asked. The row is
+                // the widget's own hit test, which is the row that was drawn.
+                if (self.overlayRowAt(ev.motion.x, ev.motion.y)) |row| {
+                    if (row != self.menu.selected) {
+                        self.menu.selected = row;
+                        self.settleThemePreview();
+                    }
+                }
+            } else if (self.dragging_divider) |divider| {
                 self.dragDivider(divider, ev.motion.x, ev.motion.y);
             } else if (self.terminal_dragging) {
                 if (self.terminal_selection) |*selection| selection.cursor = self.terminalCell(ev.motion.x, ev.motion.y);
@@ -708,13 +881,26 @@ pub const App = struct {
         }
         if (self.overlay != .none) {
             switch (keycode) {
-                c.SDLK_ESCAPE => self.overlay = .none,
+                c.SDLK_ESCAPE => {
+                    // The theme list is the one list that is showing something
+                    // rather than only naming it: closing it without putting back
+                    // the theme the reader had would leave a preview on screen.
+                    if (self.overlay == .themes) {
+                        self.cancelThemePreview();
+                        return;
+                    }
+                    self.overlay = .none;
+                },
                 c.SDLK_BACKSPACE => self.menu.backspace(),
                 c.SDLK_DOWN => self.menu.move(true),
                 c.SDLK_UP => self.menu.move(false),
                 c.SDLK_RETURN => try self.chooseOverlay(),
                 else => {},
             }
+            // Whatever the list just did, the highlight may have moved: the row
+            // under it is the one to show, and saying so again about the row
+            // that is already showing costs nothing.
+            self.settleThemePreview();
             return;
         }
         if (keycode == c.SDLK_F11) return self.toggleFullscreen();
@@ -761,6 +947,11 @@ pub const App = struct {
                 c.SDLK_B => self.sidebar = !self.sidebar,
                 c.SDLK_I => try self.showHover(),
                 c.SDLK_L => self.focus = .prompt,
+                // The reference's own key for tool output: one press flips
+                // every call in the transcript, and the per-call answers go
+                // with it. It is Ctrl+O rather than a letter of ours because a
+                // reader arriving from the reference will press this one.
+                c.SDLK_O => self.toggleCalls(),
                 c.SDLK_P => try self.openOverlay(if (shift) .commands else .files, null),
                 // Ctrl+Enter sends to the lane the panel is on; Ctrl+Shift+Enter
                 // asks which lane first, out of the lanes that are up.
@@ -796,7 +987,11 @@ pub const App = struct {
                         try self.closeFocused();
                     }
                 },
-                c.SDLK_T => if (shift) try self.openShells() else {},
+                // Ctrl+T changes the theme, and Ctrl+Shift+T opens a shell: the
+                // two are one key apart because they are one letter apart in the
+                // reader's head - the window's colours and the shell's - and the
+                // plain key was free.
+                c.SDLK_T => if (shift) try self.openShells() else try self.openThemes(),
                 c.SDLK_LEFT => if (shift) self.moveTerminalTab(false),
                 c.SDLK_RIGHT => if (shift) self.moveTerminalTab(true),
                 c.SDLK_A => {
@@ -1284,6 +1479,20 @@ pub const App = struct {
     }
 
     fn mouseDown(self: *App, x: f32, y: f32) !void {
+        // The theme list answers the pointer, and no other list does: a row puts
+        // its theme on screen while a reader passes over it, so a click on one
+        // means "this one", and the dim backdrop around the box means "never
+        // mind" - which is Escape by another name.
+        if (self.overlay == .themes) {
+            if (self.overlayRowAt(x, y)) |row| {
+                self.menu.selected = row;
+                self.settleThemePreview();
+                self.commitThemePreview();
+            } else if (!self.overlayCovers(x, y)) {
+                self.cancelThemePreview();
+            }
+            return;
+        }
         if (self.overlay != .none) return;
         // A divider is the first thing the pointer can mean: everything else
         // lives inside a dock, and the line between two of them belongs to
@@ -1364,9 +1573,17 @@ pub const App = struct {
         if (g.activity.contains(x, y)) {
             if (y < 105) self.sidebar = !self.sidebar else self.focus = .prompt;
         } else if (g.agents.contains(x, y)) {
-            // A call's chip is the one thing in the transcript that answers a
-            // click: what a click on a call means is the detail it carried.
-            if (self.callHitAt(x, y)) |id| {
+            // A call's chip and a run's line are what answer a click in the
+            // transcript: a call opens the detail it carried, and a run opens
+            // the reasoning it stands for. A link is checked first, because a
+            // link lives inside a sentence and a row that carries one belongs
+            // to the prose rather than to a call.
+            if (self.linkHitAt(x, y)) |url| {
+                try self.openLink(url);
+                return;
+            } else if (self.streamHitAt(x, y)) |seq| {
+                try self.toggleStream(seq);
+            } else if (self.callHitAt(x, y)) |id| {
                 self.focus = .prompt;
                 try self.toggleCall(id);
                 return;
@@ -1429,6 +1646,7 @@ pub const App = struct {
     /// under it. A list opened by a key is centred instead.
     fn openOverlay(self: *App, which: Overlay, trigger: ?Rect) !void {
         self.menu_items.clearRetainingCapacity();
+        _ = self.menu_arena.reset(.retain_capacity);
         switch (which) {
             // The navigator's own list, as the explorer shows it: a file's path
             // is its name relative to the root, which is the part that tells
@@ -1436,8 +1654,18 @@ pub const App = struct {
             .files => for (self.workspace.explorer.entries.items, 0..) |path, index| {
                 try self.menu_items.append(self.allocator, .{ .label = self.relativePath(path), .key = index });
             },
-            .commands => for (commands, 0..) |command, index| {
-                try self.menu_items.append(self.allocator, .{ .label = command, .key = index });
+            // The interface's own actions, then the commands the agent accepts:
+            // both are things a reader picks from this list, and the agent's are
+            // the ones that go into the composer rather than acting on the
+            // window, which is what their leading slash says. The rows are built
+            // from an arena reset with the list, because a palette that opens
+            // twice must not leave the first opening's labels behind.
+            .commands => {
+                for (commands, 0..) |command, index| {
+                    try self.menu_items.append(self.allocator, .{ .label = command, .key = index });
+                }
+                const rows = try command_palette.items(self.clients[self.active].availableCommands(), self.menu_arena.allocator());
+                for (rows) |row| try self.menu_items.append(self.allocator, .{ .label = row.label, .detail = row.detail, .key = commands.len + row.key });
             },
             // Every lane, with what it is doing: opening one is what puts it
             // online, so the state is what the reader needs to see.
@@ -1552,6 +1780,20 @@ pub const App = struct {
             },
             .commands => {
                 self.overlay = .none;
+                // Past the interface's own actions, a row is one of the agent's:
+                // choosing it does not run anything here, it puts what the
+                // command wants typed into the composer, which is where a
+                // command is answered.
+                if (item.key >= commands.len) {
+                    const hint = command_palette.hint(self.clients[self.active].availableCommands(), item.key - commands.len);
+                    self.prompt_text.clearRetainingCapacity();
+                    if (hint.len != 0) {
+                        try self.prompt_text.appendSlice(self.allocator, hint);
+                        try self.prompt_text.append(self.allocator, ' ');
+                    }
+                    self.focus = .prompt;
+                    return;
+                }
                 switch (item.key) {
                     0 => self.sidebar = !self.sidebar,
                     1 => self.focus = .prompt,
@@ -1581,6 +1823,10 @@ pub const App = struct {
                     try self.newTerminalTab(self.shell_paths[item.key][0..self.shell_lens[item.key]]);
                 }
             },
+            // A theme row is not a path to open: what it names is already on
+            // screen, because the highlight put it there, and the reader's answer
+            // is whether to keep it.
+            .themes => self.commitThemePreview(),
             else => self.overlay = .none,
         }
     }
@@ -1807,8 +2053,8 @@ pub const App = struct {
         };
     }
 
-    /// Hand the loaded theme to every shell, not only the one on screen: a tab
-    /// behind another is drawn with the palette the reader chose when they
+    /// Hand the theme on screen to every shell, not only the one on screen: a
+    /// tab behind another is drawn with the palette the reader chose when they
     /// switch to it.
     ///
     /// A terminal is drawn by the emulator rather than by us, so the editor's
@@ -1822,8 +2068,15 @@ pub const App = struct {
         // terminal paints every coloured thing in a shell - the prompt, ls, a
         // git status - in the colour of the paper. A placeholder is fine as a
         // document's default and wrong as something to hand to a program.
-        if (self.theme_doc == null) return;
-        const palette = terminalPalette(theme.current);
+        //
+        // The same goes for a document that is loaded and says nothing about a
+        // terminal - most of the vendored collection does not - and the test is
+        // that placeholder: a document carrying exactly it has no palette of its
+        // own to give, and a shell keeps the palette it already has rather than
+        // being handed the paper colour sixteen times.
+        const document = self.theme_preview orelse self.theme_doc orelse return;
+        if (std.meta.eql(document.terminal, theme.defaults().terminal)) return;
+        const palette = terminalPalette(document);
         var index: usize = 0;
         while (self.shells.sessionAt(index)) |session| : (index += 1) {
             session.terminal.setPalette(palette) catch |err| {
@@ -1860,6 +2113,264 @@ pub const App = struct {
         theme.apply(parsed);
         self.applyTerminalPalette();
         self.status("Theme: {s}", .{parsed.name});
+    }
+
+    /// The theme switcher: every theme file in the catalog directory, with the
+    /// theme on screen highlighted, because the row the highlight lands on is
+    /// the one whose theme is shown.
+    ///
+    /// The directory is scanned rather than read: a menu wants names, and the
+    /// catalog derives them from file names so that opening this list does not
+    /// read the themes behind it. See `ui.theme_catalog`.
+    fn openThemes(self: *App) !void {
+        if (self.themes != null) return;
+        const dir = try std.fs.path.join(self.allocator, &.{ self.workspace.root, "themes", "catalog" });
+        defer self.allocator.free(dir);
+
+        var picker = theme_picker.Picker.open(self.allocator, self.io, dir, theme.current.name) catch |err| {
+            self.status("themes: {s}", .{@errorName(err)});
+            return;
+        };
+        errdefer picker.deinit();
+        if (picker.rows().len == 0) {
+            picker.deinit();
+            self.status("No themes in {s}.", .{dir});
+            return;
+        }
+        self.themes = picker;
+        if (self.themes) |*open| {
+            self.menu.setItems(open.rows(), &.{});
+            self.menu.open(Overlay.themes.title());
+            // The list opens on the theme already on screen, so Enter without
+            // moving keeps what the reader had rather than taking whatever
+            // sorts first.
+            self.menu.selected = open.opening();
+        }
+        self.overlay_trigger = null;
+        self.overlay = .themes;
+        self.settleThemePreview();
+    }
+
+    /// Show the theme the highlight is on. Called whenever the highlight may
+    /// have moved - a key, a pointer, the list opening - and it does nothing at
+    /// all when that row is the one already showing, so a pointer resting on a
+    /// row reads one file rather than one a frame.
+    fn settleThemePreview(self: *App) void {
+        const picker = if (self.themes) |*open| open else return;
+        const row = self.menu.chosen() orelse return;
+        switch (picker.preview(row)) {
+            .keep => {},
+            .load => |path| self.previewTheme(row, path),
+            .refused => |refusal| self.status("theme {s}: {s}", .{ picker.label(refusal.row), @errorName(refusal.reason) }),
+        }
+    }
+
+    /// Load a theme and put it on screen without committing to it. The theme the
+    /// reader had is still held, so this document lives only until they say yes
+    /// or no; and a file that will not load leaves the theme on screen exactly
+    /// where it is, saying why rather than taking the list down with it.
+    fn previewTheme(self: *App, row: usize, path: []const u8) void {
+        const loaded = theme_catalog.load(self.allocator, self.io, path) catch |err| {
+            if (self.themes) |*picker| {
+                picker.refusedAt(row, err);
+                self.status("theme {s}: {s}", .{ picker.label(row), @errorName(err) });
+            }
+            return;
+        };
+        // The document that was showing is released only once the new one is in
+        // hand: the palette borrows whichever is on screen, so a preview that
+        // failed must not have freed anything.
+        if (self.theme_preview) |previous| theme.deinit(previous, self.allocator);
+        self.theme_preview = loaded;
+        theme.apply(loaded);
+        self.applyTerminalPalette();
+        if (self.themes) |*picker| picker.shown(row);
+        self.status("Theme {s} \u{b7} Enter applies, Esc goes back", .{loaded.name});
+    }
+
+    /// Keep the theme the highlight is on. The document that was on screen goes
+    /// now, because the reader has said this one is theirs - and when the
+    /// highlight never left the theme they already had, there is nothing to take
+    /// and the list simply closes.
+    fn commitThemePreview(self: *App) void {
+        const picker = if (self.themes) |*open| open else return;
+        const row = self.menu.chosen() orelse {
+            self.status("Nothing to apply.", .{});
+            return;
+        };
+        if (self.theme_preview) |preview| {
+            if (self.theme_doc) |previous| theme.deinit(previous, self.allocator);
+            self.theme_doc = preview;
+            self.theme_preview = null;
+            self.closeThemes();
+            // The shells take the palette now that it is the committed theme's.
+            // A preview does not hand one over while there is no theme behind it
+            // to come back to, and this is the moment there is one.
+            self.applyTerminalPalette();
+            self.status("Theme: {s}", .{theme.current.name});
+            return;
+        }
+        // The highlight never left the theme the reader already had. The label
+        // borrows the picker's rows, which the close gives back, so it is copied
+        // out before the list goes.
+        var buffer: [96]u8 = undefined;
+        const kept = clip(&buffer, picker.label(row));
+        self.closeThemes();
+        self.status("Theme {s} is unchanged.", .{kept});
+    }
+
+    /// Put back the theme the reader had, and give back the document the preview
+    /// was showing. The order is the point: `theme.current` borrows whichever
+    /// document is on screen, so the one that is going is released only after
+    /// the one that replaces it has been applied.
+    fn cancelThemePreview(self: *App) void {
+        theme.apply(self.theme_doc orelse theme.defaults());
+        if (self.theme_preview) |preview| {
+            self.theme_preview = null;
+            theme.deinit(preview, self.allocator);
+        }
+        self.applyTerminalPalette();
+        self.closeThemes();
+        self.status("Theme: {s}", .{theme.current.name});
+    }
+
+    /// Close the list and give back what it owns. The theme on screen is not
+    /// touched: whether it is kept or put back is the caller's answer, and this
+    /// is only the list going away.
+    fn closeThemes(self: *App) void {
+        self.overlay = .none;
+        self.overlay_trigger = null;
+        // The widget's rows belong to the picker, which is about to give them
+        // back: a list left pointing at them would be reading freed memory the
+        // next time anything asked it a question.
+        self.menu.setItems(&.{}, &.{});
+        if (self.themes) |*picker| picker.deinit();
+        self.themes = null;
+    }
+
+    /// Where the open list is drawn, in the terms the widget wants: the same
+    /// placement, screen and metrics the drawing used, so a point tested here is
+    /// tested against the box that was drawn.
+    fn overlayFrame(self: *const App) ?struct { placement: menu_widget.Placement, screen: Rect, metrics: menu_widget.Metrics } {
+        if (!self.overlay.listed()) return null;
+        var width: c_int = 0;
+        var height: c_int = 0;
+        if (!c.SDL_GetWindowSizeInPixels(self.window, &width, &height)) return null;
+        return .{
+            .placement = if (self.overlay_trigger) |trigger| .{ .anchored = trigger } else .centered,
+            .screen = .{ .x = 0, .y = 0, .w = @floatFromInt(width), .h = @floatFromInt(height) },
+            .metrics = .{ .line_height = self.line_height, .advance = self.char_width },
+        };
+    }
+
+    /// The row of the open list under a point, or null when the point is on the
+    /// title, the filter line, the padding, or outside the box entirely.
+    fn overlayRowAt(self: *const App, x: f32, y: f32) ?usize {
+        const frame = self.overlayFrame() orelse return null;
+        return self.menu.hit(frame.placement, frame.screen, frame.metrics, x, y);
+    }
+
+    /// Whether a point is inside the box the open list occupies.
+    fn overlayCovers(self: *const App, x: f32, y: f32) bool {
+        const frame = self.overlayFrame() orelse return false;
+        return self.menu.bounds(frame.placement, frame.screen, frame.metrics).contains(x, y);
+    }
+
+    /// The theme switcher, driven on a fixed schedule so a harness can watch it:
+    /// content goes into the transcript first, the list opens over it, the
+    /// highlight walks rows by pointer and by key, the theme that was there is
+    /// put back, and then a theme is taken with Enter.
+    ///
+    /// Every step logs what the transcript - which was on screen before any of
+    /// this - resolved to afterwards. That is the reading a unit test cannot
+    /// take: the panel's rows exist only inside the frame that builds them, so a
+    /// row that kept the colours it was built with looks correct in a fresh
+    /// session and wrong in the one place it matters.
+    ///
+    /// The keys and the pointer are pushed as SDL events, so the scenario takes
+    /// the same route a reader's input takes instead of calling the handlers
+    /// behind it.
+    pub fn exerciseThemes(self: *App, frames: usize) void {
+        const mock = self.agentIndex("Local mock") orelse return;
+        switch (frames) {
+            6 => {
+                self.active = mock;
+                self.startAgent() catch |err| std.log.err("themes: {s}", .{@errorName(err)});
+            },
+            // Content first: everything the theme does from here happens to a
+            // transcript that is already on screen.
+            8 => {
+                const transcript = &self.clients[mock].transcript;
+                transcript.clearRetainingCapacity();
+                transcript.appendSlice(self.allocator, theme_sample) catch return;
+                self.transcript_scroll = 0;
+                self.transcript_probe = true;
+            },
+            12 => self.logTranscriptColour("before"),
+            14 => pushKeyMod(c.SDLK_T, c.SDL_KMOD_CTRL),
+            // A pointer passing over a row is the preview a reader gets for
+            // free, so the exercise takes that route before the keys take it.
+            16 => self.hoverThemeRow(),
+            18 => self.logTranscriptColour("hovered"),
+            20 => {
+                pushKey(c.SDLK_DOWN);
+                pushKey(c.SDLK_DOWN);
+            },
+            22 => self.logTranscriptColour("moved"),
+            24 => pushKey(c.SDLK_ESCAPE),
+            26 => self.logTranscriptColour("restored"),
+            30 => pushKeyMod(c.SDLK_T, c.SDL_KMOD_CTRL),
+            32 => {
+                pushKey(c.SDLK_DOWN);
+                pushKey(c.SDLK_DOWN);
+                pushKey(c.SDLK_DOWN);
+            },
+            34 => pushKey(c.SDLK_RETURN),
+            36 => {
+                self.logTranscriptColour("taken");
+                std.log.info("themes: list is {s}", .{if (self.themes == null) "closed" else "still open"});
+            },
+            else => {},
+        }
+    }
+
+    /// What the transcript panel resolved to on the frame it was last drawn, in
+    /// the words a harness reads: the colour of its first run, the paper behind
+    /// it, and the row the list is on.
+    fn logTranscriptColour(self: *App, step: []const u8) void {
+        var drawn: [7]u8 = undefined;
+        var paper: [7]u8 = undefined;
+        var panel: [7]u8 = undefined;
+        const ink = hexOf(self.transcript_colour orelse theme.text, &drawn);
+        const background = hexOf(theme.background, &paper);
+        const chrome = hexOf(theme.panel, &panel);
+        const row = if (self.themes) |*picker| picker.label(self.menu.selected) else "no list";
+        std.log.info("themes: {s}: transcript {s}, background {s}, panel {s}, row {s}", .{ step, ink, background, chrome, row });
+    }
+
+    /// Move the pointer onto a row of the open list that is not the one the
+    /// highlight is already on. Where the rows are is asked of the list's own
+    /// hit test rather than worked out again here, so a point this finds is a
+    /// point a reader could have put the pointer on.
+    fn hoverThemeRow(self: *App) void {
+        const frame = self.overlayFrame() orelse {
+            std.log.warn("themes: hover skipped - no list is open", .{});
+            return;
+        };
+        const box = self.menu.bounds(frame.placement, frame.screen, frame.metrics);
+        const x = box.x + box.w / 2;
+        var y = box.y + box.h - 4;
+        while (y > box.y + 4) : (y -= 4) {
+            const row = self.menu.hit(frame.placement, frame.screen, frame.metrics, x, y) orelse continue;
+            if (row == self.menu.selected) continue;
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_MOUSE_MOTION;
+            ev.motion.x = x;
+            ev.motion.y = y;
+            if (!c.SDL_PushEvent(&ev)) std.log.warn("themes: hover not delivered: {s}", .{c.SDL_GetError()});
+            return;
+        }
+        std.log.warn("themes: hover missed - no row answered the pointer", .{});
     }
 
     pub fn newTerminalTab(self: *App, chosen: ?[]const u8) !void {
@@ -1925,8 +2436,14 @@ pub const App = struct {
     /// worked around with a second binding.
     fn closeFocused(self: *App) !void {
         // 1. A list, which is what Esc closes and the most transient thing
-        //    there is.
+        //    there is. The theme list is the one that is showing a theme rather
+        //    than naming something, so closing it means putting back the one the
+        //    reader had: a preview left on screen is not a closed list.
         if (self.overlay != .none) {
+            if (self.overlay == .themes) {
+                self.cancelThemePreview();
+                return;
+            }
             self.overlay = .none;
             return;
         }
@@ -2172,94 +2689,189 @@ pub const App = struct {
         self.shells.setTitle(index, title) catch {};
     }
 
+    /// One cell grid's drawing, for the dock's terminal and for a call's.
+    ///
+    /// It was a struct local to `drawTerminal` until a second place needed to
+    /// draw a terminal; the only thing that made it local was the assumption
+    /// that there would be one. `app` is optional because the one thing that
+    /// needs it - the dock's selection - is about a terminal a reader is typing
+    /// into, and a call's terminal is quoted rather than used.
+    const TerminalPainter = struct {
+        r: *Renderer,
+        app: ?*const App,
+        origin_x: f32,
+        origin_y: f32,
+        char_width: f32,
+        line_height: f32,
+        ascent: f32,
+        foreground: theme.Color,
+        palette: [256]theme.Color,
+
+        fn color(painter: *@This(), value: ghostty.GhosttyStyleColor, fallback: theme.Color) theme.Color {
+            return switch (value.tag) {
+                ghostty.GHOSTTY_STYLE_COLOR_RGB => rgbColor(value.value.rgb),
+                ghostty.GHOSTTY_STYLE_COLOR_PALETTE => painter.palette[value.value.palette],
+                else => fallback,
+            };
+        }
+
+        fn visit(painter: *@This(), row: u16, cells: []const vt.Terminal.Cell) anyerror!void {
+            const y = painter.origin_y + @as(f32, @floatFromInt(row)) * painter.line_height;
+            for (cells, 0..) |cell, column| {
+                const x = painter.origin_x + @as(f32, @floatFromInt(column)) * painter.char_width;
+                var cell_background = painter.color(cell.style.bg_color, painter.palette[0]);
+                var cell_foreground = painter.color(cell.style.fg_color, painter.foreground);
+                if (cell.style.inverse) {
+                    const swap = cell_background;
+                    cell_background = cell_foreground;
+                    cell_foreground = swap;
+                }
+                if (!std.mem.eql(f32, &cell_background, &painter.palette[0])) {
+                    try painter.r.rect(.{ .x = x, .y = y, .w = painter.char_width, .h = painter.line_height }, cell_background);
+                }
+                // What the pointer dragged over, under the text it covers.
+                if (painter.app) |app| {
+                    if (app.terminalSelected(column, row)) {
+                        try painter.r.rect(.{ .x = x, .y = y, .w = painter.char_width, .h = painter.line_height }, theme.selected);
+                    }
+                }
+                if (cell.style.underline != 0) {
+                    try painter.r.rect(.{ .x = x, .y = y + painter.line_height - 2, .w = painter.char_width, .h = 1 }, cell_foreground);
+                }
+                if (cell.codepoints.len == 0) continue;
+                // A grapheme's later codepoints are combining marks; the
+                // atlas maps codepoints, so the base is what it can draw.
+                const codepoint = std.math.cast(u21, cell.codepoints[0]) orelse continue;
+                // The atlas holds one upright face, so italic is a lean and
+                // bold is a second strike a fraction of a pixel across:
+                // the usual shapes for a terminal with no second font.
+                const baseline = y + painter.ascent;
+                const lean: f32 = if (cell.style.italic) painter.ascent * 0.22 else 0;
+                _ = try painter.r.glyphShearedAt(x, baseline, codepoint, cell_foreground, lean);
+                if (cell.style.bold) {
+                    _ = try painter.r.glyphShearedAt(x + 0.6, baseline, codepoint, cell_foreground, lean);
+                }
+            }
+        }
+    };
+
+    /// The screen for a terminal a call embedded, with whatever has arrived
+    /// since it was last asked parsed into it.
+    ///
+    /// Null when the client has no such terminal and never had one: a call that
+    /// names a terminal the client never created has nothing to show, and an
+    /// empty box would be claiming it ran something.
+    ///
+    /// A screen, once made, is never dropped while the session lasts - including
+    /// after the agent releases the terminal, which is what the protocol asks
+    /// for. Feeding stops when the bytes stop being available; the screen does
+    /// not, which is the whole reason it is kept here rather than read from the
+    /// client at the point of drawing.
+    fn terminalScreenFor(self: *App, id: []const u8, columns: usize) !?*vt.Terminal {
+        if (id.len == 0 or columns == 0) return null;
+        if (self.terminal_screens.getPtr(id)) |entry| {
+            try self.feedTerminal(entry);
+            return entry.screen;
+        }
+        // Only a terminal the client actually has can be shown: the id comes
+        // from the agent, and an id nothing answers to is a call that said it
+        // ran somewhere without saying where.
+        _ = self.clients[self.active].terminalOutput(id) orelse return null;
+        const cols: u16 = @intCast(@min(columns, max_terminal_columns));
+        const screen = try self.allocator.create(vt.Terminal);
+        errdefer self.allocator.destroy(screen);
+        screen.* = try vt.Terminal.init(self.allocator, cols, embedded_terminal_rows);
+        errdefer screen.deinit();
+        // Not `key`: the interface already has one of those at container scope,
+        // and Zig refuses shadowing outright.
+        const stored_id = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(stored_id);
+        try self.terminal_screens.put(self.allocator, stored_id, .{ .id = stored_id, .screen = screen });
+        if (self.terminal_screens.getPtr(stored_id)) |entry| try self.feedTerminal(entry);
+        return screen;
+    }
+
+    /// Parse what the terminal has printed since the last look into its screen.
+    ///
+    /// The new bytes only, not the whole buffer: the transcript is rebuilt every
+    /// frame, and a terminal may hold a megabyte, so re-parsing the lot would be
+    /// a megabyte of parsing sixty times a second to discover nothing changed.
+    fn feedTerminal(self: *App, entry: *TerminalScreen) !void {
+        const bytes = self.clients[self.active].terminalOutput(entry.id) orelse return;
+        if (bytes.len <= entry.fed) return;
+        entry.screen.write(bytes[entry.fed..]);
+        entry.fed = bytes.len;
+        try entry.screen.update();
+    }
+
+    /// One terminal's screen drawn into `bounds`.
+    ///
+    /// This is the dock's renderer and a call's renderer, deliberately: a
+    /// terminal is drawn one way, and a second implementation for a terminal a
+    /// transcript quotes would be a second thing to keep correct. The metrics
+    /// come from the atlas rather than from the app, because the atlas is what
+    /// draws - and the two are the same numbers, since the app takes its own
+    /// from it.
+    ///
+    /// `app` is only for the dock's selection, which is about a terminal a
+    /// reader is typing into. A call's terminal passes null and gets no
+    /// selection, because nothing can have selected text in it.
+    ///
+    /// The cursor and the scrollbar are *not* here: they belong to a terminal
+    /// being used rather than one being quoted, and both want a reader's
+    /// attention the dock keeps and a transcript does not.
+    fn drawTerminalScreen(r: *Renderer, terminal: *vt.Terminal, bounds: Rect, app: ?*const App) !void {
+        if (bounds.h <= 0 or bounds.w <= 0) return;
+        // The emulator owns the terminal's colors; the editor's theme is the
+        // fallback for the case where it cannot answer at all.
+        const colors = terminal.colors() catch null;
+        const background = if (colors) |value| rgbColor(value.background) else theme.background;
+        const foreground = if (colors) |value| rgbColor(value.foreground) else theme.text;
+        const outer = r.clip;
+        defer r.clip = outer;
+        r.clip = bounds;
+        try r.rect(bounds, background);
+
+        var painter: TerminalPainter = .{
+            .r = r,
+            .app = app,
+            .origin_x = bounds.x + 4,
+            .origin_y = bounds.y + 4,
+            .char_width = r.atlas.advance,
+            .line_height = r.atlas.line_height,
+            .ascent = r.atlas.ascent,
+            .foreground = foreground,
+            .palette = if (colors) |value| paletteColors(value.palette, background) else paletteFallback(background),
+        };
+        try terminal.visitRows(&painter, TerminalPainter.visit);
+    }
+
     /// Draw the grid the shell produced: each cell's background, then its
     /// glyph, then the cursor where the program put it.
     fn drawTerminal(self: *App, r: *Renderer) !void {
         const terminal = self.activeTerminal() orelse return;
         const bounds = layout.Layout.terminalScreen(self.geometry.terminal);
         if (bounds.h <= 0 or bounds.w <= 0) return;
-        // The emulator owns the dock's colors; the editor's theme is the
-        // fallback for the case where it cannot answer at all.
+        // The grid itself is drawn by the shared renderer. The colors are taken
+        // again here for the cursor, which is the dock's own business: a
+        // terminal a reader is typing into shows where the typing goes, and a
+        // terminal a transcript quotes does not.
         const colors = terminal.colors() catch null;
         const background = if (colors) |value| rgbColor(value.background) else theme.background;
         const foreground = if (colors) |value| rgbColor(value.foreground) else theme.text;
+        const origin_x = bounds.x + 4;
+        const origin_y = bounds.y + 4;
+        try drawTerminalScreen(r, terminal, bounds, self);
+        // The shared renderer restores the clip on its way out, having been
+        // written to be callable from anywhere. The cursor and the scrollbar
+        // below are the dock's and belong inside the same rect, so the clip goes
+        // back on for them rather than those two drawing over the panel.
         r.clip = bounds;
-        try r.rect(bounds, background);
-
-        const Painter = struct {
-            r: *Renderer,
-            app: *const App,
-            origin_x: f32,
-            origin_y: f32,
-            char_width: f32,
-            line_height: f32,
-            ascent: f32,
-            foreground: theme.Color,
-            palette: [256]theme.Color,
-
-            fn color(painter: *@This(), value: ghostty.GhosttyStyleColor, fallback: theme.Color) theme.Color {
-                return switch (value.tag) {
-                    ghostty.GHOSTTY_STYLE_COLOR_RGB => rgbColor(value.value.rgb),
-                    ghostty.GHOSTTY_STYLE_COLOR_PALETTE => painter.palette[value.value.palette],
-                    else => fallback,
-                };
-            }
-
-            fn visit(painter: *@This(), row: u16, cells: []const vt.Terminal.Cell) anyerror!void {
-                const y = painter.origin_y + @as(f32, @floatFromInt(row)) * painter.line_height;
-                for (cells, 0..) |cell, column| {
-                    const x = painter.origin_x + @as(f32, @floatFromInt(column)) * painter.char_width;
-                    var cell_background = painter.color(cell.style.bg_color, painter.palette[0]);
-                    var cell_foreground = painter.color(cell.style.fg_color, painter.foreground);
-                    if (cell.style.inverse) {
-                        const swap = cell_background;
-                        cell_background = cell_foreground;
-                        cell_foreground = swap;
-                    }
-                    if (!std.mem.eql(f32, &cell_background, &painter.palette[0])) {
-                        try painter.r.rect(.{ .x = x, .y = y, .w = painter.char_width, .h = painter.line_height }, cell_background);
-                    }
-                    // What the pointer dragged over, under the text it covers.
-                    if (painter.app.terminalSelected(column, row)) {
-                        try painter.r.rect(.{ .x = x, .y = y, .w = painter.char_width, .h = painter.line_height }, theme.selected);
-                    }
-                    if (cell.style.underline != 0) {
-                        try painter.r.rect(.{ .x = x, .y = y + painter.line_height - 2, .w = painter.char_width, .h = 1 }, cell_foreground);
-                    }
-                    if (cell.codepoints.len == 0) continue;
-                    // A grapheme's later codepoints are combining marks; the
-                    // atlas maps codepoints, so the base is what it can draw.
-                    const codepoint = std.math.cast(u21, cell.codepoints[0]) orelse continue;
-                    // The atlas holds one upright face, so italic is a lean and
-                    // bold is a second strike a fraction of a pixel across:
-                    // the usual shapes for a terminal with no second font.
-                    const baseline = y + painter.ascent;
-                    const lean: f32 = if (cell.style.italic) painter.ascent * 0.22 else 0;
-                    _ = try painter.r.glyphShearedAt(x, baseline, codepoint, cell_foreground, lean);
-                    if (cell.style.bold) {
-                        _ = try painter.r.glyphShearedAt(x + 0.6, baseline, codepoint, cell_foreground, lean);
-                    }
-                }
-            }
-        };
-
-        var painter: Painter = .{
-            .r = r,
-            .app = self,
-            .origin_x = bounds.x + 4,
-            .origin_y = bounds.y + 4,
-            .char_width = self.char_width,
-            .line_height = self.line_height,
-            .ascent = r.atlas.ascent,
-            .foreground = foreground,
-            .palette = if (colors) |value| paletteColors(value.palette, background) else paletteFallback(background),
-        };
-        try terminal.visitRows(&painter, Painter.visit);
 
         const cursor = terminal.cursor();
         if (cursor.visible and self.focus == .terminal) {
-            const x = painter.origin_x + @as(f32, @floatFromInt(cursor.x)) * self.char_width;
-            const y = painter.origin_y + @as(f32, @floatFromInt(cursor.y)) * self.line_height;
+            const x = origin_x + @as(f32, @floatFromInt(cursor.x)) * self.char_width;
+            const y = origin_y + @as(f32, @floatFromInt(cursor.y)) * self.line_height;
             const color = if ((self.frame_count / 30) % 2 == 0) foreground else background;
             try r.rect(.{ .x = x, .y = y, .w = self.char_width, .h = self.line_height }, color);
         }
@@ -2631,20 +3243,47 @@ pub const App = struct {
         return self.clients[index].transcript.items;
     }
 
-    /// A lane's tool calls as one line, for reporting and tests: what each
-    /// chip shows and what it is about. A chip is drawn rather than written
-    /// into the transcript it sits in, so this is how a caller outside the
-    /// interface reads one.
+    /// A lane's tool calls as one line, for reporting and tests: what each card
+    /// shows - its status line, its subject, the sections it names, and the rows
+    /// it takes in the transcript - rather than what the record beside it holds.
+    ///
+    /// A call is drawn rather than written into the transcript it sits in, so
+    /// this is how a caller outside the interface reads one, and building it
+    /// from the cards the transcript draws is what makes it a report about the
+    /// screen rather than a second opinion about the record.
     pub fn agentToolCalls(self: *const App, index: usize, a: std.mem.Allocator) ![]u8 {
+        // The width the transcript draws its calls in - the dock, less the
+        // margin the transcript is inset by - so the row counts here are the
+        // row counts on screen.
+        const width = @max(1, self.geometry.agents.w - 28);
+        const metrics = tool_call.Metrics{ .advance = self.char_width };
+        // The cards are scaffolding: what is reported is their words, and the
+        // slices they are built from die with this function's scratch arena.
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+
         var out: std.ArrayList(u8) = .empty;
         const calls = self.clients[index].toolCalls();
         for (calls, 0..) |call, position| {
             if (position > 0) try out.appendSlice(a, " | ");
-            try out.appendSlice(a, tool_call.kindLabel(call.kind));
+            const expanded = self.callExpanded(index, call);
+            const card = try self.callCard(scratch.allocator(), index, call, expanded);
+            try out.appendSlice(a, card.status);
             try out.append(a, ' ');
-            try out.appendSlice(a, tool_call.stateMark(call.state));
-            try out.append(a, ':');
-            try out.appendSlice(a, call.subject);
+            try out.appendSlice(a, card.subject);
+            for (card.sections) |section| {
+                try out.appendSlice(a, " · ");
+                // A section with no bar is the card's own line - the digest a
+                // quiet card opens with - and is named for what it is.
+                try out.appendSlice(a, if (section.label.len == 0) "body" else section.label);
+                if (section.detail.len != 0) {
+                    try out.append(a, ' ');
+                    try out.appendSlice(a, section.detail);
+                }
+            }
+            var size: [32]u8 = undefined;
+            const rows = try tool_call.rows(scratch.allocator(), card, width, expanded, metrics);
+            try out.appendSlice(a, try std.fmt.bufPrint(&size, " · {d} row(s)", .{rows}));
         }
         return out.toOwnedSlice(a);
     }
@@ -2652,6 +3291,149 @@ pub const App = struct {
     /// How many tool calls a lane's transcript holds.
     pub fn agentCallCount(self: *const App, index: usize) usize {
         return self.clients[index].toolCalls().len;
+    }
+
+    /// Every record the drawing half reads, in the words it draws them in: the
+    /// runs a lane has (with the state of each fold and the rows it takes), the
+    /// plans, the usage, the mode, the session's name and the commands it
+    /// accepts.
+    ///
+    /// This is what a fixture asserts on rather than a screenshot: the panel is
+    /// pixels, and a pixel is not a sentence. It reads the same functions the
+    /// drawing reads - `streamCard`, `plan_card.card`, `usage_card`, the row
+    /// counts from `tool_call.rows` - so a record that draws wrongly here draws
+    /// wrongly on screen, and a kind that never arrives is missing from this
+    /// string rather than hiding behind a fold.
+    pub fn agentRecords(self: *const App, index: usize, a: std.mem.Allocator) ![]u8 {
+        const width = @max(1, self.geometry.agents.w - 28);
+        const columns: usize = @intFromFloat(@max(1, width / self.char_width));
+        const metrics = tool_call.Metrics{ .advance = self.char_width };
+        var scratch = std.heap.ArenaAllocator.init(a);
+        defer scratch.deinit();
+        const frame = scratch.allocator();
+        const client = &self.clients[index];
+
+        var out: std.ArrayList(u8) = .empty;
+        try out.appendSlice(a, "runs:");
+        for (client.streams()) |record| {
+            const expanded = self.runExpanded(index, record);
+            const card = try self.streamCard(frame, index, record);
+            const rows = try tool_call.rows(frame, card, width, expanded, metrics);
+            try out.appendSlice(a, " ");
+            try out.appendSlice(a, @tagName(record.channel));
+            try out.append(a, '/');
+            try out.appendSlice(a, card.status);
+            try out.append(a, '=');
+            try out.appendSlice(a, card.subject);
+            try out.appendSlice(a, if (expanded) " open" else " shut");
+            // Whether the card is still arriving is what the drawer turns into a
+            // moving mark, so it is part of what a fixture has to be able to
+            // read: a pulse that never starts and one that never stops are the
+            // two failures of a label that is supposed to say "working".
+            if (card.partial) try out.appendSlice(a, " pulse");
+            var size: [32]u8 = undefined;
+            try out.appendSlice(a, try std.fmt.bufPrint(&size, "/{d} row(s)", .{rows}));
+        }
+        // The pictures a lane holds, read the way the drawing reads them: what
+        // the record is, and what the last frame did with it. A census that said
+        // only that a picture arrived would be the count this feature replaced.
+        try out.appendSlice(a, " images:");
+        for (client.images()) |record| {
+            try out.append(a, ' ');
+            try out.appendSlice(a, try image_card.label(record, self.imageState(index, record.seq), frame));
+        }
+        try out.appendSlice(a, " plans:");
+        for (client.plans()) |record| {
+            const plan_card_value = try plan_card.card(record, frame);
+            try out.append(a, ' ');
+            try out.appendSlice(a, plan_card_value.status);
+            try out.append(a, '=');
+            try out.appendSlice(a, plan_card_value.subject);
+            for (plan_card_value.sections) |section| {
+                for (section.rows) |row| {
+                    try out.appendSlice(a, " ·");
+                    for (row) |span| {
+                        try out.append(a, ' ');
+                        try out.appendSlice(a, span.text);
+                    }
+                }
+            }
+        }
+        // Both placements, each fitted to the width it is really drawn in: the
+        // gauge shares the lane's row, so it gets the half of the dock it has
+        // there, and the footer gets the transcript's width. A fixture that read
+        // both at one roomy width would never see what a reader actually sees at
+        // a dock's size, which is where a row loses its cells.
+        try out.appendSlice(a, " usage gauge:");
+        if (client.usage()) |counts| {
+            const dock_columns: usize = @intFromFloat(@max(8, (self.geometry.agents.w / 2) / self.char_width));
+            const gauge = try usage_card.gaugeCard(counts, dock_columns, frame);
+            try out.append(a, ' ');
+            try out.appendSlice(a, gauge.subject);
+            try out.appendSlice(a, " footer:");
+            const footer = try usage_card.turnCard(counts, columns, frame);
+            try out.append(a, ' ');
+            try out.appendSlice(a, footer.subject);
+        }
+        try out.appendSlice(a, " mode:");
+        if (client.currentMode()) |mode| {
+            try out.append(a, ' ');
+            try out.appendSlice(a, mode);
+        }
+        try out.appendSlice(a, " title:");
+        if (client.sessionTitle()) |title| {
+            try out.append(a, ' ');
+            try out.appendSlice(a, title);
+        }
+        try out.appendSlice(a, " commands:");
+        for (client.availableCommands()) |command| {
+            try out.append(a, ' ');
+            try out.appendSlice(a, command.name);
+        }
+        try out.appendSlice(a, " compaction:");
+        if (client.lastCompaction()) |compaction| {
+            try out.append(a, ' ');
+            try out.appendSlice(a, compaction.id);
+            try out.append(a, '/');
+            try out.appendSlice(a, @tagName(compaction.status));
+        }
+        return out.toOwnedSlice(a);
+    }
+
+    /// How many runs a lane's transcript holds.
+    pub fn agentStreamCount(self: *const App, index: usize) usize {
+        return self.clients[index].streams().len;
+    }
+
+    /// Whether a lane's run is still arriving, which is the state a reader
+    /// reads as "working" rather than "done".
+    pub fn streamIsStreaming(self: *const App, index: usize, position: usize) bool {
+        const records = self.clients[index].streams();
+        if (position >= records.len) return false;
+        return records[position].streaming;
+    }
+
+    /// Whether a lane's run is drawn open, for the callers that click one.
+    pub fn streamIsOpen(self: *const App, index: usize, position: usize) bool {
+        const records = self.clients[index].streams();
+        if (position >= records.len) return false;
+        return self.runExpanded(index, records[position]);
+    }
+
+    /// Where a run's line was drawn last frame, so a fixture can click it the
+    /// way a reader does. The position is the run's place in the lane's list,
+    /// which is what a fixture counting runs already has.
+    pub fn streamPoint(self: *const App, index: usize, position: usize) ?struct { x: f32, y: f32 } {
+        const records = self.clients[index].streams();
+        if (position >= records.len) return null;
+        const seq = records[position].seq;
+        for (self.stream_hits.items) |hit| {
+            if (hit.lane != index or hit.seq != seq) continue;
+            // Left of the label, so the click lands on the line itself rather
+            // than on the text beside it.
+            return .{ .x = hit.bounds.x + 24, .y = hit.bounds.y + hit.bounds.h / 2 };
+        }
+        return null;
     }
 
     /// Whether a lane's call is drawn open, for the callers that click one.
@@ -2662,16 +3444,105 @@ pub const App = struct {
         return false;
     }
 
+    /// A point on a card's **last** row, for a caller that has to click what a
+    /// reader clicks to fold it back up. A card's hit covers every row it
+    /// occupies, so the last row is the marker - the line saying how many lines
+    /// were withheld - and a marker that cannot be clicked is a number with no
+    /// way to ask what it counts.
+    pub fn callMarkerPoint(self: *const App, id: []const u8) ?struct { x: f32, y: f32 } {
+        for (self.call_hits.items) |hit| {
+            if (hit.lane != self.active or !std.mem.eql(u8, hit.id, id)) continue;
+            return .{ .x = hit.bounds.x + 24, .y = hit.bounds.y + hit.bounds.h - self.line_height / 2 };
+        }
+        return null;
+    }
+
     /// A point inside a call's chip, for callers outside the interface that
     /// have to click one without a pointer device.
+    ///
+    /// It is the card's **first** row, not the middle of the card: a card's hit
+    /// covers every row it occupies, so the midpoint of an open card is forty
+    /// rows down and may be off the panel entirely - a click there lands on
+    /// whatever is below the dock rather than on the card.
     pub fn toolCallPoint(self: *const App, id: []const u8) ?struct { x: f32, y: f32 } {
         for (self.call_hits.items) |hit| {
             if (hit.lane != self.active or !std.mem.eql(u8, hit.id, id)) continue;
             // Left of the subject, so the click lands on the chip itself rather
             // than on the text beside it.
-            return .{ .x = hit.bounds.x + 24, .y = hit.bounds.y + hit.bounds.h / 2 };
+            return .{ .x = hit.bounds.x + 24, .y = hit.bounds.y + self.line_height / 2 };
         }
         return null;
+    }
+
+    /// A point inside a link's words, for callers outside the interface that
+    /// have to click one without a pointer device - the same reason the chip and
+    /// the run have a point of their own.
+    pub fn linkPoint(self: *const App) ?struct { x: f32, y: f32 } {
+        if (self.link_hits.items.len == 0) return null;
+        const hit = self.link_hits.items[0];
+        return .{ .x = hit.bounds.x + hit.bounds.w / 2, .y = hit.bounds.y + hit.bounds.h / 2 };
+    }
+
+    /// How many embedded terminals the last transcript frame drew. A terminal
+    /// held by a record the agent has released still has a screen, so this
+    /// staying above zero after a release is the protocol's requirement and not
+    /// an accident of timing.
+    pub fn embeddedTerminalsDrawn(self: *const App) u32 {
+        return self.embedded_terminals_drawn;
+    }
+
+    /// What the last transcript frame drew, by block kind. A gate reads this to
+    /// tell an arm that compiles from an arm that draws: a kind with a count of
+    /// zero did not reach the screen, whatever the tests say about parsing it.
+    pub fn transcriptCensus(self: *const App, buf: []u8) []const u8 {
+        var pen: usize = 0;
+        for (self.block_census, 0..) |count, index| {
+            if (count == 0) continue;
+            const written = std.fmt.bufPrint(buf[pen..], "{s}{s}={d}", .{
+                if (pen == 0) "" else " ",
+                @tagName(@as(markdown.BlockKind, @fromBackingInt(@intCast(index)))),
+                count,
+            }) catch break;
+            pen += written.len;
+        }
+        // The inline marks are counted after the blocks, because a block count
+        // cannot see them: a paragraph holding a struck word is one paragraph.
+        for ([_]struct { name: []const u8, count: u32 }{
+            .{ .name = "struck", .count = self.struck_runs },
+            .{ .name = "links", .count = self.link_runs },
+        }) |entry| {
+            if (entry.count == 0) continue;
+            const written = std.fmt.bufPrint(buf[pen..], "{s}{s}={d}", .{
+                if (pen == 0) "" else " ",
+                entry.name,
+                entry.count,
+            }) catch break;
+            pen += written.len;
+        }
+        return buf[0..pen];
+    }
+
+    /// A link under the pointer, if one was drawn there.
+    fn linkHitAt(self: *const App, x: f32, y: f32) ?[]const u8 {
+        for (self.link_hits.items) |hit| {
+            if (hit.bounds.contains(x, y)) return hit.url;
+        }
+        return null;
+    }
+
+    /// Open a link the reader clicked.
+    ///
+    /// A link that does nothing is worse than one not drawn as a link, because
+    /// the reader concludes the program is broken rather than that the target
+    /// was inert - so a refusal is said out loud rather than swallowed.
+    fn openLink(self: *App, url: []const u8) !void {
+        const z = try self.allocator.dupeSentinel(u8, url, 0);
+        defer self.allocator.free(z);
+        if (c.SDL_OpenURL(z.ptr)) {
+            self.status("Opened {s}.", .{url});
+        } else {
+            self.status("Could not open {s}.", .{url});
+        }
     }
 
     /// The terminal's last command, as the shell reported it. Null when the
@@ -3248,7 +4119,11 @@ pub const App = struct {
     /// state, whether a turn is in flight, and the two durations the record
     /// above produces. Nothing here guesses at a state - the label, `up` and the
     /// working states all come from `Client.State`.
-    fn factsOf(self: *const App, index: usize) activity.Facts {
+    ///
+    /// The subject is the renderers' answer for the lane's latest call, written
+    /// into `subject`, which is the caller's and must outlive the Facts built
+    /// from it.
+    fn factsOf(self: *const App, index: usize, subject: []u8) activity.Facts {
         const client = &self.clients[index];
         const live = &self.liveness[index];
         const t = App.now();
@@ -3265,14 +4140,72 @@ pub const App = struct {
             // without one: zero rather than the age of the last turn.
             .since_start_ms = if (busy and live.turn_start_ms != 0) t -| live.turn_start_ms else 0,
             .since_event_ms = if (busy and live.last_event_ms != 0) t -| live.last_event_ms else 0,
-            // What the lane is on now is its latest call; a call from a turn
-            // that is over is not what it is doing, and the module reads an
-            // empty subject as "thinking" rather than printing a gap.
-            .subject = if (busy) lastCallSubject(client) else "",
+            // What the lane is on now is its latest call, said the way the
+            // shape for that kind of call says it: "reading src/app.zig" rather
+            // than the raw line the record was built from, because a shape
+            // knows what is worth saying. A call from a turn that is over is
+            // not what it is doing, and the module reads an empty subject as
+            // "thinking" rather than printing a gap.
+            .subject = if (busy) callSummary(client, subject) else "",
             // The indicator moves on the frame count, which is the only clock a
             // redraw needs: the dock is drawn every frame anyway.
             .frame = self.frame_count,
         };
+    }
+
+    /// The mode and the context gauge, at the far end of the lane's own row.
+    ///
+    /// Both are state rather than events: a reader checks them on purpose, and
+    /// neither belongs among the prose. The gauge is drawn from the card the
+    /// usage module builds, so the number here and the number on a finished
+    /// turn's footer cannot disagree; a session that has reported neither has
+    /// neither drawn, and the row is left to the lane's own words.
+    fn drawStateRow(self: *App, r: *Renderer, frame: std.mem.Allocator, bounds: Rect, y: f32) !void {
+        const client = &self.clients[self.active];
+        var right = bounds.x + bounds.w - 14;
+        // Ordered from the edge inwards: the gauge is what changes every turn,
+        // so it keeps the corner a reader's eye returns to.
+        if (client.usage()) |counts| {
+            var columns: usize = @intFromFloat(@max(8, (bounds.w / 2) / self.char_width));
+            const gauge = try usage_card.gaugeCard(counts, columns, frame);
+            columns = @min(columns, gauge.subject.len);
+            const width = self.char_width * @as(f32, @floatFromInt(columns));
+            if (width + 12 < right - bounds.x) try r.text(right - width, y, gauge.subject, tool_call.toneColor(gauge.tone));
+            right -= width + 12;
+        }
+        const mode = session_cards.modeCard(client.currentMode() orelse "") orelse return;
+        const mode_width = self.char_width * @as(f32, @floatFromInt(mode.subject.len + mode.status.len + 2));
+        if (mode_width + 12 < right - bounds.x) {
+            const room: usize = @intFromFloat(@max(0, (right - bounds.x) / self.char_width) - 2);
+            var buffer: [128]u8 = undefined;
+            try r.text(right - mode_width, y, wrap.elide(&buffer, mode.subject, room), tool_call.toneColor(mode.tone));
+        }
+    }
+
+    /// Every plan the agent has reported, as cards above the run, and how tall
+    /// they came out. The caller moves the run down by that much.
+    ///
+    /// A plan is state: it replaces itself, so this draws what the session is
+    /// working towards now rather than what it was working towards twelve
+    /// updates ago, and a plan that was removed is drawn by nothing.
+    fn drawPlans(self: *App, r: *Renderer, frame: std.mem.Allocator, bounds: Rect, y: f32) !f32 {
+        const client = &self.clients[self.active];
+        if (client.plans().len == 0) return 0;
+        const metrics = tool_call.Metrics{ .advance = self.char_width };
+        const width = bounds.w - 28;
+        var cursor = y;
+        var height: f32 = 0;
+        for (client.plans()) |record| {
+            const card = try plan_card.card(record, frame);
+            const lines = try tool_call.rows(frame, card, width, true, metrics);
+            // A plan is drawn open: it is a checklist, and a checklist behind a
+            // fold is a fold nobody opens.
+            try tool_call.draw(card, r, .{ .x = bounds.x + 14, .y = cursor }, width, self.line_height, true, metrics, self.frame_count, frame);
+            const drawn = self.line_height * @as(f32, @floatFromInt(lines));
+            cursor += drawn;
+            height += drawn;
+        }
+        return height;
     }
 
     /// The reading for a lane, written into `buf` and fitted to the `width` it
@@ -3286,7 +4219,11 @@ pub const App = struct {
         // so a line that fills the dock does not push it off the edge.
         const usable = @max(0, (width - 28) / self.char_width) - 1;
         const columns: usize = if (usable > 0) @intFromFloat(usable) else 0;
-        return activity.read(self.factsOf(index), buf[0..@min(buf.len, columns)]);
+        // The subject is the call's summary, and it lives on this frame: `read`
+        // is handed the Facts in the same expression, so the buffer outlives
+        // the borrow rather than being kept anywhere.
+        var subject: [activity_line_capacity]u8 = undefined;
+        return activity.read(self.factsOf(index, &subject), buf[0..@min(buf.len, columns)]);
     }
 
     /// Which phase a lane's tab is marked for. A tab has room for a dot and not
@@ -3294,7 +4231,8 @@ pub const App = struct {
     /// buffer fits no line at all, which is what leaves the line out.
     fn tabPhase(self: *const App, index: usize) activity.Phase {
         var nothing: [1]u8 = undefined;
-        return activity.read(self.factsOf(index), &nothing).phase;
+        var subject: [1]u8 = undefined;
+        return activity.read(self.factsOf(index, &subject), &nothing).phase;
     }
 
     /// The agent dock: which lanes are open, what the chosen one is doing, and
@@ -3330,15 +4268,35 @@ pub const App = struct {
         // nothing should move, which is a fact about the phase and not about
         // the room left for it.
         try r.text(bounds.x + 14 + self.char_width * @as(f32, @floatFromInt(doing.line.len + 1)), doing_y, doing.indicator, doing.color);
+        const client = &self.clients[self.active];
+        // State sits at the far end of the same row: the mode the agent is
+        // working under and how full its context is. Right-aligned, because it
+        // is looked at on purpose rather than read past, and the lane's own line
+        // keeps the left of the row to itself.
+        try self.drawStateRow(r, frame, bounds, doing_y);
 
         // The run is evidence, not the navigation: it gets the room that is
         // left after the strip, the lane's own line, and the composer.
-        const run_y = doing_y + self.line_height + 6;
-        const client = &self.clients[self.active];
+        // Each plan the agent has reported stands above RUN: it is what the
+        // agent is about to do, which is what a reader looks for while a turn is
+        // running, and it is state rather than a transcript line, so the twelfth
+        // update moves one card rather than adding a twelfth.
+        const plan_y = doing_y + self.line_height + 4;
+        const plans_height = try self.drawPlans(r, frame, bounds, plan_y);
+        const run_y = plan_y + plans_height + 2;
         const permission = if (client.permission != null) self.permissionRect() else null;
         const run_bottom = if (permission) |rect| rect.y - 8 else bounds.y + bounds.h - 110;
         r.clip = bounds;
         try r.text(bounds.x + 14, run_y, "RUN", theme.muted);
+        // The transcript's own header: what this session is called and when it
+        // last moved. It belongs here rather than in the flow - it names the
+        // thing below it rather than something that happened in it - and a
+        // session that has not named itself leaves the row as it was.
+        if (try session_cards.titleCard(client.sessionTitle() orelse "", client.sessionActivity() orelse "", frame)) |named| {
+            var title_buffer: [256]u8 = undefined;
+            const room: usize = @intFromFloat(@max(0, (bounds.w - 80) / self.char_width));
+            try r.text(bounds.x + 60, run_y, wrap.elide(&title_buffer, named.subject, room), theme.muted);
+        }
         // A run that is holding on a person says so where the run is, rather
         // than on a heading the strip replaced.
         if (self.runWaiting()) try r.text(bounds.x + 60, run_y, "1 decision", theme.amber);
@@ -3378,8 +4336,10 @@ pub const App = struct {
             // The help stands in only when a lane has nothing at all to show: a
             // lane whose first act was a call already has a transcript.
             const calls = client.toolCalls();
-            const bytes = if (client.transcript.items.len == 0 and calls.len == 0) default_help else client.transcript.items;
-            try self.drawTranscript(r, frame, run, bytes, calls);
+            const streams = client.streams();
+            const images = client.images();
+            const bytes = if (client.transcript.items.len == 0 and calls.len == 0 and streams.len == 0) default_help else client.transcript.items;
+            try self.drawTranscript(r, frame, run, bytes, calls, streams, images);
         }
 
         r.clip = bounds;
@@ -3422,7 +4382,7 @@ pub const App = struct {
     /// The bytes are still the bytes - a chunk that will not parse as markdown
     /// is wrapped plainly, because a transcript that cannot be styled is still
     /// a transcript.
-    fn drawTranscript(self: *App, r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, calls: []const ToolCall) !void {
+    fn drawTranscript(self: *App, r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []const u8, calls: []const ToolCall, streams: []const Stream, images: []const Image) !void {
         if (rect.h < self.line_height or rect.w <= 0) return;
         const outer = r.clip;
         defer r.clip = outer;
@@ -3433,26 +4393,78 @@ pub const App = struct {
         // as the space around it.
         try r.rect(rect, theme.background);
         const columns: usize = @intFromFloat(@max(1, rect.w / self.char_width));
-        // The chips drawn last frame are not where the ones drawn now are, so
-        // the list of them starts here.
+        // The chips and the runs drawn last frame are not where the ones drawn
+        // now are, so the lists of them start here.
         self.call_hits.clearRetainingCapacity();
-        if (calls.len == 0) {
+        self.stream_hits.clearRetainingCapacity();
+        self.link_hits.clearRetainingCapacity();
+        self.block_census = @splat(0);
+        self.struck_runs = 0;
+        self.link_runs = 0;
+        self.embedded_terminals_drawn = 0;
+        if (calls.len == 0 and streams.len == 0 and images.len == 0) {
             // Nothing is placed among the prose, so the panel is the one it has
-            // always been, down to the plain wrapping it falls back to.
+            // always been, down to the plain wrapping it falls back to. A run is
+            // something placed: a transcript of reasoning and no calls takes the
+            // same path as one with calls in it.
             return self.drawProse(r, frame, rect, bytes, columns);
         }
 
         const metrics = tool_call.Metrics{ .advance = self.char_width };
         var rows: std.ArrayList(Row) = .empty;
         var failure: ?anyerror = null;
+        // Three ordered lists of things placed among the same bytes: a call
+        // knows the offset it arrived at, a run the offset it began at, and a
+        // picture the offset its part arrived at, so the walk takes whichever
+        // comes next and the prose fills the gaps.
+        //
+        // A tie is not ordered by anything the records keep. A run and the
+        // picture that arrived inside it share an offset - a run of reasoning
+        // appends no prose to the transcript - and the run's line belongs above
+        // the picture it was thinking about, so a run is taken first. A picture
+        // and a call at one offset were separated by an update that appended no
+        // bytes, and taking the picture first is arbitrary and costs only an
+        // adjacent swap.
         var at: usize = 0;
-        for (calls) |call| {
-            const stop = @min(call.at, bytes.len);
-            if (stop > at) try appendProse(frame, bytes[at..stop], columns, self.char_width, &rows, &failure);
+        var call_index: usize = 0;
+        var run_index: usize = 0;
+        var image_index: usize = 0;
+        while (call_index < calls.len or run_index < streams.len or image_index < images.len) {
+            const call_next = nextAt(calls, call_index);
+            const run_next = nextAt(streams, run_index);
+            const image_next = nextAt(images, image_index);
+            const spent = std.math.maxInt(usize);
+            // Whichever list is next decides; a list that is spent cannot
+            // decide, because `spent` is past every real offset. The clamp is
+            // the one every placement gets: an offset past the transcript cannot
+            // be trusted, because the transcript trims from its front.
+            const next = @min(@min(call_next orelse spent, run_next orelse spent), image_next orelse spent);
+            const stop = @min(next, bytes.len);
+            const kind: enum { run, image, call } = if (run_next == next) .run else if (image_next == next) .image else .call;
+            if (stop > at) try appendProse(frame, bytes[at..stop], columns, self.char_width, self.line_height, &rows, &failure);
             at = stop;
-            try self.appendCall(frame, self.active, call, rect.w, metrics, &rows);
+            switch (kind) {
+                .run => {
+                    try self.appendStream(frame, self.active, streams[run_index], rect.w, metrics, &rows);
+                    run_index += 1;
+                },
+                .image => {
+                    try self.appendImage(r, frame, self.active, images[image_index], rect.w, &rows);
+                    image_index += 1;
+                },
+                .call => {
+                    try self.appendCall(frame, self.active, calls[call_index], rect.w, metrics, &rows);
+                    // A call that says which terminal it ran in is followed by
+                    // that terminal's screen: the protocol puts a terminal's
+                    // output where the call is drawn, and a reader who meets the
+                    // chip reads what it printed underneath it.
+                    try self.appendCallTerminal(frame, calls[call_index], columns, &rows);
+                    call_index += 1;
+                },
+            }
         }
-        if (at < bytes.len) try appendProse(frame, bytes[at..], columns, self.char_width, &rows, &failure);
+        if (at < bytes.len) try appendProse(frame, bytes[at..], columns, self.char_width, self.line_height, &rows, &failure);
+        try self.appendUsageRow(frame, columns, rect.w, metrics, &rows);
         self.reportTranscript(failure);
         try self.drawRows(r, frame, rect, rows.items);
     }
@@ -3465,7 +4477,7 @@ pub const App = struct {
             return wrappedTail(r, frame, rect, bytes, self.transcript_scroll, theme.text);
         };
         self.transcript_plain = false;
-        const rows = try transcriptRows(frame, blocks, columns, self.char_width);
+        const rows = try transcriptRows(frame, blocks, columns, self.char_width, self.line_height);
         try self.drawRows(r, frame, rect, rows);
     }
 
@@ -3481,24 +4493,255 @@ pub const App = struct {
         self.status("Transcript: markdown ({s}); showing it plainly.", .{@errorName(err)});
     }
 
-    /// One call's rows: the chip's own row, then the rows its body occupies.
+    /// One call's rows: the pill's own row, then the rows its body occupies.
     /// Those carry nothing of their own, because the module that knows what a
     /// call looks like draws the whole block.
+    ///
+    /// The card is built here rather than in the drawing, because the row count
+    /// and the drawing have to walk the same card: a card sized for one
+    /// arrangement and drawn in another is a chip drawn over its neighbours.
     fn appendCall(self: *App, frame: std.mem.Allocator, lane: usize, call: ToolCall, width: f32, metrics: tool_call.Metrics, rows: *std.ArrayList(Row)) !void {
         const expanded = self.callExpanded(lane, call);
-        const lines = try tool_call.rows(frame, call, width, expanded, metrics);
-        try rows.append(frame, .{ .call = call, .expanded = expanded, .lines = lines });
+        const card = try self.callCard(frame, lane, call, expanded);
+        const lines = try tool_call.rows(frame, card, width, expanded, metrics);
+        try rows.append(frame, .{ .call = call, .card = card, .expanded = expanded, .lines = lines });
         for (1..lines) |_| try rows.append(frame, .{ .continuation = true });
     }
 
-    /// Whether a call is open: what the reader answered, or, for a call nobody
-    /// has clicked, its state. A failure arrives open, because a failure the
-    /// reader has to open to see is one that gets missed.
+    /// One run's rows: the line it is drawn as, then the rows its body occupies.
+    /// A run is placed like a call and its card is the same kind of card, so the
+    /// row machinery is the call's: the same count, the same continuation rows,
+    /// the same drawer.
+    fn appendStream(self: *App, frame: std.mem.Allocator, lane: usize, record: Stream, width: f32, metrics: tool_call.Metrics, rows: *std.ArrayList(Row)) !void {
+        const expanded = self.runExpanded(lane, record);
+        const card = try self.streamCard(frame, lane, record);
+        const lines = try tool_call.rows(frame, card, width, expanded, metrics);
+        try rows.append(frame, .{ .stream = record, .card = card, .expanded = expanded, .lines = lines });
+        for (1..lines) |_| try rows.append(frame, .{ .continuation = true });
+    }
+
+    /// One picture's rows: the picture itself, then the line that names it.
+    ///
+    /// The picture comes first because a row reserves the room below its own
+    /// line, so a picture that started on its label's line would need an offset
+    /// the row model does not have. The line under it is where a reader finds
+    /// out what they are looking at: the mime type, the size the decoder found,
+    /// the size it was drawn at - or, when there is nothing to draw, exactly
+    /// why, in place of the picture rather than instead of it.
+    ///
+    /// The pixels are the renderer's, and asking for them is what decodes a
+    /// picture: the first frame that shows one pays for it, and every frame
+    /// after reads it out of the picture space.
+    fn appendImage(self: *App, r: *Renderer, frame: std.mem.Allocator, lane: usize, record: Image, width: f32, rows: *std.ArrayList(Row)) !void {
+        const room = @as(f32, @floatFromInt(image_card.max_rows)) * self.line_height;
+        // A record refused at capture is a refusal already: the decoder is never
+        // asked about bytes that were not kept.
+        var outcome: image_card.Outcome = .{ .refused = record.refusal };
+        var fitted: ?RowPicture = null;
+        if (record.refusal == .none) {
+            const format = record.format orelse {
+                // Kept without a format is a record that cannot happen - the
+                // sniff is what decides whether one is kept - and a picture that
+                // cannot be decoded by construction is the honest answer for it.
+                outcome = .{ .refused = .undecodable };
+                self.rememberImage(lane, record.seq, outcome);
+                return appendImageLine(frame, record, outcome, rows);
+            };
+            switch (try r.picture(imageKey(lane, record.seq), format, record.bytes)) {
+                .refused => |why| outcome = .{ .refused = why },
+                .picture => |picture| {
+                    const box = image_card.fit(picture.width, picture.height, width, room);
+                    outcome = .{ .drawn = .{ .width = picture.width, .height = picture.height, .fit = box } };
+                    fitted = .{ .texture = picture.texture, .fit = box };
+                },
+            }
+        }
+        self.rememberImage(lane, record.seq, outcome);
+        if (fitted) |picture| {
+            const held = image_card.rows(picture.fit, self.line_height);
+            try rows.append(frame, .{ .picture = picture, .lines = held });
+            for (1..held) |_| try rows.append(frame, .{ .continuation = true });
+        }
+        return appendImageLine(frame, record, outcome, rows);
+    }
+
+    /// The line a picture leaves where it is drawn, or where it is not: the one
+    /// row a reader always gets, whatever became of the pixels.
+    fn appendImageLine(frame: std.mem.Allocator, record: Image, outcome: image_card.Outcome, rows: *std.ArrayList(Row)) !void {
+        try rows.append(frame, .{
+            .spans = try frame.dupe(Span, &.{.{
+                .text = try image_card.label(record, outcome, frame),
+                // A picture that is there is a settled record and reads like one; a
+                // picture that is not is the reader's business and carries the
+                // warning tone, which is the same distinction a failed call gets.
+                .fg = switch (outcome) {
+                    .drawn => theme.muted,
+                    .refused => theme.amber,
+                },
+            }}),
+        });
+    }
+
+    /// Forget the answers about pictures this lane no longer holds, for the same
+    /// reason the folds do: a record that has left the transcript has nothing
+    /// left to report on.
+    fn pruneImageStates(self: *App, lane: usize, records: []const Image) void {
+        var index: usize = 0;
+        while (index < self.image_states.items.len) {
+            const entry = self.image_states.items[index];
+            if (entry.lane != lane or holdsImage(records, entry.seq)) {
+                index += 1;
+                continue;
+            }
+            _ = self.image_states.swapRemove(index);
+        }
+    }
+
+    /// Keep what the drawing did with a picture, so the census can report it
+    /// without a renderer and without drawing anything.
+    fn rememberImage(self: *App, lane: usize, seq: usize, outcome: image_card.Outcome) void {
+        for (self.image_states.items) |*entry| {
+            if (entry.lane == lane and entry.seq == seq) {
+                entry.outcome = outcome;
+                return;
+            }
+        }
+        self.image_states.append(self.allocator, .{ .lane = lane, .seq = seq, .outcome = outcome }) catch {};
+    }
+
+    /// What the last frame did with a picture, for a caller that only has the
+    /// records. Null is a picture no frame has drawn yet, which a census asked
+    /// before the first draw is entitled to see.
+    fn imageState(self: *const App, lane: usize, seq: usize) ?image_card.Outcome {
+        for (self.image_states.items) |entry| {
+            if (entry.lane == lane and entry.seq == seq) return entry.outcome;
+        }
+        return null;
+    }
+
+    /// The card a run is drawn as. A compaction is the one run whose state comes
+    /// from outside the record: it starts, it succeeds, or it fails, and the
+    /// session is what knows which - the run itself only knows whether text is
+    /// still arriving.
+    fn streamCard(self: *const App, frame: std.mem.Allocator, lane: usize, record: Stream) !tool_card.Card {
+        if (record.channel == .summary) return stream_card.compactionCard(record, self.clients[lane].lastCompaction(), frame);
+        return stream_card.card(record, frame);
+    }
+
+    /// The footer a finished turn leaves: what the context holds and what the
+    /// session has cost.
+    ///
+    /// It is not a record placed by an offset, because the counts belong to the
+    /// turn rather than to a byte of prose, and it is drawn from the one usage a
+    /// session reports rather than from a history this interface does not keep:
+    /// the row is the turn that just ended, and it goes when the next one starts
+    /// and a reader has something newer to look at. Nothing is drawn while a turn
+    /// is in flight, because a cost reported mid-turn is a cost nobody has.
+    fn appendUsageRow(self: *App, frame: std.mem.Allocator, columns: usize, width: f32, metrics: tool_call.Metrics, rows: *std.ArrayList(Row)) !void {
+        const client = &self.clients[self.active];
+        if (turnInFlight(client.state) or client.completed_turns == 0) return;
+        const counts = client.usage() orelse return;
+        const card = try usage_card.turnCard(counts, columns, frame);
+        const lines = try tool_call.rows(frame, card, width, false, metrics);
+        try rows.append(frame, .{ .card = card, .lines = lines });
+        for (1..lines) |_| try rows.append(frame, .{ .continuation = true });
+    }
+
+    /// The screen of the terminal a call ran in, drawn under the call.
+    ///
+    /// Nothing is drawn for a call that names no terminal, and nothing for one
+    /// naming a terminal the client never had: an empty box would be claiming a
+    /// command ran when nothing says it did. A terminal that has been released
+    /// still has its screen, which is what the protocol asks for.
+    fn appendCallTerminal(self: *App, frame: std.mem.Allocator, call: ToolCall, columns: usize, rows: *std.ArrayList(Row)) !void {
+        if (call.terminal_id.len == 0) return;
+        const screen = (try self.terminalScreenFor(call.terminal_id, columns)) orelse return;
+        try rows.append(frame, .{ .terminal = screen, .lines = embedded_terminal_rows });
+        for (1..embedded_terminal_rows) |_| try rows.append(frame, .{ .continuation = true });
+    }
+
+    /// The card a call is drawn as: the state the record carries, changed by
+    /// the one fact the record cannot hold - a call that failed while the
+    /// reader was cancelling it was cancelled rather than broken.
+    fn callCard(self: *const App, frame: std.mem.Allocator, lane: usize, call: ToolCall, expanded: bool) !tool_card.Card {
+        const call_status = tool_card.Status.of(call.state, self.callAborted(lane, call.id));
+        return tools.cardIn(call, call_status, expanded, frame);
+    }
+
+    /// Whether a call is open: what the reader answered for this call, else
+    /// what they answered for the whole transcript, else its state - a failure
+    /// arrives open, because a failure the reader has to open to see is one
+    /// that gets missed.
     fn callExpanded(self: *const App, lane: usize, call: ToolCall) bool {
         for (self.call_expansions.items) |entry| {
             if (entry.lane == lane and std.mem.eql(u8, entry.id, call.id)) return entry.expanded;
         }
-        return call.state == .failed;
+        return self.calls_expanded orelse (call.state == .failed);
+    }
+
+    /// Open or close every call in every lane at once, the way the reference's
+    /// tool-output key does: the per-call answers are dropped rather than left
+    /// to fight the new one, because a key that flips the whole transcript has
+    /// to flip the whole transcript. Calls that arrive afterwards follow it.
+    fn toggleCalls(self: *App) void {
+        const open = !(self.calls_expanded orelse false);
+        self.calls_expanded = open;
+        for (self.call_expansions.items) |entry| self.allocator.free(entry.id);
+        self.call_expansions.clearRetainingCapacity();
+        // The runs go with the calls: a key that flips the whole transcript has
+        // to flip the whole transcript, and a reader who opened everything means
+        // the reasoning too.
+        self.run_folds.clear();
+        self.status("Every tool call and thought {s}.", .{if (open) "opened" else "closed"});
+    }
+
+    /// Record the calls that failed while their lane was cancelling, and forget
+    /// the ones whose call has left the transcript.
+    ///
+    /// ACP gives a cancellation and a failure the same status, so the only
+    /// place the two can be told apart is here: the lane is what knows a cancel
+    /// is in flight, and the record is what knows the call failed. The answer is
+    /// kept rather than recomputed because the lane stops cancelling within a
+    /// frame or two of the failure arriving, and a call that read as cancelled
+    /// while it happened must not turn back into an error afterwards.
+    fn observeAborts(self: *App) void {
+        for (self.clients, 0..) |*client, lane| {
+            // A run the lane no longer keeps has nothing left to open, so the
+            // answer about it goes with it: the handles are never reused, so a
+            // stale one could never land on a different run, but the list would
+            // still grow for a session that runs all day.
+            self.run_folds.prune(lane, client.streams());
+            // The same for the pictures: a record a lane no longer holds has
+            // nothing left to report about, and the handles are never reused, so
+            // the answer could never land on another picture.
+            self.pruneImageStates(lane, client.images());
+            if (client.state != .cancelling) continue;
+            for (client.toolCalls()) |call| {
+                if (call.state != .failed or self.callAborted(lane, call.id)) continue;
+                const owned = self.allocator.dupe(u8, call.id) catch return;
+                self.aborted_calls.append(self.allocator, .{ .lane = lane, .id = owned }) catch {
+                    self.allocator.free(owned);
+                    return;
+                };
+            }
+        }
+        var index: usize = 0;
+        while (index < self.aborted_calls.items.len) {
+            const entry = self.aborted_calls.items[index];
+            if (hasCall(self.clients[entry.lane].toolCalls(), entry.id)) {
+                index += 1;
+                continue;
+            }
+            self.allocator.free(self.aborted_calls.swapRemove(index).id);
+        }
+    }
+
+    /// Whether a call is one the reader cancelled.
+    fn callAborted(self: *const App, lane: usize, id: []const u8) bool {
+        for (self.aborted_calls.items) |entry| {
+            if (entry.lane == lane and std.mem.eql(u8, entry.id, id)) return true;
+        }
+        return false;
     }
 
     /// The call a click landed on, when it landed on one. The chip belongs to
@@ -3512,7 +4755,30 @@ pub const App = struct {
         return null;
     }
 
-    /// Open or close a call, by the agent's id for it: the record is replaced
+    /// The run a click landed on, when it landed on one. Keyed the way the fold
+    /// state is keyed, so the run a click names and the run a fold opens are the
+    /// same run rather than two that happen to be drawn at one place.
+    fn streamHitAt(self: *const App, x: f32, y: f32) ?usize {
+        for (self.stream_hits.items) |hit| {
+            if (hit.lane != self.active) continue;
+            if (hit.bounds.contains(x, y)) return hit.seq;
+        }
+        return null;
+    }
+
+    /// Whether a run is open. A run nobody has answered about is shut, which is
+    /// what makes the transcript one line per thought until a reader says
+    /// otherwise.
+    fn runExpanded(self: *const App, lane: usize, record: Stream) bool {
+        return self.run_folds.isOpen(lane, record.seq);
+    }
+
+    /// Open or close a run, by the handle the client gave it.
+    fn toggleStream(self: *App, seq: usize) !void {
+        try self.run_folds.toggle(self.active, seq);
+    }
+
+    /// Open or close every call, by the agent's id for it: the record is replaced
     /// every time the call progresses, so the reader's answer is kept against
     /// the id rather than against the record.
     fn toggleCall(self: *App, id: []const u8) !void {
@@ -3570,6 +4836,10 @@ pub const App = struct {
         // at the window instead would leave a hole where the body is.
         var start = begin;
         while (start > 0 and rows[start].continuation) start -= 1;
+        // What the panel was drawn in, for a harness that asked: the colour of
+        // the first run of the first row that has text, which is content that
+        // was placed before the theme it is drawn in was chosen.
+        if (self.transcript_probe) self.transcript_colour = firstRunColour(rows);
         for (rows[start..end], 0..) |row, offset| {
             const index = start + offset;
             const above: i64 = @as(i64, @intCast(index)) - @as(i64, @intCast(begin));
@@ -3577,19 +4847,120 @@ pub const App = struct {
             if (row.background) |colour| try r.rect(.{ .x = rect.x, .y = y, .w = rect.w, .h = self.line_height }, colour);
             if (row.rule) try r.rect(.{ .x = rect.x, .y = y + self.line_height / 2, .w = rect.w, .h = 1 }, theme.border);
             if (row.bar) try r.rect(.{ .x = rect.x + self.char_width / 2, .y = y, .w = 2, .h = self.line_height }, theme.border);
+            // A picture is drawn from the top of its own row and clipped like
+            // every other row: one scrolled half out of the panel is cut, not
+            // moved or stretched. Rows above the window are drawn too, because a
+            // picture taller than the window reaches into it.
+            if (row.picture) |picture| {
+                try r.drawPicture(picture.texture, .{ .x = rect.x, .y = y, .w = picture.fit.width, .h = picture.fit.height });
+                continue;
+            }
+            // A formula is drawn from the top of its row, on the baseline the
+            // metrics put there. It is laid out in the same units the renderer
+            // draws glyphs in, so it lands on the text around it.
+            if (row.formula) |formula| {
+                math.draw(formula.handle, r, rect.x + self.char_width * 2, y + formula.height, theme.text);
+                continue;
+            }
+            if (row.stream) |record| {
+                // Only a line the window shows answers a click: a row above the
+                // fold is not under the pointer, which is what stops a click
+                // from opening something the reader cannot see. The hit covers
+                // the rows the run occupies, so clicking the reasoning itself
+                // folds it back up rather than only its label doing that.
+                const first_row = index;
+                const last_row = index + @max(1, row.lines);
+                if (last_row > begin and first_row < end) {
+                    try self.stream_hits.append(self.allocator, .{
+                        .lane = self.active,
+                        .seq = record.seq,
+                        .bounds = .{ .x = rect.x, .y = y, .w = rect.w, .h = self.line_height * @as(f32, @floatFromInt(@max(1, row.lines))) },
+                    });
+                }
+                if (row.card) |card| {
+                    try tool_call.draw(card, r, .{ .x = rect.x, .y = y }, rect.w, self.line_height, row.expanded, .{ .advance = self.char_width }, self.frame_count, frame);
+                }
+                continue;
+            }
             if (row.call) |call| {
                 // Only a chip the window shows answers a click: a row above the
                 // fold is not under the pointer.
-                if (index >= begin and index < end) {
+                //
+                // The hit covers every row the card occupies rather than the one
+                // it starts on, because the rows below it are the card: a marker
+                // saying how many lines were withheld is the row a reader clicks
+                // to ask for them, and a marker that cannot be clicked is a
+                // number with no way to ask what it counts.
+                // The card answers a click while any part of it is on screen
+                // rather than only while its first row is. A card taller than
+                // the window - which is what an opened diff is - has its chip
+                // scrolled off the top while its body fills the panel, and a
+                // reader looking at the body has to be able to fold it back up.
+                const first_row = index;
+                const last_row = index + @max(1, row.lines);
+                if (last_row > begin and first_row < end) {
                     const id = try frame.dupe(u8, call.id);
-                    try self.call_hits.append(self.allocator, .{ .lane = self.active, .id = id, .bounds = .{ .x = rect.x, .y = y, .w = rect.w, .h = self.line_height } });
+                    try self.call_hits.append(self.allocator, .{
+                        .lane = self.active,
+                        .id = id,
+                        .bounds = .{ .x = rect.x, .y = y, .w = rect.w, .h = self.line_height * @as(f32, @floatFromInt(@max(1, row.lines))) },
+                    });
                 }
-                try tool_call.draw(call, r, .{ .x = rect.x, .y = y }, rect.w, self.line_height, row.expanded, .{ .advance = self.char_width }, frame);
+                if (row.card) |card| {
+                    try tool_call.draw(card, r, .{ .x = rect.x, .y = y }, rect.w, self.line_height, row.expanded, .{ .advance = self.char_width }, self.frame_count, frame);
+                }
+                continue;
+            }
+            // A card with neither a call nor a run behind it: the footer a
+            // finished turn leaves, which is placed by no offset and answers to
+            // no click. This comes last because a call's card and a run's card
+            // are the same kind of card - the two branches above own those.
+            if (row.card) |card| {
+                try tool_call.draw(card, r, .{ .x = rect.x, .y = y }, rect.w, self.line_height, row.expanded, .{ .advance = self.char_width }, self.frame_count, frame);
+                continue;
+            }
+            // A call's terminal: the grid a command printed into, drawn with
+            // the same renderer the dock uses. Selection passes null, because
+            // nothing can have been selected in a terminal a transcript quotes,
+            // and the cursor is not drawn for the same reason - there is nowhere
+            // to type. It answers a click with nothing, so it comes before the
+            // rows that do.
+            if (row.terminal) |screen| {
+                const height = self.line_height * @as(f32, @floatFromInt(@max(1, row.lines)));
+                if (index + row.lines > begin and index < end) {
+                    self.embedded_terminals_drawn += 1;
+                    try drawTerminalScreen(r, screen, .{ .x = rect.x, .y = y, .w = rect.w, .h = height }, null);
+                }
                 continue;
             }
             if (index < begin) continue;
+            // Only a row the window shows is counted, for the same reason only
+            // one answers a click: a block above the fold did not reach the
+            // screen, and a census that counted it would report drawing that
+            // did not happen.
+            if (row.block) |kind| self.block_census[@backingInt(kind)] += 1;
             var pen = rect.x + row.indent;
-            for (row.spans) |span| pen = try drawSpan(r, pen, y, span.text, span.fg);
+            for (row.spans) |span| {
+                const first = pen;
+                pen = try drawSpan(r, pen, y, span.text, span.fg);
+                // A struck run's rule goes through the middle of the text, so it
+                // reads as a retraction of the words rather than as an underline
+                // under them. It is counted where it is drawn, because the block
+                // census above would count the paragraph it sits in either way.
+                if (span.strike) {
+                    self.struck_runs += 1;
+                    try r.rect(.{ .x = first, .y = y + self.line_height / 2, .w = pen - first, .h = 1 }, span.fg);
+                }
+                // A link records where its words landed, so a click can land on
+                // them. Only a row the window shows answers: a link above the
+                // fold is not under the pointer.
+                if (span.destination.len != 0) {
+                    self.link_runs += 1;
+                    if (index >= begin and index < end) {
+                        try self.link_hits.append(self.allocator, .{ .url = span.destination, .bounds = .{ .x = first, .y = y, .w = pen - first, .h = self.line_height } });
+                    }
+                }
+            }
         }
     }
 
@@ -3677,12 +5048,44 @@ fn turnInFlight(state: Client.State) bool {
     };
 }
 
-/// What a lane's latest tool call was about, or empty when it has made none.
-/// The records are the client's; reading the last one is how the dock says what
-/// the agent is on rather than only how long it has been on it.
-fn lastCallSubject(client: *const Client) []const u8 {
+/// What a lane's latest call is doing, in the words the shape for that kind of
+/// call would use: the verb and the value the call is about, written into `buf`
+/// and borrowed from it. `buf` has to outlive the `Facts` built from it, which
+/// is why the caller owns it.
+///
+/// This is what makes the lane's line better than the record's subject: a
+/// renderer knows what is worth saying about its own kind of call, so the line
+/// reads "reading src/app.zig" rather than naming a file with no verb. An empty
+/// string is the honest answer when there is no call to describe, and the verb
+/// alone is the answer when the record carried no value to go with it.
+fn callSummary(client: *const Client, buf: []u8) []const u8 {
     const calls = client.toolCalls();
-    return if (calls.len == 0) "" else calls[calls.len - 1].subject;
+    // No call to describe, but something arriving: the lane is thinking or
+    // compacting, and a blank line here is what makes a long turn look stuck.
+    // The client closes every open run at the end of a turn, so a run that is
+    // still streaming is a turn that is still running.
+    if (calls.len == 0) return stream_card.liveSummary(client.streams(), buf) orelse "";
+    const summary = tools.summaryFor(calls[calls.len - 1]);
+    if (summary.detail.len == 0) return clip(buf, summary.label);
+    return std.fmt.bufPrint(buf, "{s} {s}", .{ summary.label, summary.detail }) catch clip(buf, summary.label);
+}
+
+/// Whether a lane's pictures still hold a handle. An answer about a picture that
+/// has left the list is an answer about nothing.
+fn holdsImage(records: []const Image, seq: usize) bool {
+    for (records) |record| {
+        if (record.seq == seq) return true;
+    }
+    return false;
+}
+
+/// As much of `bytes` as `buf` holds. It is the answer only when a line does
+/// not fit the buffer it was given, which a caller sizes from the record's own
+/// bound.
+fn clip(buf: []u8, bytes: []const u8) []const u8 {
+    const take = @min(buf.len, bytes.len);
+    @memcpy(buf[0..take], bytes[0..take]);
+    return buf[0..take];
 }
 
 fn adjust(value: usize, delta: i32, maximum: usize) usize {
@@ -3696,6 +5099,62 @@ fn countLines(bytes: []const u8) usize {
         if (byte == '\n') n += 1;
     }
     return n;
+}
+
+/// What the theme exercise puts in the transcript: body text first, so the
+/// colour a harness reads back is the theme's own text colour, then a heading, a
+/// bullet and a fenced block, so more than one role is on screen when the theme
+/// underneath them changes.
+const theme_sample =
+    \\A line that was already on screen when the theme changed.
+    \\
+    \\## A heading
+    \\- a bullet with `inline code`
+    \\> a quotation
+    \\
+    \\```zig
+    \\const x = 1;
+    \\```
+    \\
+;
+
+/// A colour as `#rrggbb`, written into `out`, for a log line a harness reads.
+/// The alpha is left out because a screenshot has none to compare and the
+/// question being asked is which colour was drawn rather than how opaque it was.
+fn hexOf(colour: theme.Color, out: *[7]u8) []const u8 {
+    const channel = struct {
+        fn of(value: f32) u8 {
+            return @intFromFloat(@round(std.math.clamp(value, 0, 1) * 255));
+        }
+    }.of;
+    out[0] = '#';
+    _ = std.fmt.bufPrint(out[1..], "{x:0>2}{x:0>2}{x:0>2}", .{ channel(colour[0]), channel(colour[1]), channel(colour[2]) }) catch {};
+    return out;
+}
+
+/// The colour of the first run of the first row that has text, which is what a
+/// theme change is measured on: content that was placed in the panel before the
+/// theme it is drawn in was chosen.
+fn firstRunColour(rows: []const Row) ?theme.Color {
+    for (rows) |row| {
+        if (row.spans.len > 0) return row.spans[0].fg;
+    }
+    return null;
+}
+
+/// Deliver a key the way a keyboard would, so an exercise takes the same route
+/// through the event queue a reader's key takes.
+fn pushKey(keycode: c.SDL_Keycode) void {
+    pushKeyMod(keycode, 0);
+}
+
+/// The same, with the modifiers a binding is only itself with.
+fn pushKeyMod(keycode: c.SDL_Keycode, mod: c.SDL_Keymod) void {
+    var ev = std.mem.zeroes(c.SDL_Event);
+    ev.type = c.SDL_EVENT_KEY_DOWN;
+    ev.key.key = keycode;
+    ev.key.mod = mod;
+    if (!c.SDL_PushEvent(&ev)) std.log.warn("themes: key not delivered: {s}", .{c.SDL_GetError()});
 }
 
 /// Text drawn from the top of a rect, wrapping at its width.
@@ -3740,12 +5199,44 @@ fn wrappedTail(r: *Renderer, frame: std.mem.Allocator, rect: Rect, bytes: []cons
 /// One run of characters and the colour it is drawn in. A paragraph reaches the
 /// panel as runs rather than as one string, because inline code is marked
 /// differently from the sentence around it; a row is a sequence of these.
-const Span = struct { text: []const u8, fg: theme.Color };
+const Span = struct {
+    text: []const u8,
+    fg: theme.Color,
+    /// Where a link goes, empty for a run that is not one. The pointer is ours
+    /// rather than a terminal's, so a link here is a target that can be clicked
+    /// instead of an escape sequence something else decides about.
+    destination: []const u8 = "",
+    /// Whether a rule is drawn through this run. The atlas holds one face and
+    /// nothing to decorate type with, so a strikethrough is geometry rather
+    /// than a font feature - and it has to be, because a retraction carried by
+    /// colour alone is a word a reader cannot tell from a quiet one.
+    strike: bool = false,
+};
+
+/// A screen kept for a terminal a call embedded.
+///
+/// The client's record belongs to the command and is freed when the agent
+/// releases it. This belongs to the reader, and outlives that on purpose - the
+/// protocol says a client keeps displaying a terminal's output after the
+/// terminal is released, and a screen is the only thing that can: the process is
+/// gone, the bytes are gone with it, and what is left is what was drawn.
+const TerminalScreen = struct {
+    /// The id, **owned by the map key rather than here**. The record points at
+    /// its own key so that one lookup serves both the table and the feed, which
+    /// means these bytes are freed once, with the keys, and freeing them from a
+    /// record is a double free.
+    id: []const u8,
+    screen: *vt.Terminal,
+    /// How much of the terminal's output has been parsed into the screen. The
+    /// transcript is rebuilt every frame and a terminal may hold a megabyte, so
+    /// the bytes are parsed as they arrive rather than sixty times a second.
+    fed: usize = 0,
+};
 
 /// A row of the transcript panel: what it says, where it starts, and what is
 /// drawn behind it. An indent and a background are most of the difference
 /// between a paragraph, a list item, a quotation, and a line of code.
-const Row = struct {
+pub const Row = struct {
     spans: []const Span = &.{},
     /// Where the first run starts, measured from the panel's left edge.
     indent: f32 = 0,
@@ -3760,6 +5251,24 @@ const Row = struct {
     /// reader has it open. A call is not text, so it is drawn by the module
     /// that knows what one looks like rather than built out of runs.
     call: ?ToolCall = null,
+    /// A run of reasoning or speech drawn from this row down, placed the same
+    /// way a call is: the card is the line it shows shut and the text it shows
+    /// open. The record travels with the row because opening one is an answer
+    /// about this run, which the reader's click names by its handle.
+    stream: ?Stream = null,
+    /// The card the call above is drawn as, built once when the rows were laid
+    /// out. The row count and the drawing have to walk the same card, so it
+    /// travels with the row rather than being built again at the draw.
+    card: ?tool_card.Card = null,
+    /// A picture drawn from this row down. A picture is neither text nor a card:
+    /// it is one quad sampling its own texture, and the box it was fitted to
+    /// travels with it for the same reason a card travels with a call - the rows
+    /// were counted from those numbers, so the drawing has to use them.
+    picture: ?RowPicture = null,
+    /// A typeset formula drawn from the top of this row. Like a picture it is
+    /// neither text nor a card, and the box the rows were counted from travels
+    /// with it for the same reason: the count and the drawing have to agree.
+    formula: ?RowFormula = null,
     expanded: bool = false,
     /// How many rows the call occupies. The rows after this one are its own and
     /// carry nothing, which is what keeps the row grid the drawing walks.
@@ -3767,12 +5276,82 @@ const Row = struct {
     /// Whether this row is one of the rows a call above it occupies. The
     /// drawing walks back over these to find the call a row belongs to.
     continuation: bool = false,
+    /// A terminal a call embedded, drawn from this row down over `lines` rows.
+    /// It is a screen the editor keeps rather than the client's record, so it
+    /// stays on screen after the agent releases the terminal.
+    terminal: ?*vt.Terminal = null,
+    /// The kind of block that produced this row. It is recorded rather than
+    /// tallied where the block is drawn, because then the tally is the drawing's
+    /// own count of what reached the screen - a table arm that stopped drawing
+    /// anything is a table count of zero, which a test can see.
+    block: ?markdown.BlockKind = null,
 };
+
+/// A picture on a row: the texture it lives in, and the box it was fitted to.
+const RowPicture = struct { texture: *c.SDL_GPUTexture, fit: image_card.Fit };
+
+/// A display formula the TeX engine has laid out, with the metrics the rows were
+/// counted from. Height is above the baseline and depth below it, so the top of
+/// the row plus the height is where the formula's baseline sits.
+pub const RowFormula = struct { handle: math.Formula, width: f32, height: f32, depth: f32 };
 
 /// A place in a block's runs: which run, and where in it. Wrapping counts
 /// characters across runs, so a break has to be named the same way - a byte
 /// offset into one run would not survive the next run starting.
 const Place = struct { run: usize, at: usize };
+
+/// Where the next record of a list belongs, or null when the list is spent. One
+/// rule walks three kinds of record - a call, a run, and a picture - which is
+/// what keeps them in one order rather than three.
+fn nextAt(records: anytype, index: usize) ?usize {
+    if (index >= records.len) return null;
+    return records[index].at;
+}
+
+/// The cache key of one picture: the lane it arrived on and the handle the
+/// client gave it. Both are needed, because two lanes number their handles
+/// independently and a picture belongs to the lane that received it.
+/// Lay out a display formula and append the row that draws it.
+///
+/// Returns false when the engine is unavailable or will not parse the formula,
+/// and the caller shows the source instead. Trying unconditionally is the point:
+/// typeset mathematics is a nicety, and a formula the engine cannot lay out must
+/// not cost the reader the text.
+fn appendFormula(
+    a: std.mem.Allocator,
+    block: markdown.Block,
+    line_height: f32,
+    rows: *std.ArrayList(Row),
+) !bool {
+    if (!math.init(math.resourceDir())) return false;
+    // The engine reads codepoints, not bytes: mathematics is not ASCII, and a
+    // formula holding an integral sign would reach it as UTF-8 it cannot read.
+    var cps: std.ArrayList(u32) = .empty;
+    defer cps.deinit(a);
+    var view = std.unicode.Utf8View.init(block.text) catch return false;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| try cps.append(a, cp);
+    // A terminal's line is about one em tall, which is the unit the engine lays
+    // out in, so a formula comes out the size of the text around it.
+    const formula = math.parseCached(cps.items, line_height, 0, theme.text) orelse return false;
+    const metrics = formula.measure();
+    const tall = @max(metrics.height + metrics.depth, line_height);
+    const held: usize = @intFromFloat(@ceil(tall / line_height));
+    try rows.append(a, .{
+        .formula = .{ .handle = formula, .width = metrics.width, .height = metrics.height, .depth = metrics.depth },
+        .lines = held,
+    });
+    // The walk draws one line per row, so a formula claims its height the way a
+    // picture does: it occupies the rows it needs and the ones it does not draw
+    // belong to it. Without these, a formula taller than a line was drawn over
+    // whatever came next.
+    for (1..held) |_| try rows.append(a, .{ .continuation = true });
+    return true;
+}
+
+fn imageKey(lane: usize, seq: usize) u64 {
+    return @as(u64, lane) << 32 | @as(u64, @truncate(seq));
+}
 
 /// A block's own marker, as the agent wrote it: how much of the line it takes
 /// up, and the token a list draws in its margin.
@@ -3816,21 +5395,21 @@ const Shape = struct {
 };
 
 /// The rows of one parsed document, for the transcript that has no calls in it.
-fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32) ![]const Row {
+pub fn transcriptRows(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32, line_height: f32) ![]const Row {
     var rows: std.ArrayList(Row) = .empty;
-    try transcriptBlocks(a, blocks, columns, advance, &rows);
+    try transcriptBlocks(a, blocks, columns, advance, line_height, &rows);
     return rows.toOwnedSlice(a);
 }
 
 /// Append the rows of one stretch of prose. A stretch the reader will not parse
 /// is wrapped plainly and the failure is reported, but its rows are still rows:
 /// what is around it is drawn either way.
-fn appendProse(a: std.mem.Allocator, bytes: []const u8, columns: usize, advance: f32, rows: *std.ArrayList(Row), failure: *?anyerror) !void {
+fn appendProse(a: std.mem.Allocator, bytes: []const u8, columns: usize, advance: f32, line_height: f32, rows: *std.ArrayList(Row), failure: *?anyerror) !void {
     const blocks = markdown.parse(a, bytes) catch |err| {
         failure.* = err;
         return wrappedRows(a, try spansOf(a, bytes, theme.text), .{ .columns = columns, .advance = advance }, rows);
     };
-    try transcriptBlocks(a, blocks, columns, advance, rows);
+    try transcriptBlocks(a, blocks, columns, advance, line_height, rows);
 }
 
 /// Whether a call is one of the calls a lane is showing, which is what says its
@@ -3847,8 +5426,9 @@ fn hasCall(calls: []const ToolCall, id: []const u8) bool {
 ///
 /// The column a block wraps at is the panel's, less whatever its own marker
 /// takes, so a continuation line starts where the text above it does.
-fn transcriptBlocks(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32, rows: *std.ArrayList(Row)) !void {
+fn transcriptBlocks(a: std.mem.Allocator, blocks: []const markdown.Block, columns: usize, advance: f32, line_height: f32, rows: *std.ArrayList(Row)) !void {
     for (blocks) |block| {
+        const block_start = rows.items.len;
         const shape = Shape{ .columns = columns, .advance = advance };
         switch (block.kind) {
             // A heading is one line at any column: a wrapped heading would not
@@ -3880,8 +5460,122 @@ fn transcriptBlocks(a: std.mem.Allocator, blocks: []const markdown.Block, column
             },
             .rule => try rows.append(a, .{ .rule = true }),
             .code => try codeRows(a, block, columns, advance, rows),
+            .table => try tableRows(a, block, shape, rows),
+            // A display formula is typeset by the TeX engine and drawn as the
+            // mathematics it is. When the engine cannot lay it out - it is not
+            // loaded, or the formula is not valid TeX - the source is shown
+            // instead, indented and in a role of its own so it does not read as
+            // a paragraph that happens to contain backslashes. The parser hands
+            // over the body with its delimiters already taken off, so there is
+            // nothing to strip here.
+            .math => {
+                if (!try appendFormula(a, block, line_height, rows)) {
+                    try wrappedRows(a, try spansOf(a, block.text, theme.purple), .{ .columns = columns, .advance = advance, .indent = 2 }, rows);
+                }
+            },
+        }
+        // Every row this block produced remembers what produced it. Doing it
+        // here rather than in each arm means a new block kind is stamped by
+        // existing, and an arm that draws nothing is a count of zero rather
+        // than a silent absence.
+        for (rows.items[block_start..]) |*row| row.block = block.kind;
+    }
+}
+
+/// One table as the rows the panel draws.
+///
+/// The parser has already split the cells and read the alignments, so drawing a
+/// table is placement: every cell padded to its column's width and aligned the
+/// way the delimiter row asked, two spaces between the columns, and a hairline
+/// where the delimiter row was.
+///
+/// The dock is about 44 columns wide at its default size, which a three-column
+/// table of prose does not fit in, and a table drawn anyway would be shredded
+/// across the panel. So a table whose columns together ask for more than the
+/// panel has is drawn as the source it was written as - the agent's own pipes,
+/// wrapped. Nothing is truncated either way: a body row carrying more cells
+/// than the delimiter row named gets a column of its own rather than losing
+/// them.
+fn tableRows(a: std.mem.Allocator, block: markdown.Block, shape: Shape, rows: *std.ArrayList(Row)) !void {
+    const count = tableColumns(block);
+    if (count == 0) return;
+    const widths = try tableWidths(a, block, count);
+    if (tableWidth(widths) > shape.columns) {
+        try wrappedRows(a, try spansOf(a, block.text, theme.muted), shape, rows);
+        return;
+    }
+    for (block.rows, 0..) |row, index| {
+        const line = try tableLine(a, row, widths, block.aligns, count);
+        const fg = if (index == 0) theme.accent else theme.text;
+        try rows.append(a, shape.row(try spansOf(a, line, fg), false));
+        // The delimiter row is the one line of a table that draws no cells: it
+        // is the hairline between the header and what follows it, and a table
+        // with no body has nothing to put under it.
+        if (index == 0 and block.rows.len > 1) try rows.append(a, .{ .rule = true });
+    }
+}
+
+/// The columns a table is drawn in: the ones its delimiter row named, or the
+/// widest row the parser kept, whichever is more.
+fn tableColumns(block: markdown.Block) usize {
+    var count = block.aligns.len;
+    for (block.rows) |row| count = @max(count, row.len);
+    return count;
+}
+
+/// How wide each column is: as wide as its widest cell, and no wider.
+fn tableWidths(a: std.mem.Allocator, block: markdown.Block, count: usize) ![]usize {
+    const widths = try a.alloc(usize, count);
+    @memset(widths, 0);
+    for (block.rows) |row| {
+        for (row, 0..) |cell, index| {
+            if (index >= count) break;
+            widths[index] = @max(widths[index], countCells(cell));
         }
     }
+    return widths;
+}
+
+/// The cells of one table row, as the one line the row is drawn as.
+fn tableLine(a: std.mem.Allocator, row: markdown.Row, widths: []const usize, aligns: []const markdown.Align, count: usize) ![]const u8 {
+    var line: std.ArrayList(u8) = .empty;
+    for (0..count) |index| {
+        if (index > 0) try line.appendSlice(a, "  ");
+        // A ragged row is kept as the agent wrote it: a cell it never wrote is
+        // a blank one, which is what padding the column to its width means.
+        const cell = if (index < row.len) row[index] else "";
+        try appendAligned(a, &line, cell, widths[index], alignOf(aligns, index));
+    }
+    return line.toOwnedSlice(a);
+}
+
+/// One cell padded to its column: its text, and the spaces the column's
+/// alignment puts on either side of it.
+fn appendAligned(a: std.mem.Allocator, line: *std.ArrayList(u8), cell: []const u8, width: usize, justify: markdown.Align) !void {
+    const slack = width -| countCells(cell);
+    const before = switch (justify) {
+        .left => 0,
+        .center => slack / 2,
+        .right => slack,
+    };
+    for (0..before) |_| try line.append(a, ' ');
+    try line.appendSlice(a, cell);
+    for (before..slack) |_| try line.append(a, ' ');
+}
+
+/// A column's alignment. A column past the ones the delimiter row named - the
+/// extra cell of a row the agent wrote wider than its header - is left aligned,
+/// which is what a column that names no side reads as.
+fn alignOf(aligns: []const markdown.Align, index: usize) markdown.Align {
+    return if (index < aligns.len) aligns[index] else .left;
+}
+
+/// The width a table's columns ask for together: every column, and the two
+/// spaces between each pair of them.
+fn tableWidth(widths: []const usize) usize {
+    var total: usize = 0;
+    for (widths) |width| total += width;
+    return total + 2 * (widths.len -| 1);
 }
 
 /// Wrap coloured runs the way `wrap.spans` wraps one string, and append one row
@@ -3948,7 +5642,17 @@ fn emitRow(a: std.mem.Allocator, spans: []const Span, start: Place, end: Place, 
     while (run < spans.len and run <= end.run) : (run += 1) {
         const from = if (run == start.run) start.at else 0;
         const to = if (run == end.run) end.at else spans[run].text.len;
-        if (to > from) try row.append(a, .{ .text = spans[run].text[from..to], .fg = spans[run].fg });
+        // The piece is the whole run with a shorter text, not a new run with
+        // the same colour: a span carries more than its words and its colour -
+        // where a link goes, whether a rule is drawn through it - and a field
+        // added later has to survive being wrapped without anyone remembering
+        // to add it here. Copying the run and narrowing the text is what makes
+        // a wrapped link clickable on every row it occupies.
+        if (to > from) {
+            var piece = spans[run];
+            piece.text = spans[run].text[from..to];
+            try row.append(a, piece);
+        }
     }
     try out.append(a, try row.toOwnedSlice(a));
 }
@@ -3979,10 +5683,30 @@ fn inlineSpans(a: std.mem.Allocator, inlines: []const markdown.Inline, base: the
             left = 0;
         }
         if (bytes.len == 0) continue;
-        try spans.append(a, .{ .text = bytes, .fg = switch (run.kind) {
-            .code => theme.accent,
-            .plain, .bold, .italic => base,
-        } });
+        try spans.append(a, .{
+            .text = bytes,
+            .fg = switch (run.kind) {
+                .code => theme.accent,
+                // A link's words and the address it shows are marked in the two
+                // roles that say "this is not body text" without shouting: the
+                // address is the quieter of the two, because it is there to be
+                // recognised rather than read.
+                .link => theme.blue,
+                .link_url => theme.muted,
+                // A struck run is muted and carries a rule through it. The
+                // colour alone was the honest floor rather than the answer: a
+                // retraction a reader has to read twice is one they will miss.
+                .strike => theme.muted,
+                // A formula is set apart from the words around it in colour
+                // rather than in type, because the source is what is drawn: we
+                // do not typeset LaTeX yet, and a sentence carrying `\alpha`
+                // is not the sentence the agent wrote.
+                .math => theme.purple,
+                .plain, .bold, .italic => base,
+            },
+            .strike = run.kind == .strike,
+            .destination = if (run.kind == .link) run.destination else "",
+        });
     }
     return spans.toOwnedSlice(a);
 }

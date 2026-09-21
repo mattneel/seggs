@@ -246,6 +246,14 @@ fn selectorIn(a: Allocator, object: std.json.ObjectMap) !?[]const u8 {
 /// A colour field, parsed. Absent, empty and null all mean the theme does not
 /// set the key, which keeps the default: published themes leave keys at null
 /// where they do not mean them, and that is not the same as a malformed value.
+///
+/// `"inherit"` is read the same way, and deliberately so rather than because it
+/// is unparseable. It is what a theme writes where a scope takes the colour of
+/// the scope it sits inside - `one-light` writes it for punctuation inside a
+/// Ruby symbol - and a rule that sets no colour is how this editor spells that:
+/// `ui.theme.styleFor` lets an earlier, broader rule's colour stand, so the
+/// colour is inherited instead of replaced. Anything else in a colour field
+/// that is not a colour is a fault, and is named as one.
 fn colorIn(object: std.json.ObjectMap, key: []const u8) !?theme.Color {
     const value = object.get(key) orelse return null;
     const text = switch (value) {
@@ -254,6 +262,7 @@ fn colorIn(object: std.json.ObjectMap, key: []const u8) !?theme.Color {
         else => return error.InvalidColor,
     };
     if (text.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(text, "inherit")) return null;
     return theme.colorFromHex(text) orelse error.InvalidColor;
 }
 
@@ -419,6 +428,43 @@ test "a theme with no rules is still ready to be given back" {
     const unnamed = try parse(a, "{}");
     defer theme.deinit(unnamed, a);
     try testing.expectEqualStrings(theme.defaults().name, unnamed.name);
+}
+
+test "a rule that inherits takes the colour of the rule it sits inside" {
+    const a = testing.allocator;
+    // The shape `one-light` uses, in the terms this editor matches selectors in:
+    // a broad rule colours a symbol, and a narrower rule for punctuation inside
+    // it asks to inherit. What a theme means by that is "leave this to the scope
+    // around me", so the broad rule has to stay standing. A reader that resolved
+    // `inherit` to the window's foreground instead would replace it, and would
+    // win, because the narrow rule is the one that comes last.
+    const document =
+        \\{ "name": "Inherit",
+        \\  "colors": { "editor.foreground": "#111111" },
+        \\  "tokenColors": [
+        \\    { "scope": "constant.other.symbol", "settings": { "foreground": "#aa0000" } },
+        \\    { "scope": "constant.other.symbol.punctuation", "settings": { "foreground": "inherit", "fontStyle": "bold" } }
+        \\  ] }
+    ;
+    const imported = try parse(a, document);
+    defer theme.deinit(imported, a);
+
+    // The window's foreground is the one a fallback would have used, and it is
+    // not what any of these rules resolves to.
+    try expectColor("#111111", imported.chrome.text);
+
+    // The inheriting rule is kept - it still carries a style - and it carries no
+    // colour of its own, which is the whole of what `inherit` says.
+    try testing.expectEqual(@as(usize, 2), imported.syntax.len);
+    try testing.expect(imported.syntax[1].fg == null);
+    try testing.expect(imported.syntax[1].bold);
+
+    // So the punctuation inside a symbol is the symbol's colour, with the weight
+    // the rule asked for, and the symbol itself is unchanged.
+    const punctuation = theme.styleFor(imported, "constant.other.symbol.punctuation");
+    try expectColor("#aa0000", punctuation.fg.?);
+    try testing.expect(punctuation.bold);
+    try expectColor("#aa0000", theme.styleFor(imported, "constant.other.symbol").fg.?);
 }
 
 test "a theme file reports each fault under its own name" {

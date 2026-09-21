@@ -110,6 +110,30 @@ pub const Host = struct {
         return self.status_buf[0..self.status_len];
     }
 
+    /// Run one file through the engine the editor embeds and report what it
+    /// said, without keeping it as an extension.
+    ///
+    /// This is `loadOne` with nothing kept: a file being tried out is not an
+    /// extension the editor will hold, and what matters is what it reports
+    /// rather than what it registers. It exists because the engine here is not
+    /// the same thing as a `qjs` from a package manager - a bundle that behaves
+    /// one way under one and another way under the other is a bundle whose
+    /// author cannot trust either.
+    ///
+    /// The report comes back through `seggs.status`, which is the channel a
+    /// real extension already has, so a file written to be tested this way is
+    /// written the way a bundle is. A file that fails to parse reports why, in
+    /// the same words the editor would log.
+    pub fn runFile(self: *Host, path: []const u8, out: *std.ArrayList(u8)) !bool {
+        const extension = try self.loadOne(path);
+        if (!extension.ok()) {
+            try out.appendSlice(self.allocator, extension.problem.items);
+            return false;
+        }
+        try out.appendSlice(self.allocator, self.status());
+        return true;
+    }
+
     fn setStatus(self: *Host, msg: []const u8) void {
         const n = @min(msg.len, self.status_buf.len);
         @memcpy(self.status_buf[0..n], msg[0..n]);

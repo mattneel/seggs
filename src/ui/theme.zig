@@ -12,8 +12,19 @@
 //! selectors. A key that is absent keeps the default below, so a document may
 //! be two colours or a full theme.
 //!
-//! Colours are `#rgb`, `#rrggbb`, or `#rrggbbaa` in the document and `[4]f32`
-//! in the renderer: straight, not premultiplied, with the alpha included.
+//! Colours are `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa` in the document and
+//! `[4]f32` in the renderer: straight, not premultiplied, with the alpha
+//! included. The four-digit spelling is here because a VS Code theme carries it
+//! - `#0000` for a transparent black, `#ffff` for an opaque white - and a theme
+//! that ships it is a theme this editor has to read.
+//!
+//! A rule that sets no foreground is not a rule without a colour: it is how a
+//! theme says `inherit`, and it is deliberate. `styleFor` composes rules in
+//! document order, so a narrow rule that sets nothing leaves the earlier, broader
+//! rule's colour standing - which is what a scope inheriting from the scope
+//! around it means. An importer that resolved `inherit` to a default colour
+//! instead would override the very rule it was written to inherit from, so an
+//! absent field stays absent and no fallback belongs here.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
@@ -25,16 +36,29 @@ pub fn rgb(value: u24) Color {
     return fromBytes(@truncate(value >> 16), @truncate(value >> 8), @truncate(value), 255);
 }
 
-/// One colour from `#rgb`, `#rrggbb`, or `#rrggbbaa`, or null when the text is
-/// not a colour. Published because a theme imported from another editor's file
-/// spells its colours the same way.
+/// One colour from `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`, or null when the
+/// text is not a colour. Published because a theme imported from another
+/// editor's file spells its colours the same way.
 pub fn colorFromHex(hex: []const u8) ?Color {
     if (hex.len < 2 or hex[0] != '#') return null;
     const digits = hex[1..];
+    // The four spellings are the four lengths, and a length that is not one of
+    // them is not a colour: five and seven digits are the shapes a typo makes,
+    // and a theme that means `#rgba` must not be read as `#rrggbb` with a byte
+    // missing. The short forms expand a nibble to its own byte, `f` to `ff`.
     return switch (digits.len) {
-        3 => nibbles: {
+        3 => rgb_nibbles: {
             const value = std.fmt.parseInt(u12, digits, 16) catch return null;
-            break :nibbles fromBytes(spread(@truncate((value >> 8) & 0xf)), spread(@truncate((value >> 4) & 0xf)), spread(@truncate(value & 0xf)), 255);
+            break :rgb_nibbles fromBytes(spread(@truncate((value >> 8) & 0xf)), spread(@truncate((value >> 4) & 0xf)), spread(@truncate(value & 0xf)), 255);
+        },
+        4 => rgba_nibbles: {
+            const value = std.fmt.parseInt(u16, digits, 16) catch return null;
+            break :rgba_nibbles fromBytes(
+                spread(@truncate((value >> 12) & 0xf)),
+                spread(@truncate((value >> 8) & 0xf)),
+                spread(@truncate((value >> 4) & 0xf)),
+                spread(@truncate(value & 0xf)),
+            );
         },
         6 => six: {
             const value = std.fmt.parseInt(u24, digits, 16) catch return null;
@@ -507,9 +531,12 @@ test "the default theme round-trips through a document" {
     try expectSameTheme(defaults(), theme);
 }
 
-test "the three colour spellings parse to their components" {
+test "the four colour spellings parse to their components" {
     const document =
-        \\{ "chrome": { "background": "#123", "panel": "#102030", "raised": "#10203040" } }
+        \\{ "chrome": {
+        \\  "background": "#123", "panel": "#102030", "raised": "#10203040",
+        \\  "text": "#1234", "muted": "#0000", "accent": "#ffff"
+        \\} }
     ;
     const theme = try parse(testing.allocator, document);
     defer deinit(theme, testing.allocator);
@@ -517,11 +544,20 @@ test "the three colour spellings parse to their components" {
     try expectSameColor(rgb(0x112233), theme.chrome.background);
     try expectSameColor(rgb(0x102030), theme.chrome.panel);
     try expectSameColor(fromBytes(0x10, 0x20, 0x30, 0x40), theme.chrome.raised);
+    // The four-digit spelling is `#rgba`, expanded the way `#rgb` is: a nibble
+    // becomes its own byte, and the fourth one is the alpha. A transparent black
+    // and an opaque white are what a VS Code theme writes them as.
+    try expectSameColor(fromBytes(0x11, 0x22, 0x33, 0x44), theme.chrome.text);
+    try expectSameColor(fromBytes(0x00, 0x00, 0x00, 0x00), theme.chrome.muted);
+    try expectSameColor(fromBytes(0xff, 0xff, 0xff, 0xff), theme.chrome.accent);
     // A key left out keeps the colour the editor shipped with.
-    try expectSameColor(rgb(0xdce2ed), theme.chrome.text);
+    try expectSameColor(rgb(0xf38ba8), theme.chrome.red);
 
     try testing.expectError(error.InvalidColor, parse(testing.allocator, "{\"chrome\": {\"text\": \"nope\"}}"));
+    // Five and seven digits are the shapes a typo makes, and neither is read as
+    // the spelling one digit away from it.
     try testing.expectError(error.InvalidColor, parse(testing.allocator, "{\"chrome\": {\"text\": \"#12345\"}}"));
+    try testing.expectError(error.InvalidColor, parse(testing.allocator, "{\"chrome\": {\"text\": \"#1234567\"}}"));
     try testing.expectError(error.InvalidColor, parse(testing.allocator, "{\"chrome\": {\"text\": 5}}"));
 }
 

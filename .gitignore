@@ -16,3 +16,6 @@ __pycache__/
 .seggs/
 # Built book output.
 book/
+
+# Firecrawl CLI scratch output, from reading documentation.
+.firecrawl/

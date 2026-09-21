@@ -14,5 +14,10 @@
         "commit": "f64f4aca2c29b554d111b36c3d946a9bddd159ff",
         "zig": "0.16.0",
         "notes": "libghostty-vt is built by the pinned Zig, not by the toolchain in .zigversion, and reaches the editor through the C ABI."
+    },
+    "MicroTex": {
+        "repository": "https://github.com/NanoMichael/MicroTex.git",
+        "commit": "0e3707f6dafebb121d98b53c64364d16fefe481d",
+        "notes": "The TeX engine behind display math, MIT. Fetched rather than built: its CMake insists on a GUI backend on Linux (gtkmm or Qt), and the library has no such dependency - the base source list is 78 C++ files that compile with nothing but a C++17 compiler and tinyxml2, and the drawing is supplied by the editor through the library's own abstract Graphics2D interface. Its fonts are C++ source (src/res/font/*.def.cpp) rather than a font binary, so nothing here is a font binary in the repository. tinyxml2 is a system dependency, like FreeType for SDL_ttf."
     }
 }

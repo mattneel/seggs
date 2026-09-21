@@ -17,6 +17,17 @@ const help =
     \\F5 starts the selected agent. Ctrl+L focuses the prompt.
     \\Ctrl+Enter sends to that agent. Ctrl+Shift+Enter picks a destination.
     \\Ctrl+Shift+A opens an agent. F11 toggles fullscreen. Ctrl+Q quits.
+    \\
+    \\QA flags, for looking at a frame with nobody in front of it:
+    \\  --screenshot PATH  Write the last frame to PATH. The extension picks the
+    \\                     format: .png, .bmp, .gif, .jpg, or .ppm.
+    \\  --frames N         Stop after N frames, so a run ends without a window
+    \\                     manager's help. The capture is of the last frame.
+    \\  --exercise-NAME    Drive a path and leave it up for the capture. Each one
+    \\                     reaches the state a person would rather than asserting
+    \\                     it from the code. Names: window ime click terminal run
+    \\                     compose tabs markdown transcript toolcalls records
+    \\                     formula liveness themes embedded.
 ;
 
 pub fn main(init: std.process.Init) !void {
@@ -30,6 +41,11 @@ fn run(init: std.process.Init) !void {
     const a = init.gpa;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
+    // A subcommand is a word rather than a flag: `seggs seggsc exec <file>`
+    // runs one SeggsC file and exits without opening a window. It is here
+    // because the engine the editor embeds is not a `qjs` from a package
+    // manager, and an author testing a bundle needs the engine that ships.
+    if (args.len > 1 and std.mem.eql(u8, args[1], "seggsc")) return runSeggsC(init, args[2..]);
     var workspace_arg: []const u8 = ".";
     var file_arg: ?[]const u8 = null;
     var config_arg: ?[]const u8 = null;
@@ -46,7 +62,11 @@ fn run(init: std.process.Init) !void {
     var exercise_markdown = false;
     var exercise_transcript = false;
     var exercise_toolcalls = false;
+    var exercise_records = false;
+    var exercise_formula = false;
     var exercise_liveness = false;
+    var exercise_themes = false;
+    var exercise_embedded = false;
     var window_width: c_int = 1440;
     var window_height: c_int = 900;
     var fullscreen_override: ?bool = null;
@@ -84,8 +104,16 @@ fn run(init: std.process.Init) !void {
             exercise_transcript = true;
         } else if (std.mem.eql(u8, arg, "--exercise-toolcalls")) {
             exercise_toolcalls = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-records")) {
+            exercise_records = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-formula")) {
+            exercise_formula = true;
         } else if (std.mem.eql(u8, arg, "--exercise-liveness")) {
             exercise_liveness = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-themes")) {
+            exercise_themes = true;
+        } else if (std.mem.eql(u8, arg, "--exercise-embedded")) {
+            exercise_embedded = true;
         } else {
             if (index + 1 >= args.len) return error.MissingArgument;
             index += 1;
@@ -163,7 +191,7 @@ fn run(init: std.process.Init) !void {
     }
     std.log.info("fallbacks: {d} registered", .{renderer.fallbackFontCount()});
     std.log.info("atlas: advance {d:.2}, line height {d:.2}", .{ renderer.atlas.advance, renderer.atlas.line_height });
-    var app = try App.init(a, window, config, root);
+    var app = try App.init(a, init.io, window, config, root);
     defer app.deinit();
     var host = Host.init(a);
     defer host.deinit();
@@ -256,11 +284,15 @@ fn run(init: std.process.Init) !void {
         if (exercise_markdown) exerciseMarkdown(&app, frames);
         if (exercise_transcript) exerciseTranscript(&app, frames);
         if (exercise_toolcalls) exerciseToolCalls(&app, frames);
-        if (exercise_liveness) exerciseLiveness(&app, frames, &renderer, liveness_working_shot);
+        if (exercise_records) exerciseRecords(&app, frames);
+        if (exercise_formula) exerciseFormula(&app, frames);
+        if (exercise_liveness) exerciseLiveness(&app, frames, &renderer, init.io, a, liveness_working_shot);
+        if (exercise_themes) app.exerciseThemes(frames);
+        if (exercise_embedded) exerciseEmbedded(&app, frames);
         if (frames_limit) |limit| if (frames >= limit) break;
     }
     if (screenshot_arg) |path| {
-        try renderer.capture(path);
+        try renderer.capture(init.io, a, path);
         std.log.info("screenshot: {s}", .{path});
     }
     std.log.info("atlas: {d} glyphs packed, {d} placeholder hits", .{ renderer.atlas.glyphCount(), renderer.atlas.missing });
@@ -641,6 +673,35 @@ const markdown_sample =
     \\
     \\# Transcript, as markdown
     \\
+    \\A table the panel has room for:
+    \\
+    \\| shape | field |
+    \\| --- | --- |
+    \\| read | path |
+    \\| run | exit code |
+    \\
+    \\And one it has not, so it falls back to the source it was written in rather
+    \\than shredding the columns across the dock:
+    \\
+    \\| first column long enough to overrun | second column long enough as well | third |
+    \\| --- | --- | --- |
+    \\| a cell | another cell | a third cell |
+    \\
+    \\Inline math such as $E = mc^2$ sits inside the sentence, and a display
+    \\formula is set apart:
+    \\
+    \\$$
+    \\\int_0^1 x^2 dx = \frac{1}{3}
+    \\$$
+    \\
+    \\Prices are not formulas: $5 and $10 stay as they were written.
+    \\
+    \\A ~~struck word~~ is drawn with a rule through it, so a retraction is
+    \\visible rather than merely quiet.
+    \\
+    \\See [the ACP specification](https://agentclientprotocol.com/) for what an
+    \\agent is allowed to ask for.
+    \\
     \\An agent's message with **bold**, *italic*, and `inline code`, wrapped at
     \\the panel's column rather than at the one the agent happened to choose.
     \\
@@ -716,6 +777,10 @@ fn exerciseMarkdown(app: *App, frame: usize) void {
 /// Whether the transcript panel has been asked the two things it can get wrong.
 var transcript_scrolled = false;
 var transcript_oversize = false;
+var transcript_link_clicked = false;
+var transcript_link_reported = false;
+var transcript_census_reported = false;
+var transcript_link_frame: usize = 0;
 
 /// The transcript panel under strain, with no harness in the way: the markdown
 /// sample is written straight into the lane's buffer with enough filler after
@@ -762,6 +827,37 @@ fn exerciseTranscript(app: *App, frame: usize) void {
         std.log.info("transcript: the wheel asked for 180 rows; the panel stopped at {d} of {d}", .{ app.transcript_scroll, app.transcript_max_scroll });
         return;
     }
+    // The link is clicked on whichever frame it is first drawable rather than
+    // on a fixed one. The panel is drawn only once the lane is up, and how many
+    // frames that takes depends on the machine: a harness that clicks on a
+    // schedule is a harness that fails when the runner is busy. This is the
+    // shape the scroll step above already uses - retry without claiming to have
+    // acted - and the deadline is what keeps a missing link a reported failure
+    // rather than a hang.
+    if (!transcript_link_clicked and frame >= 30 and frame <= 37) {
+        if (app.linkPoint()) |point| {
+            transcript_link_clicked = true;
+            transcript_link_frame = frame;
+            var ev = std.mem.zeroes(c.SDL_Event);
+            ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+            ev.button.button = c.SDL_BUTTON_LEFT;
+            ev.button.x = point.x;
+            ev.button.y = point.y;
+            if (!c.SDL_PushEvent(&ev)) std.log.err("transcript: the link click was not delivered", .{});
+        } else if (frame == 37) {
+            std.log.err("transcript: no link was drawn to click", .{});
+        }
+        return;
+    }
+    if (transcript_link_clicked and !transcript_link_reported and frame >= transcript_link_frame + 1) {
+        transcript_link_reported = true;
+        std.log.info("transcript: a click on a link says: {s}", .{app.statusText()});
+    }
+    if (transcript_link_reported and !transcript_census_reported and frame >= transcript_link_frame + 2) {
+        transcript_census_reported = true;
+        var census: [256]u8 = undefined;
+        std.log.info("transcript: blocks drawn: {s}", .{app.transcriptCensus(&census)});
+    }
     if (transcript_oversize and frame == 40) {
         // Past the reader's bound, so the panel has to fall back to the plain
         // wrapped text it drew before markdown, and say so, rather than draw
@@ -785,11 +881,99 @@ var calls_drawn = false;
 var calls_clicked = false;
 var call_reported = false;
 var call_open_before = false;
+var call_chip_clicked = false;
+var call_chip_reported = false;
+var call_open_before_chip = false;
 
 /// The frame the click on a call happens on. It is late enough that a run which
 /// stops before it captures the chips closed, which is what makes the click's
 /// effect a difference in pixels rather than a claim.
 const call_click_frame: usize = 100;
+
+/// `seggs seggsc <verb> [args]` - the extension host driven from a shell.
+///
+/// One verb so far, and it is the one an author needs: run a file and print what
+/// it reported. A window is never opened, which is the point - testing a bundle
+/// should not need a display, and a measurement taken under a running editor is
+/// a measurement of the editor as much as of the bundle.
+fn runSeggsC(init: std.process.Init, rest: []const []const u8) !void {
+    const a = init.gpa;
+    if (rest.len == 0 or std.mem.eql(u8, rest[0], "help")) {
+        std.debug.print("usage: seggs seggsc exec <file.js>\n", .{});
+        return;
+    }
+    if (!std.mem.eql(u8, rest[0], "exec")) {
+        std.debug.print("seggsc: unknown verb '{s}'\nusage: seggs seggsc exec <file.js>\n", .{rest[0]});
+        return error.UnknownArgument;
+    }
+    if (rest.len < 2) {
+        std.debug.print("seggsc exec: no file named\nusage: seggs seggsc exec <file.js>\n", .{});
+        return error.MissingArgument;
+    }
+    var host = Host.init(a);
+    defer host.deinit();
+    var report: std.ArrayList(u8) = .empty;
+    defer report.deinit(a);
+    const ok = host.runFile(rest[1], &report) catch |err| {
+        std.debug.print("seggsc: {s}: {s}\n", .{ rest[1], @errorName(err) });
+        return err;
+    };
+    // The report is what the file said, printed as it said it, so a caller
+    // piping this into a script gets the line and nothing around it.
+    std.debug.print("{s}\n", .{report.items});
+    // A file that did not run has to be distinguishable from one that ran and
+    // said nothing, which is the whole reason a shell checks an exit code: a
+    // test that failed silently is worse than one that failed loudly.
+    if (!ok) std.process.exit(1);
+}
+
+/// Whether an embedded terminal has been reported.
+var embedded_sent = false;
+var embedded_reported = false;
+
+/// A turn whose tool call embeds a terminal: the agent creates one through the
+/// client, announces a call that names it, waits for it, and then releases it.
+///
+/// What this is here to prove is the second half of the protocol's sentence -
+/// the output keeps being displayed after the terminal is released. The report
+/// is taken *after* the release has been answered, so a count above zero at that
+/// point is a screen the editor kept rather than a record the client still had.
+const embedded_report_frame: usize = 150;
+
+fn exerciseEmbedded(app: *App, frame: usize) void {
+    const mock = app.agentIndex("Local mock") orelse return;
+    if (frame == 6) {
+        app.active = mock;
+        app.startAgent() catch |err| std.log.err("embedded: {s}", .{@errorName(err)});
+        return;
+    }
+    if (!embedded_sent) {
+        if (!app.agentReady(mock)) {
+            if (frame > 400) std.log.err("embedded: the harness never came up", .{});
+            return;
+        }
+        embedded_sent = true;
+        app.prompt_text.clearRetainingCapacity();
+        app.prompt_text.appendSlice(app.allocator, "terminal: run something in a terminal") catch |err| {
+            std.log.err("embedded: {s}", .{@errorName(err)});
+            return;
+        };
+        app.pipeTo(mock) catch |err| std.log.err("embedded: {s}", .{@errorName(err)});
+        return;
+    }
+    if (!embedded_reported and frame >= embedded_report_frame) {
+        embedded_reported = true;
+        // The chip as well as the count, because a terminal drawn under nothing
+        // is not what the protocol asks for: the call is what says which command
+        // ran in it.
+        const summary = app.agentToolCalls(mock, app.allocator) catch null;
+        defer if (summary) |text| app.allocator.free(text);
+        std.log.info("embedded: {d} terminal(s) drawn after the agent released it; calls: {s}", .{
+            app.embeddedTerminalsDrawn(),
+            summary orelse "none",
+        });
+    }
+}
 
 /// A transcript of tool calls, drawn as the chips a reader scans.
 ///
@@ -843,10 +1027,14 @@ fn exerciseToolCalls(app: *App, frame: usize) void {
         if (frame < call_click_frame) return;
         calls_clicked = true;
         call_open_before = app.callIsExpanded(mock, "mock-edit");
-        // A click is delivered the way SDL delivers one, so what moves the chip
-        // is the interface's own routing rather than a call into it.
-        const point = app.toolCallPoint("mock-edit") orelse {
-            std.log.err("calls: the edit's chip was not drawn, so the click had nothing to land on", .{});
+        // The click lands on the card's **last** row rather than on its chip.
+        // The card is shut here, so that row is the marker - the line saying how
+        // many lines were withheld - and the point of the marker is that it is
+        // what asks for them. A click is delivered the way SDL delivers one, so
+        // what moves the card is the interface's own routing rather than a call
+        // into it.
+        const point = app.callMarkerPoint("mock-edit") orelse {
+            std.log.err("calls: the edit's last row was not drawn, so the click had nothing to land on", .{});
             return;
         };
         var ev = std.mem.zeroes(c.SDL_Event);
@@ -865,11 +1053,180 @@ fn exerciseToolCalls(app: *App, frame: usize) void {
             openWord(app.callIsExpanded(mock, "mock-edit")),
         });
     }
+    if (call_reported and !call_chip_clicked and frame >= call_click_frame + 4) {
+        call_chip_clicked = true;
+        call_open_before_chip = app.callIsExpanded(mock, "mock-edit");
+        // The other end: the chip itself, on a card that is now open, has to
+        // close it. Both halves are the same routing, so a card that opens and
+        // will not close is a card whose hit covers the wrong rows.
+        const point = app.toolCallPoint("mock-edit") orelse {
+            std.log.err("calls: the edit's chip was not drawn, so the click had nothing to land on", .{});
+            return;
+        };
+        var ev = std.mem.zeroes(c.SDL_Event);
+        ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+        ev.button.button = c.SDL_BUTTON_LEFT;
+        ev.button.clicks = 1;
+        ev.button.x = point.x;
+        ev.button.y = point.y;
+        if (!c.SDL_PushEvent(&ev)) std.log.warn("calls: the chip click was not delivered", .{});
+        return;
+    }
+    if (call_chip_clicked and !call_chip_reported and frame >= call_click_frame + 6) {
+        call_chip_reported = true;
+        std.log.info("calls: the click on the edit changed open {s} -> {s}", .{
+            openWord(call_open_before_chip),
+            openWord(app.callIsExpanded(mock, "mock-edit")),
+        });
+    }
 }
 
 /// Whether a call is open, as the report words it.
 fn openWord(open: bool) []const u8 {
     return if (open) "true" else "false";
+}
+
+/// Whether the records turn has been sent, caught arriving, reported, and
+/// clicked.
+var records_sent = false;
+var records_pulsed = false;
+var records_drawn = false;
+var records_clicked = false;
+var records_reported = false;
+var record_open_before = false;
+
+/// The frame the click on a run happens on, for the same reason the calls'
+/// click is late: what the click changes has to be a difference rather than a
+/// claim about the frame it arrived in.
+const record_click_frame: usize = 160;
+
+/// A turn of reasoning, a plan, usage, a compaction and a mode, drawn as the
+/// records a reader meets them as.
+///
+/// The turn is the one the fixture's `records` prefix answers with, and the
+/// report names every record the drawing half reads rather than the pixels it
+/// became: a chip that says `thinking ● 54 B` here is a chip that says it on
+/// screen. The click opens the reasoning, which is the one thing in the
+/// transcript a reader most needs to be able to do and the easiest to get
+/// wrong, because a run has no agent id to be keyed by - it is keyed by the
+/// handle the client gave it.
+/// Show display mathematics in a transcript and leave it up for the capture.
+///
+/// The formula path runs from the markdown parser through the TeX engine to the
+/// renderer, and every one of those can be right while the reader still sees
+/// backslashes: the parser has to recognise the form the agent wrote, the
+/// typesetter has to lay it out, and the row has to claim the height it draws
+/// over. Only looking at the panel says whether all three happened.
+fn exerciseFormula(app: *App, frame: usize) void {
+    const mock = app.agentIndex("Local mock") orelse {
+        std.log.err("formula: no local mock profile", .{});
+        return;
+    };
+    if (frame == 6) {
+        app.active = mock;
+        app.startAgent() catch |err| std.log.err("formula: {s}", .{@errorName(err)});
+        return;
+    }
+    if (formula_sent) return;
+    if (!app.agentReady(mock)) return;
+    formula_sent = true;
+    app.prompt_text.clearRetainingCapacity();
+    app.prompt_text.appendSlice(app.allocator, "math: show me some mathematics") catch |err| {
+        std.log.err("formula: {s}", .{@errorName(err)});
+        return;
+    };
+    app.pipeTo(mock) catch |err| std.log.err("formula: {s}", .{@errorName(err)});
+}
+
+var formula_sent = false;
+
+fn exerciseRecords(app: *App, frame: usize) void {
+    const mock = app.agentIndex("Local mock") orelse {
+        std.log.err("records: no local mock profile", .{});
+        return;
+    };
+    if (frame == 6) {
+        app.active = mock;
+        app.startAgent() catch |err| std.log.err("records: {s}", .{@errorName(err)});
+        return;
+    }
+    if (!records_sent) {
+        if (!app.agentReady(mock)) {
+            if (frame > 400) std.log.err("records: the harness never came up", .{});
+            return;
+        }
+        records_sent = true;
+        app.prompt_text.clearRetainingCapacity();
+        app.prompt_text.appendSlice(app.allocator, "records: show what a session is doing") catch |err| {
+            std.log.err("records: {s}", .{@errorName(err)});
+            return;
+        };
+        app.pipeTo(mock) catch |err| std.log.err("records: {s}", .{@errorName(err)});
+        return;
+    }
+    if (!records_pulsed) {
+        // The report is taken the moment a run is caught still arriving, rather
+        // than at a frame chosen in advance: what is being checked is that a
+        // reader can see the agent is working, and a frame picked by number
+        // would be checking the fixture's arithmetic instead.
+        if (app.agentStreamCount(mock) == 0 or !app.streamIsStreaming(mock, 0)) {
+            if (app.agentState(mock) == .ready and frame > 400) {
+                std.log.err("records: no run was caught arriving, so the pulse was never drawn", .{});
+            }
+            return;
+        }
+        records_pulsed = true;
+        const live = app.agentRecords(mock, app.allocator) catch return;
+        defer app.allocator.free(live);
+        std.log.info("records: mid-turn {s}", .{live});
+        return;
+    }
+    if (!records_drawn) {
+        // The turn is done when the harness is idle and every run it sent has
+        // arrived: a run still on the wire is not one to report.
+        if (app.agentState(mock) != .ready) {
+            if (frame > 600) std.log.err("records: the harness never finished the turn", .{});
+            return;
+        }
+        if (app.agentStreamCount(mock) < 3) {
+            if (frame > 600) std.log.err("records: the turn produced {d} run(s)", .{app.agentStreamCount(mock)});
+            return;
+        }
+        const summary = app.agentRecords(mock, app.allocator) catch return;
+        defer app.allocator.free(summary);
+        records_drawn = true;
+        std.log.info("records: {d} runs drawn, {s}", .{ app.agentStreamCount(mock), summary });
+        return;
+    }
+    if (!records_clicked) {
+        if (frame < record_click_frame) return;
+        records_clicked = true;
+        // The reasoning is the first run of the turn, which is the one placed
+        // before the answer rather than after it.
+        record_open_before = app.streamIsOpen(mock, 0);
+        const point = app.streamPoint(mock, 0) orelse {
+            std.log.err("records: the reasoning's line was not drawn, so the click had nothing to land on", .{});
+            return;
+        };
+        var ev = std.mem.zeroes(c.SDL_Event);
+        ev.type = c.SDL_EVENT_MOUSE_BUTTON_DOWN;
+        ev.button.button = c.SDL_BUTTON_LEFT;
+        ev.button.clicks = 1;
+        ev.button.x = point.x;
+        ev.button.y = point.y;
+        if (!c.SDL_PushEvent(&ev)) std.log.warn("records: the click was not delivered", .{});
+        return;
+    }
+    if (!records_reported and frame >= record_click_frame + 2) {
+        records_reported = true;
+        const after = app.agentRecords(mock, app.allocator) catch return;
+        defer app.allocator.free(after);
+        std.log.info("records: the click on the reasoning changed open {s} -> {s}", .{
+            openWord(record_open_before),
+            openWord(app.streamIsOpen(mock, 0)),
+        });
+        std.log.info("records: open {s}", .{after});
+    }
 }
 
 /// The two readings a reader has to be able to tell apart: a lane that is
@@ -904,7 +1261,7 @@ const liveness_settled_frames: usize = 4;
 /// the backstop that keeps a broken run from being a run that hangs.
 const liveness_deadline_ms: u64 = 60_000;
 
-fn exerciseLiveness(app: *App, frame: usize, renderer: *Renderer, working_shot: ?[]const u8) void {
+fn exerciseLiveness(app: *App, frame: usize, renderer: *Renderer, io: std.Io, a: std.mem.Allocator, working_shot: ?[]const u8) void {
     if (liveness_started == 0) liveness_started = App.now();
     if (liveness_stalled) return;
     const mock = app.agentIndex("Local mock") orelse {
@@ -941,7 +1298,7 @@ fn exerciseLiveness(app: *App, frame: usize, renderer: *Renderer, working_shot: 
     // here is what a reader would see.
     var line: [256]u8 = undefined;
     const reading = app.activityLine(mock, &line, app.geometry.agents.w);
-    const phase: u8 = @intFromEnum(reading.phase);
+    const phase: u8 = @backingInt(reading.phase);
     if (phase != liveness_phase) {
         liveness_phase = phase;
         liveness_held = 0;
@@ -956,7 +1313,7 @@ fn exerciseLiveness(app: *App, frame: usize, renderer: *Renderer, working_shot: 
             std.log.info("liveness: working reading: \"{s}\" indicator \"{s}\" after {d}ms", .{
                 reading.line, reading.indicator, App.now() -| liveness_started,
             });
-            if (working_shot) |path| renderer.capture(path) catch |err| std.log.err("liveness: {s}", .{@errorName(err)});
+            if (working_shot) |path| renderer.capture(io, a, path) catch |err| std.log.err("liveness: {s}", .{@errorName(err)});
         } else if (!liveness_named and app.agentCallCount(mock) > 0) {
             // The harness has said what it is on, and the line names it: the
             // subject is the latest call's, which is what a reader watching an

@@ -1,5 +1,17 @@
 const std = @import("std");
 
+/// The most pixels every kept picture may add up to: 8 MP, or 32 MB once they
+/// are RGBA. This is the picture space's budget rather than a bound on one
+/// image - `gpu/image.zig` bounds the decode at half of this - and it is
+/// deliberately twice the largest image, so a full-size one never has to empty
+/// the space to fit.
+pub const max_picture_pixels: usize = 8 * 1024 * 1024;
+
+/// The most pictures the renderer remembers. Pixels are what cost and the pixel
+/// budget is what bounds them; this bounds the entries, so a session that
+/// scrolls past hundreds of pictures cannot grow the map without end.
+pub const max_pictures: usize = 64;
+
 var diag_count: usize = 0;
 var shear_log: usize = 0;
 const builtin = @import("builtin");
@@ -7,13 +19,70 @@ const c = @import("native");
 const shaders = @import("shaders");
 const Atlas = @import("atlas.zig").Atlas;
 const Shaper = @import("shaper.zig").Shaper;
+const image = @import("../gpu/image.zig");
 const Rect = @import("../ui/layout.zig").Rect;
 const Color = @import("../ui/theme.zig").Color;
+
+/// A point placed by a 2D affine:
+///
+///     x' = m[0]*x + m[2]*y + m[4]
+///     y' = m[1]*x + m[3]*y + m[5]
+///
+/// The order is the drawing layer's, which is the order the TeX engine composes
+/// its transforms in, so a matrix crosses that boundary without rearrangement.
+fn affinePoint(m: [6]f32, x: f32, y: f32) [2]f32 {
+    return .{ m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5] };
+}
 const text_util = @import("../core/text.zig");
+const zignal = @import("zignal");
 
 pub const Renderer = struct {
     const Vertex = extern struct { position: [2]f32, uv: [2]f32, color: Color };
     const max_vertices = 262_144;
+
+    /// One run of vertices drawn with one texture, in the order they were
+    /// appended. A frame is a single segment - and so a single draw call - for
+    /// as long as everything on it samples the glyph atlas. A picture is not in
+    /// the atlas, so drawing one starts a second segment, and the frame becomes
+    /// a short sequence of draws with a texture rebound between them. The order
+    /// is the order the rows were drawn in, which is what keeps a picture behind
+    /// the rows that come after it exactly as it was before this existed.
+    const Segment = struct { texture: *c.SDL_GPUTexture, first: usize, count: usize };
+
+    /// A decoded picture that is on screen: the texture it lives in, and the
+    /// size the decoder found.
+    pub const Picture = struct { texture: *c.SDL_GPUTexture, width: u32, height: u32 };
+
+    /// What the picture space did with a record: the texture to draw, or the
+    /// reason there is nothing to draw. A failure to allocate is not in here -
+    /// that is the machine's problem and not the image's, so it is an error.
+    pub const Drawn = union(enum) { picture: Picture, refused: image.Refusal };
+
+    /// What the space remembers about one handle: the picture, or why there is
+    /// none, and the frame it was last asked for.
+    const Entry = struct {
+        state: Drawn,
+        last: u64,
+    };
+
+    /// One texture per picture, rather than one packed surface for all of them.
+    ///
+    /// The glyph atlas was the obvious candidate and is the wrong one: it is
+    /// 1024×1024 and holds an alphabet, one picture of any size at all would
+    /// take the room a run of text needs, and the atlas answers a full surface
+    /// with the placeholder glyph - so the failure would land on every piece of
+    /// text on screen rather than on the picture. A picture also has no business
+    /// being a cache entry: it is decoded once and drawn scaled, so its own
+    /// pixels are the whole of what it needs.
+    pictures: std.AutoHashMapUnmanaged(u64, Entry) = .empty,
+    /// The pixels every kept picture adds up to, which is what the space bounds:
+    /// what costs is the bitmaps, not the number of entries.
+    picture_pixels: usize = 0,
+    /// The frame the space is drawing, so that what is evicted is what a reader
+    /// has stopped looking at.
+    frame: u64 = 0,
+    /// Every quad the frame is made of, grouped by the texture it samples.
+    segments: std.ArrayList(Segment) = .empty,
     allocator: std.mem.Allocator,
     window: *c.SDL_Window,
     device: *c.SDL_GPUDevice,
@@ -112,6 +181,9 @@ pub const Renderer = struct {
 
     pub fn deinit(self: *Renderer) void {
         _ = c.SDL_WaitForGPUIdle(self.device);
+        self.segments.deinit(self.allocator);
+        self.releasePictures();
+        self.pictures.deinit(self.allocator);
         self.vertices.deinit(self.allocator);
         self.shaper.deinit();
         self.atlas.deinit();
@@ -125,6 +197,8 @@ pub const Renderer = struct {
 
     pub fn begin(self: *Renderer, width: f32, height: f32) void {
         self.vertices.clearRetainingCapacity();
+        self.segments.clearRetainingCapacity();
+        self.frame += 1;
         self.width = @max(1, width);
         self.height = @max(1, height);
         self.clip = .{ .x = 0, .y = 0, .w = self.width, .h = self.height };
@@ -132,6 +206,91 @@ pub const Renderer = struct {
 
     pub fn rect(self: *Renderer, bounds: Rect, color: Color) !void {
         try self.quad(bounds, .{ .x = Atlas.solid_u, .y = Atlas.solid_v, .w = 0, .h = 0 }, color);
+    }
+
+    /// Four arbitrary corners as two triangles, filled with a solid colour.
+    ///
+    /// Every other quad in this renderer is axis-aligned, because a terminal
+    /// draws nothing that is not. A drawing layer is not, and a line, a rotated
+    /// box, and a stroke all reduce to this one primitive, so this is where the
+    /// rest of the drawing is built from. Corners are in screen coordinates, in
+    /// the order top-left, top-right, bottom-right, bottom-left.
+    pub fn quadCorners(self: *Renderer, corners: [4][2]f32, color: Color) !void {
+        // A quad that falls wholly outside the clip contributes nothing, and
+        // skipping it here keeps a formula scrolled out of its panel from
+        // costing six vertices. The glyph path clips exactly; this one rejects
+        // rather than clips, which is only visible when a shape straddles the
+        // clip edge - a case the caller avoids by not drawing there.
+        var min_x = corners[0][0];
+        var max_x = min_x;
+        var min_y = corners[0][1];
+        var max_y = min_y;
+        for (corners[1..]) |p| {
+            min_x = @min(min_x, p[0]);
+            max_x = @max(max_x, p[0]);
+            min_y = @min(min_y, p[1]);
+            max_y = @max(max_y, p[1]);
+        }
+        if (max_x <= self.clip.x or min_x >= self.clip.x + self.clip.w) return;
+        if (max_y <= self.clip.y or min_y >= self.clip.y + self.clip.h) return;
+        if (self.vertices.items.len + 6 > max_vertices) return error.FrameGeometryLimit;
+        const uv = [2]f32{ Atlas.solid_u, Atlas.solid_v };
+        const tl = self.screenVertex(corners[0], uv, color);
+        const tr = self.screenVertex(corners[1], uv, color);
+        const br = self.screenVertex(corners[2], uv, color);
+        const bl = self.screenVertex(corners[3], uv, color);
+        try self.openSegment(self.atlas.texture);
+        try self.vertices.appendSlice(self.allocator, &.{ tl, bl, tr, tr, bl, br });
+    }
+
+    /// A line of the given width, as a quad spanning the two endpoints.
+    ///
+    /// A terminal never draws one, which is why the renderer had no line until
+    /// the drawing layer wanted a fraction bar. Width is the full width of the
+    /// stroke, centred on the segment; a hairline is a width of one.
+    pub fn line(self: *Renderer, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, color: Color) !void {
+        const dx = x2 - x1;
+        const dy = y2 - y1;
+        const len = @sqrt(dx * dx + dy * dy);
+        if (len <= 0) return;
+        const half = @max(width, 1) * 0.5;
+        // The perpendicular, scaled to half the stroke.
+        const px = -dy / len * half;
+        const py = dx / len * half;
+        try self.quadCorners(.{
+            .{ x1 + px, y1 + py },
+            .{ x2 + px, y2 + py },
+            .{ x2 - px, y2 - py },
+            .{ x1 - px, y1 - py },
+        }, color);
+    }
+
+    /// A filled rectangle placed by a 2D affine, so a drawing layer can scale
+    /// and rotate what it fills. The corners are transformed here rather than in
+    /// the shader: there is one transform per shape, not one per vertex.
+    pub fn rectTransformed(self: *Renderer, x: f32, y: f32, w: f32, h: f32, m: [6]f32, color: Color) !void {
+        if (w <= 0 or h <= 0) return;
+        try self.quadCorners(.{
+            affinePoint(m, x, y),
+            affinePoint(m, x + w, y),
+            affinePoint(m, x + w, y + h),
+            affinePoint(m, x, y + h),
+        }, color);
+    }
+
+    fn screenVertex(self: *const Renderer, p: [2]f32, uv: [2]f32, color: Color) Vertex {
+        return .{
+            .position = .{ p[0] / self.width * 2 - 1, 1 - p[1] / self.height * 2 },
+            .uv = .{ uv[0], uv[1] },
+            .color = color,
+        };
+    }
+
+    /// The advance a codepoint would take, without drawing it. A drawing layer
+    /// asks for a width before it decides where to put the ink; the terminal
+    /// never does, because it moves the pen as it draws.
+    pub fn glyphAdvance(self: *Renderer, cp: u21) f32 {
+        return self.atlas.advanceFor(cp);
     }
 
     /// Draw one codepoint at pen `x` on the baseline `y`, and return the
@@ -216,6 +375,12 @@ pub const Renderer = struct {
     /// draws italic without a second face by leaning the glyph; the atlas holds
     /// one upright bitmap, so the lean is geometry.
     fn quadSheared(self: *Renderer, bounds: Rect, uv: Rect, color: Color, shear: f32) !void {
+        return self.texturedQuad(bounds, uv, color, shear, self.atlas.texture);
+    }
+
+    /// One textured quad, sampled from `texture`: what a glyph and a picture
+    /// have in common, and the only place a picture differs from a glyph.
+    fn texturedQuad(self: *Renderer, bounds: Rect, uv: Rect, color: Color, shear: f32, texture: *c.SDL_GPUTexture) !void {
         if (bounds.w <= 0 or bounds.h <= 0) return;
         const x0 = @max(bounds.x, self.clip.x);
         const y0 = @max(bounds.y, self.clip.y);
@@ -236,7 +401,185 @@ pub const Renderer = struct {
         const tr: Vertex = .{ .position = .{ right + offset, top }, .uv = .{ u_max, v_min }, .color = color };
         const bl: Vertex = .{ .position = .{ left, bottom }, .uv = .{ u_min, v_max }, .color = color };
         const br: Vertex = .{ .position = .{ right, bottom }, .uv = .{ u_max, v_max }, .color = color };
+        try self.openSegment(texture);
         try self.vertices.appendSlice(self.allocator, &.{ tl, bl, tr, tr, bl, br });
+    }
+
+    /// Point the next six vertices at `texture`, extending the current segment
+    /// when it already samples it. A segment is opened only when a quad is
+    /// actually appended, so a row clipped out of its panel does not leave an
+    /// empty draw behind.
+    fn openSegment(self: *Renderer, texture: *c.SDL_GPUTexture) !void {
+        if (self.segments.items.len != 0) {
+            const last = &self.segments.items[self.segments.items.len - 1];
+            if (last.texture == texture) {
+                last.count += 6;
+                return;
+            }
+        }
+        try self.segments.append(self.allocator, .{ .texture = texture, .first = self.vertices.items.len, .count = 6 });
+    }
+
+    /// Draw what the frame holds: every segment in the order it was appended,
+    /// with the texture it samples bound for it. While nothing but glyphs is on
+    /// screen there is one segment and this is the single draw call the frame
+    /// has always been.
+    fn drawSegments(self: *Renderer, pass: *c.SDL_GPURenderPass) void {
+        for (self.segments.items) |segment| {
+            if (segment.count == 0) continue;
+            const sampler: c.SDL_GPUTextureSamplerBinding = .{ .texture = segment.texture, .sampler = self.sampler };
+            c.SDL_BindGPUFragmentSamplers(pass, 0, &sampler, 1);
+            c.SDL_DrawGPUPrimitives(pass, @intCast(segment.count), 1, @intCast(segment.first), 0);
+        }
+    }
+
+    /// Draw one picture into `bounds`, which the caller has already fitted to
+    /// the room it has. The panel's clip applies like it does to every other
+    /// quad, so a picture scrolled half out of the dock is cut in half rather
+    /// than drawn over its neighbours.
+    pub fn drawPicture(self: *Renderer, texture: *c.SDL_GPUTexture, bounds: Rect) !void {
+        try self.texturedQuad(bounds, .{ .x = 0, .y = 0, .w = 1, .h = 1 }, .{ 1, 1, 1, 1 }, 0, texture);
+    }
+
+    /// The picture for one record, decoded and uploaded the first time it is
+    /// asked for and kept afterwards, so a picture costs one decode rather than
+    /// one per frame.
+    ///
+    /// `key` names the record the picture belongs to - the lane and the handle
+    /// the client gave it - so the same picture is drawn from every frame
+    /// without decoding it again, and two pictures that happen to be alike are
+    /// still two records with two textures.
+    pub fn picture(self: *Renderer, key: u64, format: image.Format, bytes: []const u8) !Drawn {
+        if (self.pictures.getPtr(key)) |entry| {
+            entry.last = self.frame;
+            return entry.state;
+        }
+        const decoded = try image.decode(self.allocator, format, bytes);
+        var pixels = switch (decoded) {
+            .picture => |bitmap| bitmap,
+            .refused => |why| {
+                try self.remember(key, .{ .refused = why });
+                return .{ .refused = why };
+            },
+        };
+        defer pixels.deinit(self.allocator);
+        const bitmap: usize = @as(usize, pixels.width) * @as(usize, pixels.height);
+        if (!self.makeRoom(bitmap)) {
+            try self.remember(key, .{ .refused = .no_room });
+            return .{ .refused = .no_room };
+        }
+        // A texture that could not be created or filled is a picture that is not
+        // on screen, and that is what a reader is told: the alternative - an
+        // error out of the draw - would take the frame down for a picture.
+        const texture = self.upload(pixels) catch {
+            try self.remember(key, .{ .refused = .no_room });
+            return .{ .refused = .no_room };
+        };
+        const drawn: Picture = .{ .texture = texture, .width = pixels.width, .height = pixels.height };
+        self.picture_pixels += bitmap;
+        try self.remember(key, .{ .picture = drawn });
+        return .{ .picture = drawn };
+    }
+
+    /// Remember what became of a record, so the same picture is not decoded -
+    /// or refused - again on the next frame.
+    fn remember(self: *Renderer, key: u64, state: Drawn) !void {
+        try self.pictures.put(self.allocator, key, .{ .state = state, .last = self.frame });
+    }
+
+    /// Whether the space can hold `pixels` more, evicting what a reader has
+    /// stopped looking at to make room. False when the picture is larger than
+    /// the whole space, which is refused before anything is evicted so that one
+    /// oversized image cannot empty the cache and then fail anyway.
+    fn makeRoom(self: *Renderer, pixels: usize) bool {
+        if (pixels > max_picture_pixels) return false;
+        while (self.pictures.count() >= max_pictures or self.picture_pixels + pixels > max_picture_pixels) {
+            if (!self.evictOldest()) return true;
+        }
+        return true;
+    }
+
+    /// Release the picture last asked for longest ago, or the plainest entry
+    /// when there is none: a refusal costs no pixels and is still an entry.
+    /// False when there is nothing left to give up.
+    fn evictOldest(self: *Renderer) bool {
+        var oldest_key: ?u64 = null;
+        var oldest: u64 = std.math.maxInt(u64);
+        var entries = self.pictures.iterator();
+        while (entries.next()) |entry| {
+            if (entry.value_ptr.last >= oldest) continue;
+            oldest = entry.value_ptr.last;
+            oldest_key = entry.key_ptr.*;
+        }
+        const key = oldest_key orelse return false;
+        self.forget(key);
+        return true;
+    }
+
+    fn forget(self: *Renderer, key: u64) void {
+        const entry = self.pictures.fetchRemove(key) orelse return;
+        switch (entry.value.state) {
+            .picture => |drawn| {
+                c.SDL_ReleaseGPUTexture(self.device, drawn.texture);
+                self.picture_pixels -= @as(usize, drawn.width) * @as(usize, drawn.height);
+            },
+            .refused => {},
+        }
+    }
+
+    fn releasePictures(self: *Renderer) void {
+        var entries = self.pictures.iterator();
+        while (entries.next()) |entry| {
+            switch (entry.value_ptr.state) {
+                .picture => |drawn| c.SDL_ReleaseGPUTexture(self.device, drawn.texture),
+                .refused => {},
+            }
+        }
+        self.pictures.clearRetainingCapacity();
+        self.picture_pixels = 0;
+    }
+
+    /// A texture of the picture's own, filled from the decoded pixels. The
+    /// format is the one the decoder produces - RGBA, unorm - so nothing is
+    /// converted on the way in.
+    fn upload(self: *Renderer, pixels: image.Picture) !*c.SDL_GPUTexture {
+        var texture_info = std.mem.zeroes(c.SDL_GPUTextureCreateInfo);
+        texture_info.type = c.SDL_GPU_TEXTURETYPE_2D;
+        texture_info.format = c.SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+        texture_info.usage = c.SDL_GPU_TEXTUREUSAGE_SAMPLER;
+        texture_info.width = pixels.width;
+        texture_info.height = pixels.height;
+        texture_info.layer_count_or_depth = 1;
+        texture_info.num_levels = 1;
+        const texture = c.SDL_CreateGPUTexture(self.device, &texture_info) orelse return error.GpuTexture;
+        errdefer c.SDL_ReleaseGPUTexture(self.device, texture);
+        var transfer_info = std.mem.zeroes(c.SDL_GPUTransferBufferCreateInfo);
+        transfer_info.usage = c.SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        transfer_info.size = @intCast(pixels.pixels.len);
+        const transfer = c.SDL_CreateGPUTransferBuffer(self.device, &transfer_info) orelse return error.GpuTransfer;
+        defer c.SDL_ReleaseGPUTransferBuffer(self.device, transfer);
+        const command = c.SDL_AcquireGPUCommandBuffer(self.device) orelse return error.GpuCommand;
+        const mapped: [*]u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(self.device, transfer, true) orelse {
+            _ = c.SDL_CancelGPUCommandBuffer(command);
+            return error.GpuMap;
+        });
+        @memcpy(mapped[0..pixels.pixels.len], pixels.pixels);
+        c.SDL_UnmapGPUTransferBuffer(self.device, transfer);
+        const copy = c.SDL_BeginGPUCopyPass(command) orelse {
+            _ = c.SDL_CancelGPUCommandBuffer(command);
+            return error.GpuCopyPass;
+        };
+        var from = std.mem.zeroes(c.SDL_GPUTextureTransferInfo);
+        from.transfer_buffer = transfer;
+        var region = std.mem.zeroes(c.SDL_GPUTextureRegion);
+        region.texture = texture;
+        region.w = pixels.width;
+        region.h = pixels.height;
+        region.d = 1;
+        c.SDL_UploadToGPUTexture(copy, &from, &region, false);
+        c.SDL_EndGPUCopyPass(copy);
+        if (!c.SDL_SubmitGPUCommandBuffer(command)) return error.GpuSubmit;
+        return texture;
     }
 
     /// Render the current vertices into an offscreen texture, read it back, and
@@ -247,7 +590,16 @@ pub const Renderer = struct {
     /// format the pipeline was created for. A different size would scale the
     /// capture, and a different format makes the render pass incompatible with
     /// the pipeline.
-    pub fn capture(self: *Renderer, path: []const u8) !void {
+    /// Write the current frame to `path`, in the format the name asks for.
+    ///
+    /// This exists for QA: a run that has to be looked at afterwards, or a gate
+    /// that reads pixels rather than strings. The download gives back the
+    /// swapchain's own format - BGRA on the backends that use it - so the
+    /// pixels are put in RGBA order once here and every encoder then takes the
+    /// same buffer. An unfamiliar extension is refused rather than guessed at,
+    /// because a run that silently got a different format than it asked for is
+    /// worse than one that failed.
+    pub fn capture(self: *Renderer, io: std.Io, a: std.mem.Allocator, path: []const u8) !void {
         try self.atlas.flush();
         const width: u32 = @intFromFloat(@max(1, self.width));
         const height: u32 = @intFromFloat(@max(1, self.height));
@@ -297,9 +649,7 @@ pub const Renderer = struct {
         c.SDL_BindGPUGraphicsPipeline(pass, self.pipeline);
         const binding: c.SDL_GPUBufferBinding = .{ .buffer = self.vertex_buffer, .offset = 0 };
         c.SDL_BindGPUVertexBuffers(pass, 0, &binding, 1);
-        const sampler: c.SDL_GPUTextureSamplerBinding = .{ .texture = self.atlas.texture, .sampler = self.sampler };
-        c.SDL_BindGPUFragmentSamplers(pass, 0, &sampler, 1);
-        if (self.vertices.items.len > 0) c.SDL_DrawGPUPrimitives(pass, @intCast(self.vertices.items.len), 1, 0, 0);
+        self.drawSegments(pass);
         c.SDL_EndGPURenderPass(pass);
         const download = c.SDL_BeginGPUCopyPass(command) orelse {
             _ = c.SDL_SubmitGPUCommandBuffer(command);
@@ -319,7 +669,38 @@ pub const Renderer = struct {
         c.SDL_ReleaseGPUFence(self.device, fence);
         const pixels: [*]const u8 = @ptrCast(c.SDL_MapGPUTransferBuffer(self.device, transfer, false) orelse return error.GpuMap);
         defer c.SDL_UnmapGPUTransferBuffer(self.device, transfer);
-        try writePpm(self.allocator, path, pixels, width, height, isBgra(format));
+        // PPM is kept because none of the codecs here writes one, and a plain
+        // raster dump is occasionally what a pixel diff wants.
+        if (std.mem.endsWith(u8, path, ".ppm") or std.mem.endsWith(u8, path, ".pnm")) {
+            return writePpm(self.allocator, path, pixels, width, height, isBgra(format));
+        }
+        const framebuffer = try rgbaPixels(a, pixels, width, height, isBgra(format));
+        defer a.free(framebuffer);
+        const shot = zignal.Image(zignal.Rgba(u8)).initFromSlice(height, width, framebuffer);
+        if (std.mem.endsWith(u8, path, ".png")) return zignal.png.save(zignal.Rgba(u8), io, a, shot, path);
+        if (std.mem.endsWith(u8, path, ".bmp")) return zignal.bmp.save(zignal.Rgba(u8), io, a, shot, path);
+        if (std.mem.endsWith(u8, path, ".gif")) return zignal.gif.save(zignal.Rgba(u8), io, a, shot, path);
+        if (std.mem.endsWith(u8, path, ".jpg") or std.mem.endsWith(u8, path, ".jpeg")) {
+            return zignal.jpeg.save(zignal.Rgba(u8), io, a, shot, path);
+        }
+        return error.UnknownCaptureFormat;
+    }
+
+    /// The frame's pixels in RGBA order, which is the order every encoder here
+    /// takes. The swapchain hands back its own order, so this puts it right once
+    /// rather than each encoder being told about it.
+    fn rgbaPixels(a: std.mem.Allocator, pixels: [*]const u8, width: u32, height: u32, bgra: bool) ![]zignal.Rgba(u8) {
+        const out = try a.alloc(zignal.Rgba(u8), @as(usize, width) * height);
+        for (out, 0..) |*pixel, i| {
+            const at = i * 4;
+            pixel.* = .{
+                .r = if (bgra) pixels[at + 2] else pixels[at],
+                .g = pixels[at + 1],
+                .b = if (bgra) pixels[at] else pixels[at + 2],
+                .a = pixels[at + 3],
+            };
+        }
+        return out;
     }
 
     /// True when the format stores blue before red, which the PPM writer swaps.
@@ -395,9 +776,7 @@ pub const Renderer = struct {
         c.SDL_BindGPUGraphicsPipeline(pass, self.pipeline);
         const binding: c.SDL_GPUBufferBinding = .{ .buffer = self.vertex_buffer, .offset = 0 };
         c.SDL_BindGPUVertexBuffers(pass, 0, &binding, 1);
-        const sampler: c.SDL_GPUTextureSamplerBinding = .{ .texture = self.atlas.texture, .sampler = self.sampler };
-        c.SDL_BindGPUFragmentSamplers(pass, 0, &sampler, 1);
-        if (self.vertices.items.len > 0) c.SDL_DrawGPUPrimitives(pass, @intCast(self.vertices.items.len), 1, 0, 0);
+        self.drawSegments(pass);
         c.SDL_EndGPURenderPass(pass);
         if (!c.SDL_SubmitGPUCommandBuffer(command)) return error.GpuSubmit;
     }

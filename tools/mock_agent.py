@@ -28,6 +28,21 @@ class Turn:
     client_reply: dict[str, Any] | None = None
 
 
+# How long the mock holds between the chunks of a streamed run. Long enough for
+# a frame to be drawn while the run is still arriving, which is what the pulse
+# fixture is looking for, and short enough that a gate run stays quick.
+reasoning_pause = 0.25
+
+
+# A 16x16 RGBA PNG: four 8x8 quadrants - red, green, blue, yellow - with a white
+# diagonal across them. Small enough to write down, structured enough that a
+# drawing of it is unmistakable in a screenshot, and real enough that a decoder
+# has to decode it rather than being handed something that happens to parse.
+SAMPLE_PNG_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAAYUlEQVR42p3M0QkAIQyD4Q6WSW4SR3SIG8INPAQFkZpLG/jfwmd97gXcUB+ajRNDJIAhMnBDQoCHhIETSQE7kgZUxFBaZ621CrdfYJwYIgEMkYEbEgI8JAycSArYkTSwkA91yLusbERALAAAAABJRU5ErkJggg=="
+)
+
+
 class MockAgent:
     def __init__(self, name: str, fragment: int, delay: float, output: BinaryIO, require_auth: bool = False) -> None:
         self.name = name
@@ -231,7 +246,16 @@ class MockAgent:
 
     def terminal_run(self, turn: Turn) -> str:
         """Exercise the client terminal capability end to end: create, wait for
-        exit, read the bounded output, then release ownership."""
+        exit, read the bounded output, then release ownership.
+
+        The terminal is also embedded in a tool call while it is still running,
+        which is what the protocol asks a client to draw: the call says which
+        terminal it ran in and the client shows that terminal's output where the
+        call is. The call is announced *before* the wait, so the screen has
+        something in it by the time the turn ends, and the release comes after -
+        a client that only draws a terminal it still owns is a client that blanks
+        the output the moment the agent is done with it.
+        """
         created = self.client_call(turn, "term", "terminal/create", {
             "sessionId": turn.session_id,
             "command": "sh",
@@ -240,10 +264,20 @@ class MockAgent:
         terminal_id = created.get("result", {}).get("terminalId")
         if not terminal_id:
             return "\nterminal-create-failed"
+        self.update(turn.session_id, {
+            "sessionUpdate": "tool_call",
+            "toolCallId": "mock-term",
+            "title": "Run in a terminal",
+            "kind": "execute",
+            "status": "in_progress",
+            "rawInput": {"command": "echo seggs-terminal-ok"},
+            "content": [{"type": "terminal", "terminalId": terminal_id}],
+        })
         exit_reply = self.client_call(turn, "termexit", "terminal/wait_for_exit", {"sessionId": turn.session_id, "terminalId": terminal_id})
         exit_code = exit_reply.get("result", {}).get("exitCode")
         output_reply = self.client_call(turn, "termout", "terminal/output", {"sessionId": turn.session_id, "terminalId": terminal_id})
         output = output_reply.get("result", {}).get("output", "")
+        self.update(turn.session_id, {"sessionUpdate": "tool_call_update", "toolCallId": "mock-term", "status": "completed"})
         self.client_call(turn, "termrel", "terminal/release", {"sessionId": turn.session_id, "terminalId": terminal_id})
         if exit_code == 0 and "seggs-terminal-ok" in output:
             return "\nterminal-ok"
@@ -269,8 +303,18 @@ class MockAgent:
             "content": [{
                 "type": "diff",
                 "path": "src/ui/tool_call.zig",
-                "oldText": "const Renderer = @import(\"../gpu/renderer.zig\").Renderer;\nconst Allocator = std.mem.Allocator;\n",
-                "newText": "const Renderer = @import(\"../gpu/renderer.zig\").Renderer;\nconst Rect = @import(\"layout.zig\").Rect;\nconst Allocator = std.mem.Allocator;\n",
+                "oldText": "const Allocator = std.mem.Allocator;\nconst Drawer = @import(\"../gpu/renderer.zig\").Renderer;\nconst Surface = @import(\"../gpu/surface.zig\").Surface;\n",
+                "newText": "const Allocator = std.mem.Allocator;\nconst Drawer = @import(\"../gpu/renderer.zig\").Canvas;\nconst Surface = @import(\"../gpu/surface.zig\").Surface;\n",
+            }, {
+                # A patch the agent printed rather than a pair of sides. Only
+                # this shape carries context lines: two sides written out as one
+                # are a whole-block replacement, because context invented for an
+                # excerpt the agent never sent would be read as the file. So this
+                # part is the only one that exercises the highlighting of an
+                # unchanged line.
+                "type": "diff",
+                "path": "src/ui/tool_call.zig",
+                "diff": "--- a/src/ui/tool_call.zig\n+++ b/src/ui/tool_call.zig\n@@ -1,3 +1,3 @@\n const keep = 1;\n-const value = 10;\n+const value = 20;\n",
             }],
         })
         self.update(session, {"sessionUpdate": "tool_call_update", "toolCallId": "mock-edit", "status": "completed"})
@@ -292,6 +336,9 @@ class MockAgent:
             return
         try:
             self.update(turn.session_id, {"sessionUpdate": "plan", "entries": [{"content": "Echo the prompt without workspace access", "priority": "medium", "status": "in_progress"}]})
+            records = turn.text.startswith("records")
+            if records:
+                self.records_before(turn)
             permission = self.permission(turn) if turn.text.startswith("permission") else ""
             calls = self.tool_calls(turn) if turn.text.startswith("tools") else ""
             if turn.text.startswith("fsread "):
@@ -302,12 +349,32 @@ class MockAgent:
                 fs_result = self.terminal_run(turn)
             else:
                 fs_result = ""
-            response = f"mock[{self.name}] {turn.text}\n{permission}{fs_result}{calls}"
+            if turn.text.startswith("math"):
+                # Display mathematics in each form an agent writes it, so a run
+                # exercises the parser and the typesetter together rather than
+                # only whichever form the fixture happened to use.
+                math = (
+                    "\nHere is a fraction:\n\n"
+                    "$$\\frac{1}{3}$$\n\n"
+                    "One opened and closed on its own lines:\n\n"
+                    "$$\n\\int_0^\\infty e^{-x^2}\\,dx = \\frac{\\sqrt{\\pi}}{2}\n$$\n\n"
+                    "And a matrix:\n\n"
+                    "$$\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}$$\n"
+                )
+            else:
+                math = ""
+            response = f"mock[{self.name}] {turn.text}\n{permission}{fs_result}{calls}{math}"
             for offset in range(0, len(response), 7):
                 if turn.cancelled.is_set() or self.closed.is_set():
                     break
                 self.update(turn.session_id, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": response[offset:offset + 7]}})
                 turn.cancelled.wait(self.delay)
+            # The summary arrives after the prose on purpose: it is the second
+            # run of the turn, and a transcript that draws every run at the end
+            # would put it in the same place as the reasoning rather than where
+            # the session actually folded its context.
+            if records:
+                self.records_after(turn)
             if turn.text.startswith("slow"):
                 turn.cancelled.wait(2)
             stop = "cancelled" if turn.cancelled.is_set() else "end_turn"
@@ -319,6 +386,56 @@ class MockAgent:
             with self.state_lock:
                 self.turns.pop(turn.session_id, None)
             self.error(turn.request_id, -32603, f"Mock failure: {type(exc).__name__}")
+
+    def records_before(self, turn: Turn) -> None:
+        """The updates a reader needs to see what a session is doing.
+
+        One turn carries every kind the interface draws from a record: a stream
+        of reasoning in many chunks (which has to arrive as one run, placed where
+        it began), the user's own words, the usage of the turn, the mode, what
+        the session is called, the commands it accepts, and a plan that replaces
+        itself rather than appending. They are here because nothing else in the
+        mock sends them, and a kind nothing sends is a kind no fixture can tell
+        apart from one the client drops.
+        """
+        session = turn.session_id
+        # The reasoning is sent slowly on purpose: a run that arrives in one
+        # frame is never caught mid-arrival, and a client that draws reasoning
+        # only after it has stopped is a client whose reader cannot tell thinking
+        # from done. The pause is the fixture's, not the client's.
+        for index, piece in enumerate(("A transcript has to show what ", "the agent thought, ", "not only what it called.")):
+            if index != 0:
+                turn.cancelled.wait(reasoning_pause)
+            self.update(session, {"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": piece}})
+        # A picture, and a real one: sixteen pixels square, four quadrants of
+        # distinct colour with a white diagonal. The bytes matter - a two-byte
+        # `aGk=` is valid base64 and not a PNG, so a client that decoded it would
+        # fail, and a fixture that sent it would prove nothing about a picture
+        # being drawn. These are the bytes `src/acp/image.zig` names as its own
+        # sample, and the gate looks for their colours on screen.
+        self.update(session, {"sessionUpdate": "agent_thought_chunk", "content": {"type": "image", "data": SAMPLE_PNG_BASE64, "mimeType": "image/png"}})
+        self.update(session, {"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "show me the records"}})
+        self.update(session, {"sessionUpdate": "usage_update", "used": 42000, "size": 200000, "cost": {"amount": 1.25, "currency": "USD"}})
+        self.update(session, {"sessionUpdate": "current_mode_update", "currentModeId": "plan"})
+        self.update(session, {"sessionUpdate": "session_info_update", "title": "Records fixture", "updatedAt": "2026-09-21T10:00:00Z"})
+        self.update(session, {"sessionUpdate": "available_commands_update", "availableCommands": [
+            {"name": "compact", "description": "Fold the context"},
+            {"name": "research", "description": "Look something up", "input": {"hint": "what to look up"}},
+        ]})
+        self.update(session, {"sessionUpdate": "plan_update", "plan": {"type": "items", "planId": "mock-plan", "entries": [
+            {"content": "capture the reasoning", "priority": "high", "status": "completed"},
+            {"content": "draw it where it happened", "priority": "medium", "status": "in_progress"},
+            {"content": "show what a turn cost", "priority": "low", "status": "pending"},
+        ]}})
+
+    def records_after(self, turn: Turn) -> None:
+        """A compaction that streams its summary and then reports itself done."""
+        session = turn.session_id
+        for index, piece in enumerate(("Earlier: the transcript kept ", "three kinds of update ", "and dropped the rest.")):
+            if index != 0:
+                turn.cancelled.wait(reasoning_pause)
+            self.update(session, {"sessionUpdate": "compaction_summary_chunk", "compactionId": "mock-compaction", "content": {"type": "text", "text": piece}})
+        self.update(session, {"sessionUpdate": "compaction_update", "compactionId": "mock-compaction", "status": "completed"})
 
     def close(self) -> None:
         self.closed.set()

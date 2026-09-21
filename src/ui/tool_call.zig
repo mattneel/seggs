@@ -1,17 +1,19 @@
-//! One tool call, as the transcript draws it.
+//! One tool call, as the transcript draws it: whatever card a renderer built,
+//! turned into pixels.
 //!
-//! A call is not prose. What an agent did to a file is a label, a subject, and
-//! the few facts that came with it, and a reader scanning a transcript is
-//! looking for the call rather than reading it. So a call is drawn as an object
-//! - a chip naming the tool and its state, with the one line that says what it
-//! was about - and the detail underneath stays closed until the reader opens it.
+//! A call is not prose, and it is not one shape either: what a `read` is worth
+//! drawing and what a failing command is worth drawing are different, and the
+//! difference is decided in `ui/tools/`. This module is the other half of that
+//! split, and it is only pixels: every rectangle, every column, every elision.
+//! What a section holds, how much of it a budget shows, and which lines the
+//! marker names are decided in `ui/tool_card.zig`, so a shape can be read - and
+//! a plan can be checked - by a test with no renderer in it.
 //!
-//! This module is the whole of a call's surface. `rows` says how many display
-//! rows the block takes and `draw` fills them; both walk the same parts in the
-//! same order - the chip, the fields, the diff - so a block can never be sized
-//! for one arrangement and drawn in another.
+//! `rows` says how many display rows a card takes and `draw` fills them; both
+//! walk the same plan - the pill, the sections, the diff - so a card can never
+//! be sized for one arrangement and drawn in another.
 //!
-//! Nothing here owns the call: the record comes from the ACP client, and every
+//! Nothing here owns the call: the card comes from the frame's arena, and every
 //! slice in it is borrowed for as long as the frame is.
 
 const std = @import("std");
@@ -19,6 +21,7 @@ const acp = @import("../acp/tool_call.zig");
 const diff = @import("diff.zig");
 const theme = @import("theme.zig");
 const wrap = @import("wrap.zig");
+const tool_card = @import("tool_card.zig");
 const text = @import("../core/text.zig");
 const Renderer = @import("../gpu/renderer.zig").Renderer;
 const Rect = @import("layout.zig").Rect;
@@ -32,9 +35,9 @@ pub const Vec2 = struct { x: f32, y: f32 };
 /// happen to be drawn.
 pub const Metrics = struct { advance: f32 };
 
-/// The pad inside the chip's pill, and the space after it before the subject:
-/// enough that the pill reads as an object with the subject beside it, rather
-/// than as a word with brackets around it.
+/// The pad inside the pill, and the space after it before the subject: enough
+/// that the pill reads as an object with the subject beside it, rather than as
+/// a word with brackets around it.
 const chip_pad: f32 = 7;
 const chip_gap: f32 = 8;
 
@@ -42,99 +45,123 @@ const chip_gap: f32 = 8;
 /// row would be a bar.
 const pill_inset: f32 = 3;
 
-/// The cells a wrapped continuation of a field's value or of a diff line steps
-/// in by, so a wrapped row reads as the row above it continued.
-const hang_cells: usize = 2;
+/// The gutter down a card's left edge: one column of the panel, and a bar two
+/// device pixels wide inside it, which is what the transcript's other rails
+/// (a quotation, a run) are drawn with. The reference frames a block in a
+/// rounded box; that costs two columns and a border between every call, and our
+/// agent dock is about 44 columns wide, so the frame here is the one column the
+/// information actually needs.
+const gutter_cells: usize = 1;
+const gutter_width: f32 = 2;
 
-/// The fraction of the panel a field's label may take. Labels are words like
-/// "path" and "command"; one that is not is cut rather than leaving its value no
-/// column at all, and half the panel is the most a label may have of it.
-const label_share: usize = 2;
+/// The columns a section bar keeps for its rule, and the gap between the label
+/// and the detail beside it.
+const bar_rule_cells: usize = 3;
+const bar_gap_cells: usize = 2;
 
-/// How many display rows the call takes at this width: the chip's own row, and,
-/// when it is open, its fields and its diff. A caller that lays out rows asks
-/// this; the height in pixels is this times the line height. The allocator is
-/// only used to read a diff the call carries, and a frame's arena is the right
-/// one.
-pub fn rows(a: Allocator, call: acp.ToolCall, width: f32, expanded: bool, metrics: Metrics) !usize {
+/// How many display rows a card takes at this width: the pill's own row, then
+/// the sections and the diff. A caller that lays out rows asks this; the height
+/// in pixels is this times the line height. The allocator is the frame's: the
+/// plans are built in it.
+pub fn rows(a: Allocator, card: tool_card.Card, width: f32, expanded: bool, metrics: Metrics) !usize {
+    const columns = contentColumns(card, width, metrics);
     var count: usize = 1;
-    if (!expanded) return count;
-    const columns = columnsFor(width, metrics);
-    const label = labelColumn(call.fields, columns);
-    for (call.fields) |field| count += fieldRows(field, label, columns);
-    if (call.diff) |bytes| {
+    for (card.sections) |section| {
+        if (!shows(section, card, expanded)) continue;
+        const plan = try tool_card.plan(a, section, columns, expanded);
+        count += @intFromBool(section.label.len > 0) + plan.height();
+    }
+    if (!frames(card, expanded)) return count;
+    if (card.diff) |bytes| {
         // A diff the reader will not get out of the parser is text, and is
-        // counted as the text it is drawn as.
+        // planned as the text it is drawn as.
         const files = diff.parse(a, bytes) catch null;
         defer if (files) |parsed| diff.deinit(parsed, a);
-        const lines = diffCount(files, bytes, columns);
-        // One blank row between the fields and the diff, so the two are not
+        const plan = try tool_card.planDiff(a, files, bytes, columns, expanded);
+        // One blank row between the sections and the diff, so the two are not
         // read as one list.
-        if (lines > 0) count += 1 + lines;
+        if (plan.rows() > 0) count += 1 + plan.height();
     }
     return count;
 }
 
-/// Draw the block at `origin`. The caller owns the clip; the block starts on the
-/// row grid `rows` counted and never leaves it.
-pub fn draw(call: acp.ToolCall, r: *Renderer, origin: Vec2, width: f32, line_height: f32, expanded: bool, metrics: Metrics, a: Allocator) !void {
-    const columns = columnsFor(width, metrics);
-    try drawChip(call, r, origin, columns, line_height, metrics, a);
-    if (!expanded) return;
+/// Whether a card's structure - its barred sections and its diff - is on
+/// screen: a framed card shows it under the pill, a quiet one keeps it for the
+/// reader who opens it.
+fn frames(card: tool_card.Card, expanded: bool) bool {
+    return expanded or card.variant == .framed;
+}
 
-    const label = labelColumn(call.fields, columns);
+/// Whether a section is drawn. One with no bar is a line of the card's own
+/// scan - the digest of what a call was given - and is drawn whenever the card
+/// is; a barred section is structure, and follows the card's variant.
+fn shows(section: tool_card.Section, card: tool_card.Card, expanded: bool) bool {
+    return section.label.len == 0 or frames(card, expanded);
+}
+
+/// Draw the card at `origin`. The caller owns the clip; the card starts on the
+/// row grid `rows` counted and never leaves it. `frame` is the counter the one
+/// moving glyph is drawn from, so a call in flight does not look frozen.
+pub fn draw(card: tool_card.Card, r: *Renderer, origin: Vec2, width: f32, line_height: f32, expanded: bool, metrics: Metrics, frame: usize, a: Allocator) !void {
+    const framed = card.variant == .framed;
+    const columns = contentColumns(card, width, metrics);
+    const x = origin.x + if (framed) @as(f32, @floatFromInt(gutter_cells)) * metrics.advance else 0;
+    const colour = toneColor(card.tone);
+
+    // The gutter runs down the card's left edge in the colour its state is read
+    // in, and only a framed card has one: a quiet call is a line in the flow,
+    // and three of them in a row are three lines rather than three boxes.
+    if (framed) try drawGutter(r, origin.x, origin.y, line_height, colour);
+    try drawChip(card, r, .{ .x = x, .y = origin.y }, columns, line_height, metrics, frame, a);
+
     var row: usize = 1;
-    for (call.fields) |field| {
-        try drawField(field, r, origin.x, origin.y + lineY(row, line_height), label, columns, line_height, metrics, a);
-        row += fieldRows(field, label, columns);
+    for (card.sections) |section| {
+        if (!shows(section, card, expanded)) continue;
+        const plan = try tool_card.plan(a, section, columns, expanded);
+        const height = @intFromBool(section.label.len > 0) + plan.height();
+        if (height == 0) continue;
+        if (framed) try drawGutter(r, origin.x, origin.y + lineY(row, line_height), @as(f32, @floatFromInt(height)) * line_height, colour);
+        _ = try drawSection(section, plan, r, x, origin.y + lineY(row, line_height), line_height, columns, metrics, expanded, a);
+        row += height;
     }
 
-    const bytes = call.diff orelse return;
+    if (!frames(card, expanded)) return;
+    const bytes = card.diff orelse return;
     const files = diff.parse(a, bytes) catch null;
     defer if (files) |parsed| diff.deinit(parsed, a);
-    if (diffCount(files, bytes, columns) == 0) return;
+    const plan = try tool_card.planDiff(a, files, bytes, columns, expanded);
+    if (plan.rows() == 0) return;
     row += 1;
-    _ = try drawDiff(files, bytes, r, origin.x, origin.y + lineY(row, line_height), line_height, columns, metrics, a);
+    const height = 1 + plan.height();
+    try drawGutter(r, origin.x, origin.y + lineY(row - 1, line_height), @as(f32, @floatFromInt(height)) * line_height, colour);
+    try drawDiff(plan, r, x, origin.y + lineY(row, line_height), line_height, metrics);
+    row += plan.rows();
+    if (plan.withheld > 0) {
+        const marker = try moreRow(a, plan.withheld, !expanded, .head);
+        try drawText(marker, r, x, origin.y + lineY(row, line_height));
+    }
 }
 
-/// The word a chip shows for a kind. A reader learns ten words once and then
-/// scans them, which a bracket full of JSON never gave them.
-pub fn kindLabel(kind: acp.Kind) []const u8 {
-    return switch (kind) {
-        .read => "read",
-        .edit => "edit",
-        .delete => "delete",
-        .move => "move",
-        .search => "search",
-        .execute => "run",
-        .think => "think",
-        .fetch => "fetch",
-        .switch_mode => "mode",
-        .other => "tool",
-    };
+/// The row a capped payload ends - or, for a payload whose tail is kept,
+/// begins - with. Exported because the number it names and the direction it
+/// names are the whole point of a cap, and a test can read it without a
+/// renderer.
+pub fn moreRow(a: Allocator, dropped: usize, hint: bool, edge: tool_card.Edge) !tool_card.Span {
+    return .{ .text = try tool_card.moreText(a, dropped, hint, edge), .tone = .muted };
 }
 
-/// The mark a state shows, which is what carries the state when the colour
-/// cannot: the same four marks the runs panel already uses, meaning the same
-/// four things.
-pub fn stateMark(state: acp.State) []const u8 {
-    return switch (state) {
-        .pending => "○",
-        .in_progress => "●",
-        .completed => "✓",
-        .failed => "✗",
-    };
-}
-
-/// The colour a state is read in: work that has not started is quiet, work in
-/// flight is a warning, work that finished is the accent, and work that failed
-/// is an error.
-pub fn stateColor(state: acp.State) theme.Color {
-    return switch (state) {
-        .pending => theme.muted,
-        .in_progress => theme.amber,
-        .completed => theme.accent,
-        .failed => theme.red,
+/// The colour a tone is drawn in. These are the roles the rest of the
+/// transcript reads in, so a card, a heading and a fenced diff are the same
+/// voice.
+pub fn toneColor(tone: tool_card.Tone) theme.Color {
+    return switch (tone) {
+        .plain => theme.text,
+        .muted => theme.muted,
+        .accent => theme.accent,
+        .added => theme.added,
+        .removed => theme.removed,
+        .warning => theme.amber,
+        .danger => theme.red,
     };
 }
 
@@ -151,13 +178,21 @@ pub fn diffColor(kind: diff.LineKind) theme.Color {
     };
 }
 
-/// The chip: the kind's word and the state's mark on a raised pill, then the
-/// subject, cut to what is left of the row.
-fn drawChip(call: acp.ToolCall, r: *Renderer, origin: Vec2, columns: usize, line_height: f32, metrics: Metrics, a: Allocator) !void {
-    const word = kindLabel(call.kind);
-    const mark = stateMark(call.state);
-    const colour = stateColor(call.state);
-    const cells = cellCount(word) + 1 + cellCount(mark);
+/// The pill: the card's status line, drawn as the tool's word and the state's
+/// glyph, then the subject, cut to what is left of the row.
+///
+/// The two halves of the status land in columns of their own - the glyph starts
+/// at the word's column plus a space - so two chips of one kind keep their marks
+/// in one column, and so a glyph that moves does not walk the word around.
+fn drawChip(card: tool_card.Card, r: *Renderer, origin: Vec2, columns: usize, line_height: f32, metrics: Metrics, frame: usize, a: Allocator) !void {
+    // Flattened here as well as where the card was composed: this is a row, and
+    // a status line carrying a newline would draw itself a second one.
+    const status = tool_card.splitStatus(try tool_card.flatten(a, card.status));
+    // A call whose result is still arriving shows a frame of the spinner in the
+    // glyph's cell: a call that never moves reads as a frozen one.
+    const mark = if (card.partial) tool_card.spin(frame) else status.mark;
+    const colour = toneColor(card.tone);
+    const cells = cellCount(status.word) + if (mark.len == 0) 0 else 1 + cellCount(mark);
     const pill: Rect = .{
         .x = origin.x,
         .y = origin.y + pill_inset,
@@ -165,82 +200,175 @@ fn drawChip(call: acp.ToolCall, r: *Renderer, origin: Vec2, columns: usize, line
         .h = @max(1, line_height - pill_inset * 2),
     };
     try r.rect(pill, theme.raised);
-    _ = try drawRun(r, origin.x + chip_pad, origin.y, word, colour);
-    // The mark starts at the word's column rather than where the word's last
-    // glyph happened to end, so two chips of the same kind keep their marks in
-    // one column.
-    _ = try drawRun(r, origin.x + chip_pad + @as(f32, @floatFromInt(cellCount(word) + 1)) * metrics.advance, origin.y, mark, colour);
+    _ = try drawRun(r, origin.x + chip_pad, origin.y, status.word, colour);
+    if (mark.len != 0) {
+        _ = try drawRun(r, origin.x + chip_pad + @as(f32, @floatFromInt(cellCount(status.word) + 1)) * metrics.advance, origin.y, mark, colour);
+    }
 
     // The subject is one line: a path or a command is scanned rather than read,
     // and a chip that wraps is a chip whose neighbours move.
     const room = columns -| (cells + 3);
-    if (room == 0 or call.subject.len == 0) return;
-    const buffer = try a.alloc(u8, call.subject.len + 3);
-    try r.text(pill.x + pill.w + chip_gap, origin.y, wrap.elide(buffer, call.subject, room), theme.text);
+    if (room == 0 or card.subject.len == 0) return;
+    const buffer = try a.alloc(u8, card.subject.len + 3);
+    try r.text(pill.x + pill.w + chip_gap, origin.y, wrap.elide(buffer, card.subject, room), theme.text);
 }
 
-/// One field: the label naming the datum, and the value itself, wrapped in the
-/// column the label leaves. The label is drawn once, on the row the field
-/// starts on, which is what `fieldRows` counts.
-fn drawField(field: acp.Field, r: *Renderer, x: f32, y: f32, label: usize, columns: usize, line_height: f32, metrics: Metrics, a: Allocator) !void {
-    const buffer = try a.alloc(u8, field.label.len + 3);
-    try r.text(x, y, wrap.elide(buffer, field.label, label -| 2), theme.muted);
-    var lines: std.ArrayList([]const u8) = .empty;
-    try wrap.spans(a, field.value, columns -| label, &lines);
-    for (lines.items, 0..) |line, index| {
-        try r.text(x + @as(f32, @floatFromInt(label)) * metrics.advance, y + lineY(index, line_height), line, theme.text);
-    }
-}
-
-/// A call's diff: the path it is about, then its hunks and their lines, exactly
-/// as a fenced diff in the prose is read. `files` is null when the bytes are not
-/// a diff, in which case they are drawn as the text they are rather than
-/// dropped.
-fn drawDiff(files: ?[]const diff.File, bytes: []const u8, r: *Renderer, x: f32, y: f32, line_height: f32, columns: usize, metrics: Metrics, a: Allocator) !usize {
-    const parsed = files orelse return try drawText(bytes, r, x, y, line_height, columns, metrics, a);
+/// One section: its bar, the rows its plan keeps, and the row that names what
+/// the budget left out. Answers how many rows it took, which is what the gutter
+/// behind it is drawn from.
+fn drawSection(section: tool_card.Section, plan: tool_card.Plan, r: *Renderer, x: f32, y: f32, line_height: f32, columns: usize, metrics: Metrics, expanded: bool, a: Allocator) !usize {
     var row: usize = 0;
-    for (parsed) |file| {
-        // A fragment with no header has no name, and an empty name is not a row.
-        if (file.path.len > 0) {
-            const buffer = try a.alloc(u8, file.path.len + 3);
-            try r.text(x, y + lineY(row, line_height), wrap.elide(buffer, file.path, columns), theme.muted);
-            row += 1;
-        }
-        for (file.hunks) |hunk| {
-            row += try drawWrapped(hunk.header, diffColor(.hunk), r, x, y + lineY(row, line_height), line_height, columns, metrics, a);
-            for (hunk.lines) |line| {
-                row += try drawWrapped(line.text, diffColor(line.kind), r, x, y + lineY(row, line_height), line_height, columns, metrics, a);
-            }
-        }
+    if (section.label.len > 0) {
+        try drawBar(section, r, x, y, line_height, columns, metrics, a);
+        row = 1;
+    }
+    // A payload whose end is kept says what it is missing above its rows: that
+    // is where the missing lines were, and a marker under them would read as
+    // the end of the payload rather than as the hole in front of it.
+    if (plan.withheld > 0 and section.edge == .tail) {
+        const marker = try moreRow(a, plan.withheld, !expanded, section.edge);
+        try drawText(marker, r, x, y + lineY(row, line_height));
+        row += 1;
+    }
+    for (plan.steps) |step| {
+        row += try drawStep(section, step, r, x, y + lineY(row, line_height), line_height, metrics);
+    }
+    if (plan.withheld > 0 and section.edge == .head) {
+        const marker = try moreRow(a, plan.withheld, !expanded, section.edge);
+        try drawText(marker, r, x, y + lineY(row, line_height));
+        row += 1;
     }
     return row;
 }
 
-/// Bytes that did not read as a diff, drawn as the lines they were written in.
-fn drawText(bytes: []const u8, r: *Renderer, x: f32, y: f32, line_height: f32, columns: usize, metrics: Metrics, a: Allocator) !usize {
-    var row: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| {
-        row += try drawWrapped(line, theme.text, r, x, y + lineY(row, line_height), line_height, columns, metrics, a);
+/// One row of a section's plan: its display rows, each drawn from the pieces
+/// the plan already wrapped - nothing is wrapped twice, and nothing is wrapped
+/// that is not drawn.
+fn drawStep(section: tool_card.Section, step: tool_card.Plan.Step, r: *Renderer, x: f32, y: f32, line_height: f32, metrics: Metrics) !usize {
+    const line = section.rows[step.line];
+    const hang = @as(f32, @floatFromInt(tool_card.hang_cells)) * metrics.advance;
+    if (step.cut) {
+        // A row longer than the whole budget: one row, its text cut, drawn in
+        // the tone of the row's first run.
+        const tone = if (line.len > 0) line[0].tone else .plain;
+        try r.text(x, y, step.pieces[0], toneColor(tone));
+        return 1;
     }
-    return row;
+    for (step.pieces, 0..) |piece, index| {
+        try drawPiece(line, step.bytes, piece, r, x + if (index == 0) 0 else hang, y + lineY(index, line_height));
+    }
+    return step.pieces.len;
 }
 
-/// One line wrapped into the rows it needs, each continuation stepped in by the
-/// same hang the count assumed. Answers how many rows it took.
-fn drawWrapped(bytes: []const u8, colour: theme.Color, r: *Renderer, x: f32, y: f32, line_height: f32, columns: usize, metrics: Metrics, a: Allocator) !usize {
-    var lines: std.ArrayList([]const u8) = .empty;
-    try wrap.spans(a, bytes, columns -| hang_cells, &lines);
-    for (lines.items, 0..) |line, index| {
-        const indent = if (index == 0) 0 else @as(f32, @floatFromInt(hang_cells)) * metrics.advance;
-        try r.text(x + indent, y + lineY(index, line_height), line, colour);
+/// One wrapped line of a row, drawn in the tone of the span it came from. A
+/// line that straddles two spans is drawn as the pieces it is, so a label in
+/// front of a value keeps its own colour and its own text.
+fn drawPiece(line: []const tool_card.Span, bytes: []const u8, piece: []const u8, r: *Renderer, x: f32, y: f32) !void {
+    const start = @intFromPtr(piece.ptr) - @intFromPtr(bytes.ptr);
+    const end = start + piece.len;
+    var pen = x;
+    var at: usize = 0;
+    for (line) |span| {
+        const from = @max(start, at) - at;
+        const to = @min(end, at + span.text.len) - at;
+        at += span.text.len;
+        if (to <= from) continue;
+        pen = try drawRun(r, pen, y, span.text[from..to], toneColor(span.tone));
     }
-    return lines.items.len;
+}
+
+/// A diff's rows, drawn run by run in the colours the plan read them in: a line
+/// of one kind is one colour, a context line is the code it is, and the words
+/// that differ from a line's pair are marked.
+fn drawDiff(plan: tool_card.DiffPlan, r: *Renderer, x: f32, y: f32, line_height: f32, metrics: Metrics) !void {
+    const hang = @as(f32, @floatFromInt(tool_card.hang_cells)) * metrics.advance;
+    var row: usize = 0;
+    for (plan.steps) |step| {
+        for (step.pieces, 0..) |piece, index| {
+            try drawDiffPiece(step, piece, r, x + if (index == 0) 0 else hang, y + lineY(row + index, line_height), line_height);
+        }
+        row += step.pieces.len;
+    }
+}
+
+/// One wrapped piece of a diff line: the piece is a byte range of the line, so
+/// every run that overlaps it is drawn in its own colour, and a marked run is
+/// underlined under the glyphs it covers - a mark the reader can see without
+/// relying on the colour alone.
+///
+/// A line drawn cut has one piece that is an elided copy rather than a range of
+/// the line, so it is drawn in the colour of the line's first run: a mark that
+/// fell outside what is drawn is not drawn somewhere it does not belong.
+fn drawDiffPiece(step: tool_card.DiffPlan.Step, piece: []const u8, r: *Renderer, x: f32, y: f32, line_height: f32) !void {
+    if (step.cut) {
+        const colour = if (step.runs.len > 0) step.runs[0].colour else theme.text;
+        try r.text(x, y, piece, colour);
+        return;
+    }
+    // The piece's stretch of the line, and the runs' stretches of the same
+    // line: the arithmetic that meets them lives in the card vocabulary, where
+    // it can be tested without a renderer - a run that begins past the piece is
+    // "no overlap" rather than an underflow.
+    var piece_range = tool_card.Stretch{ .from = @intFromPtr(piece.ptr) - @intFromPtr(step.text.ptr), .to = 0 };
+    piece_range.to = piece_range.from + piece.len;
+    var pen = x;
+    var at: usize = 0;
+    for (step.runs) |run| {
+        // The runs are ordered and the walk moves forward, so once a run begins
+        // past the piece none of the rest can meet it either.
+        if (at >= piece_range.to) break;
+        const run_range = tool_card.Stretch{ .from = at, .to = at + run.text.len };
+        at = run_range.to;
+        const part = tool_card.overlap(piece_range, run_range) orelse continue;
+        const first = pen;
+        pen = try drawRun(r, pen, y, run.text[part.from..part.to], run.colour);
+        if (run.marked) try r.rect(.{ .x = first, .y = y + line_height - 3, .w = pen - first, .h = 2 }, run.colour);
+    }
+}
+
+/// A section's bar: its name, what the section is about, and a rule filling
+/// what is left of the row - so a section reads as a header over its payload
+/// rather than as another row of it. This is the reference's labelled section
+/// bar; it is a bar rather than a box because the panel is narrow.
+fn drawBar(section: tool_card.Section, r: *Renderer, x: f32, y: f32, line_height: f32, columns: usize, metrics: Metrics, a: Allocator) !void {
+    const label = try tool_card.flatten(a, section.label);
+    const detail = try tool_card.flatten(a, section.detail);
+    var buffer = try a.alloc(u8, label.len + 3);
+    const name = wrap.elide(buffer, label, columns -| bar_rule_cells);
+    var pen = try drawRun(r, x, y, name, theme.accent);
+    if (detail.len != 0) {
+        const room = columns -| (cellCount(name) + bar_gap_cells + bar_rule_cells);
+        if (room > 0) {
+            buffer = try a.alloc(u8, detail.len + 3);
+            const value = wrap.elide(buffer, detail, room);
+            pen = try drawRun(r, pen + bar_gap_cells * metrics.advance, y, value, theme.muted);
+        }
+    }
+    // The rule runs from the pen to the panel's edge, which is what makes the
+    // bar a bar rather than a line of text.
+    const edge = x + @as(f32, @floatFromInt(columns)) * metrics.advance;
+    const start = pen + bar_gap_cells * metrics.advance;
+    if (edge > start + @as(f32, @floatFromInt(bar_rule_cells)) * metrics.advance) {
+        try r.rect(.{ .x = start, .y = y + line_height / 2, .w = edge - start, .h = 1 }, theme.border);
+    }
+}
+
+/// The gutter: one column of the card's left edge, in the colour its state is
+/// read in. A settled call's gutter recedes, so the reader's eye goes to the
+/// call that is still moving.
+fn drawGutter(r: *Renderer, x: f32, y: f32, height: f32, colour: theme.Color) !void {
+    try r.rect(.{ .x = x, .y = y, .w = gutter_width, .h = height }, colour);
+}
+
+/// One row of a card's own: the digest, or a marker naming what a budget left
+/// out. A single span, so it needs no wrapping machinery of its own.
+fn drawText(span: tool_card.Span, r: *Renderer, x: f32, y: f32) !void {
+    try r.text(x, y, span.text, toneColor(span.tone));
 }
 
 /// Draw a run and answer where the pen stopped. `Renderer.text` draws a run but
-/// does not say where it ended, and a chip's word and mark have to follow one
-/// another.
+/// does not say where it ended, and a chip's word and glyph, or a bar's label
+/// and its detail, have to follow one another.
 fn drawRun(r: *Renderer, x: f32, y: f32, bytes: []const u8, colour: theme.Color) !f32 {
     var pen = x;
     var at: usize = 0;
@@ -250,43 +378,12 @@ fn drawRun(r: *Renderer, x: f32, y: f32, bytes: []const u8, colour: theme.Color)
     return pen;
 }
 
-/// The rows a field takes: the label's row holds the value's first row, and the
-/// rest of the value wraps under it in the column the label leaves.
-fn fieldRows(field: acp.Field, label: usize, columns: usize) usize {
-    return wrap.rowCount(field.value, columns -| label);
-}
-
-/// The rows a diff takes: one per path, hunk header, and line, each wrapped at
-/// the panel's column. A path that is not a diff is counted as the text it will
-/// be drawn as.
-fn diffCount(files: ?[]const diff.File, bytes: []const u8, columns: usize) usize {
-    const parsed = files orelse return textRows(bytes, columns);
-    const room = columns -| hang_cells;
-    var count: usize = 0;
-    for (parsed) |file| {
-        if (file.path.len > 0) count += 1;
-        for (file.hunks) |hunk| {
-            count += wrap.rowCount(hunk.header, room);
-            for (hunk.lines) |line| count += wrap.rowCount(line.text, room);
-        }
-    }
-    return count;
-}
-
-/// The rows plain text takes, which is one wrap per line it was written in.
-fn textRows(bytes: []const u8, columns: usize) usize {
-    var count: usize = 0;
-    var lines = std.mem.splitScalar(u8, bytes, '\n');
-    while (lines.next()) |line| count += wrap.rowCount(line, columns -| hang_cells);
-    return count;
-}
-
-/// The column a field's value starts at: the widest label plus two cells, so a
-/// reader scans the values down one column.
-fn labelColumn(fields: []const acp.Field, columns: usize) usize {
-    var widest: usize = 0;
-    for (fields) |field| widest = @max(widest, cellCount(field.label));
-    return @min(widest + 2, @max(3, columns / label_share));
+/// The columns a card's content has: the panel's, less the one a framed card's
+/// gutter takes. A quiet card is not indented, because nothing is drawn down
+/// its left edge.
+fn contentColumns(card: tool_card.Card, width: f32, metrics: Metrics) usize {
+    const gutter: usize = if (card.variant == .framed) gutter_cells else 0;
+    return columnsFor(width, metrics) -| gutter;
 }
 
 /// The cells a width holds.

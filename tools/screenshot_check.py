@@ -32,6 +32,10 @@ SCRIPT_FIXTURES = (
     ("CJK", "\u65e5\u672c\u8a9e\n\u4e2d\u6587\u6d4b\u8bd5\n"),
 )
 RUN_TIMEOUT = 120
+# Frames for the records fixture. Its turn is streamed with pauses - so a frame
+# can be drawn while a run is still arriving - and the click happens after the
+# turn, so the run has to outlast both.
+RECORDS_FRAMES = 200
 ATLAS_LINE = re.compile(r"atlas: (\d+) glyphs packed, (\d+) placeholder hits")
 WINDOW_LINE = re.compile(r"window after step (\d+): logical (\d+)x(\d+), pixels (\d+)x(\d+)")
 SCALE_LINE = re.compile(r"logical (\d+)x(\d+), pixels (\d+)x(\d+), scale (\d+\.\d+)")
@@ -72,7 +76,33 @@ IME_COMMIT = re.compile(r"ime: committed, document (\d+) -> (\d+) byte\(s\)")
 # words are the chip's own, so a chip that stopped naming its kind or its state
 # fails here rather than only looking different.
 CALLS_LINE = re.compile(r"calls: (\d+) drawn, (.+)")
+# The turn the records fixture answers with: the runs a reader meets (what each
+# line says and whether it is still arriving), the plans, the usage row, the
+# mode, the session's name, the commands it accepts and the compaction.
+RECORDS_LINE = re.compile(r"records: (\d+) runs drawn, (.+)")
+# The picture the records turn carries, as the census names it: what it is, the
+# size it decoded to, and the size it was drawn at. A picture that stopped being
+# drawn - or one that was counted as a part nobody could read - fails here.
+RECORDS_IMAGE = re.compile(r"images: image/png \u00b7 (\d+)\u00d7(\d+) \u00b7 (\d+) B \u00b7 shown (\d+)\u00d7(\d+) ")
+# The fixture's four quadrant colours. The picture is small enough to be drawn at
+# its own size, so each 8x8 quadrant is the colour that was sent, less the pixels
+# the diagonal crosses.
+QUADRANTS = ((220, 60, 60), (60, 200, 90), (60, 120, 240), (240, 200, 60))
+QUADRANT_PIXELS = 32
+RECORDS_PULSE = re.compile(r"records: mid-turn (.+)")
+RECORDS_CLICK_LINE = re.compile(r"records: the click on the reasoning changed open (true|false) -> (true|false)")
+RECORDS_OPEN_LINE = re.compile(r"records: open (.+)")
 CALL_CLICK_LINE = re.compile(r"calls: the click on the (\S+) changed open (true|false) -> (true|false)")
+# What the transcript panel says it drew, by block kind, from its own count of
+# the rows it put on the screen.
+MARKDOWN_BLOCKS = re.compile(r"transcript: blocks drawn: (.+)")
+LINK_CLICK = re.compile(r"transcript: a click on a link says: Opened (\S+)")
+MARKDOWN_FRAMES = 40
+# A tool call that embeds a terminal: the agent creates one through the client,
+# names it in a call, waits for it, and releases it. What the gate reads is the
+# count the *drawing* takes, which is above zero only where a screen was drawn.
+EMBEDDED_LINE = re.compile(r"embedded: (\d+) terminal\(s\) drawn after the agent released it; calls: (.+)")
+EMBEDDED_FRAMES = 200
 CALL_CHIP_WORDS = ("read \u2713", "edit \u2713", "run \u2717", "run \u25cf")
 CALL_FRAMES = 130
 # The composition is drawn in the theme's amber; nothing else in a session
@@ -912,13 +942,189 @@ def check_tool_calls(binary: str) -> None:
     shown = drawn.group(2)
     for word in CALL_CHIP_WORDS:
         require(word in shown, f"no chip showed {word!r}: {shown}")
-    click = CALL_CLICK_LINE.search(output)
-    require(click is not None, "the click on a call was never reported")
+    # Two clicks, because a card has two ends. The first lands on the card's last
+    # row - the marker saying how many lines were withheld - and has to open it;
+    # a marker that cannot be clicked is a number with no way to ask what it
+    # counts. The second lands on the chip and has to close it again; a card that
+    # opens and will not close is a card whose hit covers the wrong rows.
+    clicks = CALL_CLICK_LINE.findall(output)
+    require(len(clicks) >= 2, f"both clicks on a call were not reported: {clicks}")
+    first, second = clicks[0], clicks[1]
     require(
-        click.group(2) == "false" and click.group(3) == "true",
-        f"the click left {click.group(1)} open {click.group(2)} -> {click.group(3)}",
+        first[1] == "false" and first[2] == "true",
+        f"the click on the withheld marker left {first[0]} open {first[1]} -> {first[2]}",
     )
-    print(f"tool calls: {count} chips drawn ({shown}); the click opened the {click.group(1)}")
+    require(
+        second[1] == "true" and second[2] == "false",
+        f"the click on the chip left {second[0]} open {second[1]} -> {second[2]}",
+    )
+    print(f"tool calls: {count} chips drawn ({shown}); the withheld marker opened the {first[0]} and the chip closed it")
+
+
+def check_records(binary: str) -> None:
+    """A session's records are drawn as records, not as JSON and not dropped.
+
+    The fixture's turn carries every kind the interface draws from something
+    other than a tool call: a stream of reasoning (many chunks, one run), the
+    user's own words, a compaction summary, a plan that replaces itself, the
+    usage of the turn, the mode, what the session is called, and the commands it
+    accepts. What the gate reads is what a reader would: the words on each line,
+    that the reasoning is caught *while it is still arriving* and stops pulsing
+    when it settles, and that a click opens it - the last of which is the one
+    thing a run has no agent id for, so it is keyed by the handle the client
+    gave it, and a wrong key would open a different thought.
+    """
+    shot = Path("/tmp/seggs-records.ppm")
+    command = display_command([binary, "--windowed", "--frames", str(RECORDS_FRAMES), "--exercise-records", "--screenshot", str(shot)], app_env())
+    shot.unlink(missing_ok=True)
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+
+    # While it is arriving: the label says thinking, the mark is the running one,
+    # and the card is set to pulse, which is what the drawer turns into a moving
+    # glyph.
+    pulse = RECORDS_PULSE.search(output)
+    require(pulse is not None, "no run was reported while it was arriving")
+    mid = pulse.group(1)
+    require("thinking ●" in mid, f"a run that is still arriving is not labelled as thinking: {mid}")
+    require("pulse" in mid, f"a run that is still arriving is not set to pulse: {mid}")
+
+    drawn = RECORDS_LINE.search(output)
+    require(drawn is not None, "no records were drawn")
+    count = int(drawn.group(1))
+    require(count >= 3, f"expected the turn's three runs, saw {count}")
+    shown = drawn.group(2)
+    # Settled: the pulse stopped and the count is final, which is the whole
+    # difference between "the agent is working" and "the agent has stopped".
+    runs_only = shown.split("plans:")[0]
+    require("thought ✓" in shown, f"the settled reasoning is not labelled as finished: {shown}")
+    require("pulse" not in runs_only, f"a settled run is still pulsing: {runs_only}")
+    # A picture is drawn rather than counted. The run it arrived in must not
+    # report a part nobody could read - that marker is for a content type this
+    # client keeps nowhere, and a picture is kept - and the picture itself has to
+    # be in the census with the size it decoded to and the size it was drawn at.
+    require("part not text" not in shown, f"a picture was counted as an unreadable part: {shown}")
+    picture = RECORDS_IMAGE.search(shown)
+    require(picture is not None, f"the picture is not reported as drawn: {shown}")
+    require((int(picture.group(1)), int(picture.group(2))) == (16, 16), f"the picture decoded to {picture.group(1)}x{picture.group(2)}")
+    require("you" in shown, f"the user's own words were not drawn: {shown}")
+    # A plan is a checklist with a mark per task, the working one standing out,
+    # and the priority shown only where it says something.
+    require("1/3 done" in shown, f"the plan's progress is not on its line: {shown}")
+    require("✓   capture the reasoning" in shown, f"the finished task has no mark: {shown}")
+    require("●   draw it where it happened" in shown, f"the task in hand has no mark: {shown}")
+    require("○   show what a turn cost" in shown, f"a waiting task has no mark: {shown}")
+    require("· high" in shown and "· low" in shown, f"priority is missing where it matters: {shown}")
+    # Usage, mode, name, commands, compaction. The two usage placements are read
+    # at the widths they are really drawn in, so the cost has to survive the
+    # narrow one: a bar is a picture of the counts beside it and a share is
+    # arithmetic on them, which is why both are given up before the cost is.
+    require("42k/200k" in shown, f"the usage row lost its counts: {shown}")
+    require("21%" in shown, f"the usage footer lost its share: {shown}")
+    require("$1.25" in shown, f"the usage row lost its cost: {shown}")
+    gauge = shown.split("usage gauge:")[1].split(" footer:")[0].strip() if "usage gauge:" in shown else ""
+    require(gauge.startswith("42k/200k"), f"the standing gauge does not lead with the counts: {gauge}")
+    require("$1.25" in gauge, f"the standing gauge dropped the cost at the width it is drawn in: {gauge}")
+    require("mode: plan" in shown, f"the mode was not drawn: {shown}")
+    require("title: Records fixture" in shown, f"the session's name was not drawn: {shown}")
+    require("commands: compact research" in shown, f"the agent's commands were not drawn: {shown}")
+    require("mock-compaction/completed" in shown, f"the compaction was not drawn: {shown}")
+
+    # And the pixels: the census says what the drawing did, and this says the
+    # pixels reached the screen. The fixture's quadrants are a colour nothing
+    # else in the interface uses, so finding them in the frame is finding the
+    # picture - a client whose decode succeeded but whose quad never landed
+    # passes every string check above and fails this one.
+    require(shot.exists(), f"{shot}: the records run wrote no screenshot")
+    width, height, pixels = parse_ppm(shot)
+    counted = {
+        colour: sum(1 for index in range(0, width * height * 3, 3) if pixels[index : index + 3] == bytes(colour))
+        for colour in QUADRANTS
+    }
+    drawn = [colour for colour, count in counted.items() if count >= QUADRANT_PIXELS]
+    require(len(drawn) >= 3, f"the picture is not on screen: quadrant pixels {counted}")
+
+    click = RECORDS_CLICK_LINE.search(output)
+    require(click is not None, "the click on the reasoning was never reported")
+    require(
+        click.group(1) == "false" and click.group(2) == "true",
+        f"the click left the reasoning open {click.group(1)} -> {click.group(2)}",
+    )
+    opened = RECORDS_OPEN_LINE.search(output)
+    require(opened is not None, "the opened run was never reported")
+    # Opening a run shows its text: the shut line is one row, and the open one is
+    # the reasoning itself, which is the difference a reader asked for.
+    require("thought ✓=73 B open/" in opened.group(1), f"the open run is not the one that was clicked: {opened.group(1)}")
+    require("shut/1 row(s)" in opened.group(1), f"a shut run is not one line: {opened.group(1)}")
+    print(f"records: {count} runs drawn; the reasoning pulsed while it arrived and a click opened it ({runs_only.strip()})")
+
+
+def check_embedded(binary: str) -> None:
+    """A call that ran in a terminal shows that terminal's output.
+
+    The protocol's sentence has two halves and the second is the interesting one:
+    *"the Client displays live output as it's generated and continues to display
+    it even after the terminal is released."* The release is what makes this worth
+    asserting - `terminal/release` frees the client's record, so a client that
+    reads the terminal at the point of drawing blanks the output the moment the
+    agent is done with it. The count the gate reads is taken after the release
+    has been answered, and it is incremented where the screen is drawn, so a
+    non-zero count is a screen the editor kept rather than a record that happened
+    to still exist.
+    """
+    command = display_command([binary, "--windowed", "--frames", str(EMBEDDED_FRAMES), "--exercise-embedded"], app_env())
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+
+    drawn = EMBEDDED_LINE.search(output)
+    require(drawn is not None, "the embedded terminal was never reported")
+    require(int(drawn.group(1)) >= 1, f"the call's terminal was not drawn after release: {drawn.group(0)}")
+    # The call itself has to have been drawn too, or the terminal is floating
+    # under nothing: the chip is what says which command ran in it.
+    require("run \u2713" in drawn.group(2), f"the call that embedded the terminal is not drawn: {drawn.group(2)}")
+
+    print(f"embedded: {drawn.group(1)} terminal(s) drawn after the agent released it; calls: {drawn.group(2)}")
+
+
+def check_markdown(binary: str) -> None:
+    """Prose is drawn by the arms that claim it, counted where it is drawn.
+
+    The sample the transcript exercise feeds carries the constructs whose
+    drawing is otherwise only asserted by reading the code: a table that fits
+    the panel and one that does not, a formula inline and one set apart, a
+    struck word, and a link. What the gate reads is the panel's own census of
+    the rows it put on the screen, by block kind - so an arm that stopped
+    drawing anything is a count of zero rather than a line someone has to
+    notice is missing - and it clicks the link, because a target that does
+    nothing is worse than one not drawn as a target.
+
+    Only a row the window shows is counted, so the kinds absent from the census
+    are the ones below the fold rather than the ones that failed: this asserts
+    what did reach the screen, not what did not.
+    """
+    command = display_command([binary, "--windowed", "--frames", str(MARKDOWN_FRAMES), "--exercise-transcript"], app_env())
+    result = subprocess.run(command, check=True, env=app_env(), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=RUN_TIMEOUT)
+    output = app_output(result)
+
+    drawn = MARKDOWN_BLOCKS.search(output)
+    require(drawn is not None, "the transcript never reported what it drew")
+    census = drawn.group(1)
+    counts = dict((name, int(value)) for name, value in (part.split("=") for part in census.split()))
+    require(counts.get("table", 0) >= 1, f"no table row reached the screen: {census}")
+    require(counts.get("math", 0) >= 1, f"no formula row reached the screen: {census}")
+    # The inline marks need their own counts, because a block's kind says nothing
+    # about what is inside it: a paragraph holding a struck word is one
+    # paragraph, so the block census would be unchanged if the rule stopped being
+    # drawn. Two link runs is the expected number for one link - the words and
+    # the address are separate runs and both are targets.
+    require(counts.get("struck", 0) >= 1, f"no struck run reached the screen: {census}")
+    require(counts.get("links", 0) >= 1, f"no link run reached the screen: {census}")
+
+    clicked = LINK_CLICK.search(output)
+    require(clicked is not None, "the click on a link was never reported")
+    require("agentclientprotocol.com" in clicked.group(1), f"the click did not reach the link's address: {clicked.group(1)}")
+
+    print(f"markdown: {census}; a click on a link opened {clicked.group(1)}")
 
 
 def main() -> int:
@@ -950,11 +1156,14 @@ def main() -> int:
         check_compose(binary)
         check_tabs(binary)
         check_tool_calls(binary)
+        check_records(binary)
+        check_markdown(binary)
+        check_embedded(binary)
         check_terminal_paints(binary)
     except (OSError, subprocess.CalledProcessError, ValueError) as err:
         print(f"FAIL: {err}", file=sys.stderr)
         return 1
-    print("PASS: renders agree, glyphs draw at the reported scale and baseline, composition draws and commits, extension panels take events and reload, fallback covers uncovered scripts, window transitions hold, tool calls draw as chips and open on a click, a live shell paints")
+    print("PASS: renders agree, glyphs draw at the reported scale and baseline, composition draws and commits, extension panels take events and reload, fallback covers uncovered scripts, window transitions hold, tool calls draw as chips and open on a click, a session's records draw as records (reasoning pulses while it arrives, a picture arrives and is drawn, and a click opens it), prose draws the blocks it claims and a clicked link opens, a call's terminal draws and outlives its release, a live shell paints")
     return 0
 
 

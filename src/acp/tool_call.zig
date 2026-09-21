@@ -53,6 +53,16 @@ pub const ToolCall = struct {
     id: []const u8,
     /// What the agent called the call.
     title: []const u8,
+    /// The programmatic name of the tool - `read_file`, `ast_grep` - when the
+    /// agent gives one. It is optional in the protocol and absent from most
+    /// updates, but it is the tool's own word rather than a sentence about it,
+    /// so it says what a call is better than the title does and better than a
+    /// kind that only knows ten categories.
+    name: []const u8,
+    /// The id of the terminal this call ran in, when it embeds one. It is the
+    /// client's own handle for a terminal it created, so the drawing resolves it
+    /// rather than reading output kept here.
+    terminal_id: []const u8,
     kind: Kind,
     state: State,
     /// The one line a reader scans: a path, a command, a query, or a URL.
@@ -117,10 +127,21 @@ pub fn parse(a: Allocator, update: std.json.Value) !ToolCall {
 
     const id = optional(update, "toolCallId") orelse "";
     const title = optional(update, "title") orelse "";
+    // The tool's own name, when the agent gives one. ACP makes it optional and
+    // most updates leave it out, but where it exists it is the better hint:
+    // `read_file` is what the tool is called, where the title is a sentence the
+    // agent wrote about it.
+    const name = optional(update, "name") orelse "";
     const named_kind = optional(update, "kind") orelse "";
-    // An update often carries no kind: it is the same call, and its title is
-    // where the words for it are.
-    const kind: Kind = if (named_kind.len != 0) kindOf(named_kind) else kindOf(title);
+    // An update often carries no kind: it is the same call, and the words for it
+    // are in the name or the title. The name is asked first for the reason
+    // above, and the title is the fallback that has always been here.
+    const kind: Kind = if (named_kind.len != 0)
+        kindOf(named_kind)
+    else if (name.len != 0)
+        kindOf(name)
+    else
+        kindOf(title);
     const state = stateOf(optional(update, "status") orelse "");
 
     var reading = Reading{};
@@ -162,8 +183,10 @@ pub fn parse(a: Allocator, update: std.json.Value) !ToolCall {
 
     // The record owns what it keeps; the scratch arena dies with this call.
     var call: ToolCall = .{
-        .id = try bounded(a, id, max_value_bytes),
+        .id = try bounded(a, id, max_value_bytes, .head),
         .title = &.{},
+        .name = &.{},
+        .terminal_id = &.{},
         .kind = kind,
         .state = state,
         .subject = &.{},
@@ -172,8 +195,10 @@ pub fn parse(a: Allocator, update: std.json.Value) !ToolCall {
         .at = 0,
     };
     errdefer deinit(&call, a);
-    call.title = try bounded(a, title, max_line_bytes);
-    call.subject = try bounded(a, subjectOf(kind, &reading, title), max_line_bytes);
+    call.title = try bounded(a, title, max_line_bytes, .head);
+    call.name = try bounded(a, name, max_line_bytes, .head);
+    call.terminal_id = try bounded(a, reading.terminal_id, max_value_bytes, .head);
+    call.subject = try bounded(a, subjectOf(kind, &reading, title), max_line_bytes, .head);
     if (reading.diff.items.len != 0) call.diff = try a.dupe(u8, reading.diff.items);
     var owned: std.ArrayList(Field) = .empty;
     errdefer {
@@ -197,6 +222,8 @@ pub fn parse(a: Allocator, update: std.json.Value) !ToolCall {
 pub fn deinit(call: *ToolCall, a: Allocator) void {
     a.free(call.id);
     a.free(call.title);
+    a.free(call.name);
+    a.free(call.terminal_id);
     a.free(call.subject);
     for (call.fields) |field| freeField(field, a);
     if (call.fields.len != 0) a.free(call.fields);
@@ -204,6 +231,8 @@ pub fn deinit(call: *ToolCall, a: Allocator) void {
     call.* = .{
         .id = &.{},
         .title = &.{},
+        .name = &.{},
+        .terminal_id = &.{},
         .kind = .other,
         .state = .pending,
         .subject = &.{},
@@ -267,6 +296,19 @@ pub fn merge(calls: *std.ArrayList(ToolCall), a: Allocator, parsed: ToolCall) !v
             if (next.title.len == 0) {
                 next.title = stored.title;
                 stored.title = &.{};
+            }
+            // The protocol's rule for a name, kept exactly: an update that
+            // carries one sets or replaces it, and one that omits it - or sends
+            // null, which reads here as an empty string - leaves the stored name
+            // standing. ACP v1 has no way to clear a name, so there is no case
+            // where this falls through to nothing.
+            if (next.terminal_id.len == 0) {
+                next.terminal_id = stored.terminal_id;
+                stored.terminal_id = &.{};
+            }
+            if (next.name.len == 0) {
+                next.name = stored.name;
+                stored.name = &.{};
             }
             if (next.subject.len == 0) {
                 next.subject = stored.subject;
@@ -401,22 +443,53 @@ fn firstLine(text: []const u8) []const u8 {
     return if (line.len > 0 and line[line.len - 1] == '\r') line[0 .. line.len - 1] else line;
 }
 
-/// A value no longer than `limit`, with what was left out said out loud. A
-/// multi-line value keeps its first line: the rest of a file body in a chip is
-/// the dump this replaces. Nothing is quiet about the cut, because a reader who
-/// cannot see that a value continues reads a truncation as the value.
-fn bounded(a: Allocator, text: []const u8, limit: usize) ![]u8 {
+/// Which end of a value is worth keeping.
+///
+/// An identity - a path, a command, a query, a title - is named by its front,
+/// and the rest of a file body in a chip is the dump this replaces. Output is
+/// the other way round: the first line of a failing command is a banner, and
+/// the line that says why it failed is at the end, so cutting an output from
+/// the front throws away the only part a reader wanted.
+const End = enum { head, tail };
+
+/// Whether a value under this label is output, and so kept from the back.
+fn keepsTail(label: []const u8) bool {
+    for (output_keys) |key| {
+        if (std.mem.eql(u8, label, key)) return true;
+    }
+    return false;
+}
+
+/// A value no longer than `limit`, with what was left out said out loud and
+/// said *where*: a head that was cut keeps its front and notes the rest after
+/// it, a tail that was cut keeps its end and notes the omission above. Nothing
+/// is quiet about the cut, because a reader who cannot see that a value
+/// continues reads a truncation as the value.
+fn bounded(a: Allocator, text: []const u8, limit: usize, end: End) ![]u8 {
     // A value that ends in a newline is the same value without it, and the note
     // is about content rather than about line endings.
     const value = std.mem.trimEnd(u8, text, "\r\n");
     if (value.len == 0) return &.{};
-    const line = firstLine(value);
-    var cut = @min(line.len, limit);
-    // Never cut a character in half: the next byte starts one.
-    while (cut < line.len and line[cut] & 0xc0 == 0x80) : (cut += 1) {}
-    const shown = line[0..cut];
-    if (shown.len == value.len) return a.dupe(u8, value);
-    return std.fmt.allocPrint(a, "{s} … ({d} bytes omitted)", .{ shown, value.len - shown.len });
+    switch (end) {
+        .head => {
+            const line = firstLine(value);
+            var cut = @min(line.len, limit);
+            // Never cut a character in half: the next byte starts one.
+            while (cut < line.len and line[cut] & 0xc0 == 0x80) : (cut += 1) {}
+            const shown = line[0..cut];
+            if (shown.len == value.len) return a.dupe(u8, value);
+            return std.fmt.allocPrint(a, "{s} … ({d} bytes omitted)", .{ shown, value.len - shown.len });
+        },
+        .tail => {
+            var start = value.len - @min(value.len, limit);
+            // The same rule from the other side: a kept region never begins in
+            // the middle of a character either.
+            while (start < value.len and value[start] & 0xc0 == 0x80) : (start += 1) {}
+            const shown = value[start..];
+            if (shown.len == value.len) return a.dupe(u8, value);
+            return std.fmt.allocPrint(a, "… ({d} bytes omitted) {s}", .{ value.len - shown.len, shown });
+        },
+    }
 }
 
 fn freeField(field: Field, a: Allocator) void {
@@ -497,6 +570,11 @@ const Reading = struct {
     mode: []const u8 = "",
     matches: []const u8 = "",
     exit_code: []const u8 = "",
+    /// The id of a terminal the call embeds, from a `terminal` content part.
+    /// The record keeps the id rather than the bytes: the terminal belongs to
+    /// the client's own table, and a call that held a copy of its output would
+    /// be a call that stops agreeing with it.
+    terminal_id: []const u8 = "",
     output: []const u8 = "",
     first_text: []const u8 = "",
     text_diff: []const u8 = "",
@@ -520,6 +598,16 @@ const Reading = struct {
     /// One content part: the two sides of an edit, the text a tool wrote, or a
     /// diff it printed.
     fn readPart(self: *Reading, a: Allocator, part: std.json.Value) !void {
+        // A terminal the call ran in. The spec has the client show that
+        // terminal's live output where the call is drawn and keep showing it
+        // after the terminal is released, so the record keeps the id and the
+        // drawing asks the client's own table for it - a copy taken here would
+        // be a second answer to what the terminal said.
+        if (std.mem.eql(u8, rpc.str(part, "type"), "terminal")) {
+            const id = rpc.str(part, "terminalId");
+            if (self.terminal_id.len == 0 and id.len != 0) self.terminal_id = id;
+            return;
+        }
         if (std.mem.eql(u8, rpc.str(part, "type"), "diff")) {
             const path = rpc.str(part, "path");
             if (self.path.len == 0 and path.len != 0) self.path = path;
@@ -681,12 +769,12 @@ const Fields = struct {
     /// value is the same thing said twice, and the list stops at `max_fields`.
     fn add(self: *Fields, label: []const u8, value: []const u8) !void {
         if (value.len == 0 or self.list.items.len == max_fields) return;
-        const shown = try bounded(self.a, value, max_value_bytes);
+        const shown = try bounded(self.a, value, max_value_bytes, if (keepsTail(label)) .tail else .head);
         if (shown.len == 0) return;
         for (self.list.items) |field| {
             if (std.mem.eql(u8, field.label, label) and std.mem.eql(u8, field.value, shown)) return;
         }
-        const word = if (label.len <= max_label_bytes) label else try bounded(self.a, label, max_label_bytes);
+        const word = if (label.len <= max_label_bytes) label else try bounded(self.a, label, max_label_bytes, .head);
         try self.list.append(self.a, .{ .label = word, .value = shown });
     }
 
@@ -805,6 +893,15 @@ fn labelFor(key: []const u8) []const u8 {
 /// because pairing a removed line with the added one that replaced it is a
 /// guess, and a reader is better served by the two lists the diff reader
 /// colours than by the guess.
+///
+/// This is not a diff and must not be turned into one. What arrives here is an
+/// agent's `oldText`/`newText`, which is an excerpt of the edit's arguments and
+/// not a pair of files: a real diff would need the file read, and diffing the
+/// two excerpts would *invent* context lines the agent never sent - lines a
+/// reader would take for the file, which is the one thing a diff is not
+/// allowed to do. A tool that wants a hunked diff sends one, and takes the
+/// `text_diff` path below; the two lists are the honest answer to what this
+/// one carries.
 fn writeDiff(a: Allocator, out: *std.ArrayList(u8), path: []const u8, old: []const u8, new: []const u8) !void {
     if (old.len == 0 and new.len == 0) return;
     if (out.items.len != 0 and out.items[out.items.len - 1] != '\n') try out.append(a, '\n');
@@ -1113,7 +1210,7 @@ test "an update to a call already seen keeps its place, its kind and its fields"
     try testing.expectEqualStrings("one more line", fieldOf(calls.items[0], "output").?);
 }
 
-test "a long value keeps its first line and says what it left out" {
+test "a long output keeps its end, because that is where the reason is" {
     const a = testing.allocator;
     const long = try a.alloc(u8, 4000);
     defer a.free(long);
@@ -1131,14 +1228,40 @@ test "a long value keeps its first line and says what it left out" {
 
     try testing.expectEqualStrings("cat big.txt", call.subject);
     try testing.expectEqualStrings("2", fieldOf(call, "exit code").?);
+    // A failing command says why on its last line. Keeping the front of a long
+    // dump keeps the banner and throws away the reason, so an output is cut
+    // from the other end.
     const output = fieldOf(call, "output").?;
-    // One line, cut at the bound, and honest about the rest: the body of the
-    // file is not passed through as if it were the value.
     try testing.expect(output.len < max_value_bytes + 64);
-    try testing.expect(std.mem.startsWith(u8, output, "xxx"));
-    try testing.expect(std.mem.endsWith(u8, output, "bytes omitted)"));
-    try testing.expect(std.mem.indexOfScalar(u8, output, '\n') == null);
-    try testing.expect(std.mem.indexOf(u8, output, "second line") == null);
+    try testing.expect(std.mem.endsWith(u8, output, "second line"));
+    // And the cut is said where it happened: above what was kept.
+    try testing.expect(std.mem.startsWith(u8, output, "… ("));
+    try testing.expect(std.mem.indexOf(u8, output, "bytes omitted)") != null);
+}
+
+test "a long identity keeps its front, because the name is at the beginning" {
+    const a = testing.allocator;
+    const long = try a.alloc(u8, 4000);
+    defer a.free(long);
+    @memset(long, 'd');
+    const path = try std.fmt.allocPrint(a, "{s}/file.zig", .{long});
+    defer a.free(path);
+    const text = try std.fmt.allocPrint(a,
+        \\{{"sessionUpdate":"tool_call","toolCallId":"p1","title":"Read","kind":"read","status":"completed",
+        \\ "rawInput":{{"file_path":"{s}"}}}}
+    , .{path});
+    defer a.free(text);
+    const parsed = try readJson(a, text);
+    defer parsed.deinit();
+    var call = try parse(a, parsed.value);
+    defer deinit(&call, a);
+
+    // A path is named by its front, and the rest of a file body in a chip is
+    // the dump this replaces: the same value cut from the other end.
+    const shown = fieldOf(call, "path").?;
+    try testing.expect(shown.len < max_value_bytes + 64);
+    try testing.expect(std.mem.startsWith(u8, shown, "ddd"));
+    try testing.expect(std.mem.endsWith(u8, shown, "bytes omitted)"));
 }
 
 test "a transcript that drops its oldest bytes moves every chip with it" {

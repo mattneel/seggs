@@ -1,4 +1,7 @@
 const std = @import("std");
+const math = @import("ui/math.zig");
+const app = @import("app.zig");
+const markdown = @import("ui/markdown.zig");
 const builtin = @import("builtin");
 
 /// The mock servers are Python programs. Windows installs the interpreter as
@@ -861,4 +864,117 @@ test "pty spawns a shell and echoes output" {
         n += count;
     }
     try std.testing.expect(std.mem.indexOf(u8, buf[0..n], "seggs-pty") != null);
+}
+
+test "the TeX engine lays out a formula" {
+    // The engine reads its tables from a directory, so this is the one test that
+    // needs the dependency tree present. It is fetched by the bootstrap, not
+    // committed, so a tree without it skips rather than fails - the same
+    // bargain the live-agent integration tests make.
+    if (!math.init(math.resourceDir())) return error.SkipZigTest;
+
+    // "\frac{1}{3}", as codepoints: the engine reads mathematics as text, not
+    // as bytes.
+    var source: [11]u32 = undefined;
+    const text = "\\frac{1}{3}";
+    for (text, 0..) |byte, i| source[i] = byte;
+
+    const formula = math.parse(&source, 0, 20, 0, .{ 1, 1, 1, 1 }) orelse return error.ParseFailed;
+    defer formula.deinit();
+
+    const metrics = formula.measure();
+    // A fraction stacks a numerator over a denominator, so it is narrower than
+    // it is tall - which a formula renderer that ignored the layout would get
+    // wrong by drawing the source.
+    try std.testing.expect(metrics.width > 0);
+    try std.testing.expect(metrics.height > metrics.width);
+    // The denominator hangs below the baseline, and the engine reports that
+    // separately because placing the formula in a row of text needs it.
+    try std.testing.expect(metrics.depth > 0);
+}
+
+test "a cached formula holds after the frame that laid it out is gone" {
+    // The transcript lays its rows out against a frame arena that is reset when
+    // the frame ends, and a formula is cached for the life of the process. A
+    // cache built out of that arena would hold pointers into memory that the
+    // next frame has already reused, which is a segfault rather than a wrong
+    // answer - so the sequence below is the one that has to be safe.
+    if (!math.init(math.resourceDir())) return error.SkipZigTest;
+
+    var source: [11]u32 = undefined;
+    const text = "\\frac{1}{3}";
+    for (text, 0..) |byte, i| source[i] = byte;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    // Churn the arena the way a frame does, so anything held on it is reused
+    // rather than merely released.
+    _ = try arena.allocator().alloc(u8, 4096);
+    _ = arena.reset(.retain_capacity);
+
+    const first = math.parseCached(&source, 20, 0, .{ 1, 1, 1, 1 }) orelse return error.ParseFailed;
+
+    // A whole frame passes, and the arena it ran on is reset.
+    _ = try arena.allocator().alloc(u8, 4096);
+    _ = arena.reset(.retain_capacity);
+
+    // The second call is answered from the cache, and it is the same layout:
+    // laying it out again would be a different handle.
+    const second = math.parseCached(&source, 20, 0, .{ 1, 1, 1, 1 }) orelse return error.ParseFailed;
+    try std.testing.expectEqual(first.handle, second.handle);
+    try std.testing.expect(second.measure().width > 0);
+}
+
+test "the transcript typesets a display formula instead of showing its source" {
+    // The contract is the rows, not the engine: the engine laid formulas out
+    // correctly while the transcript went on drawing the LaTeX, because the form
+    // an agent writes was not the form the parser opened a display block with.
+    // So this asserts what the reader sees.
+    // The transcript lays its rows out against an arena that it throws away
+    // whole, so the test does the same rather than tracking every span.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Asserted, not skipped. The tree is present in every build that gets this
+    // far, and a skip is how that went unnoticed.
+    try std.testing.expect(math.init(math.resourceDir()));
+
+    // Both ways an agent writes display math, because they reach the parser by
+    // different roads - delimiters on one line, and an opener and closer of
+    // their own.
+    const sources = [_][]const u8{
+        "A fraction:\n\n$$\\frac{1}{3}$$\n\nAnd after.\n",
+        "A fraction:\n\n$$\n\\frac{1}{3}\n$$\n\nAnd after.\n",
+    };
+    for (sources) |source| {
+        const blocks = try markdown.parse(a, source);
+        const rows = try app.transcriptRows(a, blocks, 80, 9.5, 22);
+
+        var typeset: ?app.RowFormula = null;
+        var at: usize = 0;
+        for (rows, 0..) |row, i| {
+            if (row.formula) |formula| {
+                typeset = formula;
+                at = i;
+            }
+        }
+        // A row carries the layout, and a fraction is taller than it is wide -
+        // which a row of source text is not.
+        try std.testing.expect(typeset != null);
+        try std.testing.expect(typeset.?.height > typeset.?.width);
+        // A fraction is taller than one line, so it must occupy more than one
+        // row: the walk gives each row a single line of height, and a formula
+        // that claimed only one was drawn over the block under it.
+        try std.testing.expect(rows[at].lines > 1);
+        for (rows[at + 1 .. at + rows[at].lines]) |row| {
+            try std.testing.expect(row.continuation);
+        }
+        // And the source is replaced rather than drawn beside the formula, which
+        // is what "jumbled" was: both of them at once.
+        for (rows) |row| {
+            for (row.spans) |span| {
+                try std.testing.expect(std.mem.indexOf(u8, span.text, "\\frac") == null);
+            }
+        }
+    }
 }

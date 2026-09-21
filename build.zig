@@ -30,6 +30,12 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     }) });
+    // The image path decodes with zignal - a codec library with no dependencies
+    // of its own - and what it refuses is worth testing where the rest of the
+    // core is tested. The decoder and the tests that prove its bounds are the
+    // same build, so a limit that stops being enforced fails here rather than in
+    // a run that needs a display.
+    unit.root_module.addImport("zignal", zignal.module("zignal"));
     const test_step = b.step("test", "Run the pure Zig core tests");
     test_step.dependOn(&b.addRunArtifact(unit).step);
 
@@ -159,11 +165,148 @@ pub fn build(b: *std.Build) void {
     app.addImport("shaders", shaders);
     app.addImport("quickjs", qjs.module("quickjs"));
     app.addImport("zignal", zignal.module("zignal"));
+    // MicroTex: the TeX engine behind display math.
+    //
+    // Its own CMake requires a GUI backend on Linux - gtkmm or Qt - and the
+    // library has no such dependency. What is compiled here is the engine: the
+    // atom/box tree, the parsers, the macros, and thirty-five font tables that
+    // are C++ source rather than a font binary. Nothing here needs a toolkit,
+    // and the drawing comes from the editor through the library's own abstract
+    // Graphics2D, which src/ui/microtex_shim.cpp implements over callbacks.
+    //
+    // The list is explicit rather than globbed for the reason the Yoga list
+    // above is: bumping the pin then fails here rather than silently compiling a
+    // partial engine and rendering wrong.
+    const microtex_root = b.path(".deps/MicroTex");
+    const microtex_lib = b.addLibrary(.{ .name = "microtex", .root_module = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    }) });
+    microtex_lib.root_module.addIncludePath(microtex_root.path(b, "src"));
+    microtex_lib.root_module.addIncludePath(microtex_root.path(b, "src/graphic"));
+    microtex_lib.root_module.addCSourceFiles(.{
+        .root = microtex_root,
+        .flags = &.{"-std=c++17"},
+        .files = &.{
+            "src/atom/atom_basic.cpp",
+            "src/atom/atom_char.cpp",
+            "src/atom/atom_impl.cpp",
+            "src/atom/atom_matrix.cpp",
+            "src/atom/atom_row.cpp",
+            "src/atom/atom_space.cpp",
+            "src/atom/colors_def.cpp",
+            "src/atom/unit_conversion.cpp",
+            "src/box/box.cpp",
+            "src/box/box_factory.cpp",
+            "src/box/box_group.cpp",
+            "src/box/box_single.cpp",
+            "src/core/core.cpp",
+            "src/core/formula.cpp",
+            "src/core/formula_def.cpp",
+            "src/core/glue.cpp",
+            "src/core/localized_num.cpp",
+            "src/core/macro.cpp",
+            "src/core/macro_def.cpp",
+            "src/core/macro_impl.cpp",
+            "src/core/parser.cpp",
+            "src/fonts/alphabet.cpp",
+            "src/fonts/font_basic.cpp",
+            "src/fonts/font_info.cpp",
+            "src/fonts/fonts.cpp",
+            "src/utils/string_utils.cpp",
+            "src/utils/utf.cpp",
+            "src/utils/utils.cpp",
+            "src/res/builtin/formula_mappings.res.cpp",
+            "src/res/builtin/symbol_mapping.res.cpp",
+            "src/res/builtin/tex_param.res.cpp",
+            "src/res/builtin/tex_symbols.res.cpp",
+            "src/res/font/bi10.def.cpp",
+            "src/res/font/bx10.def.cpp",
+            "src/res/font/cmbsy10.def.cpp",
+            "src/res/font/cmbx10.def.cpp",
+            "src/res/font/cmbxti10.def.cpp",
+            "src/res/font/cmex10.def.cpp",
+            "src/res/font/cmmi10.def.cpp",
+            "src/res/font/cmmi10_unchanged.def.cpp",
+            "src/res/font/cmmib10.def.cpp",
+            "src/res/font/cmmib10_unchanged.def.cpp",
+            "src/res/font/cmr10.def.cpp",
+            "src/res/font/cmss10.def.cpp",
+            "src/res/font/cmssbx10.def.cpp",
+            "src/res/font/cmssi10.def.cpp",
+            "src/res/font/cmsy10.def.cpp",
+            "src/res/font/cmti10.def.cpp",
+            "src/res/font/cmti10_unchanged.def.cpp",
+            "src/res/font/cmtt10.def.cpp",
+            "src/res/font/dsrom10.def.cpp",
+            "src/res/font/eufb10.def.cpp",
+            "src/res/font/eufm10.def.cpp",
+            "src/res/font/i10.def.cpp",
+            "src/res/font/moustache.def.cpp",
+            "src/res/font/msam10.def.cpp",
+            "src/res/font/msbm10.def.cpp",
+            "src/res/font/r10.def.cpp",
+            "src/res/font/r10_unchanged.def.cpp",
+            "src/res/font/rsfs10.def.cpp",
+            "src/res/font/sb10.def.cpp",
+            "src/res/font/sbi10.def.cpp",
+            "src/res/font/si10.def.cpp",
+            "src/res/font/special.def.cpp",
+            "src/res/font/ss10.def.cpp",
+            "src/res/font/stmary10.def.cpp",
+            "src/res/font/tt10.def.cpp",
+            "src/res/parser/font_parser.cpp",
+            "src/res/parser/formula_parser.cpp",
+            "src/res/reg/builtin_font_reg.cpp",
+            "src/res/reg/builtin_syms_reg.cpp",
+            "src/res/sym/amsfonts.def.cpp",
+            "src/res/sym/amssymb.def.cpp",
+            "src/res/sym/base.def.cpp",
+            "src/res/sym/stmaryrd.def.cpp",
+            "src/res/sym/symspecial.def.cpp",
+            "src/latex.cpp",
+            "src/render.cpp",
+        },
+    });
+    // The one system dependency the engine has, alongside a C++17 compiler.
+    // MicroTex parses its resource XML with it; the repository treats it the way
+    // it treats FreeType for SDL_ttf, as a documented system package.
+    microtex_lib.root_module.linkSystemLibrary("tinyxml2", .{ .use_pkg_config = .force });
+
     app.addImport("yoga", yoga_module);
     // QuickJS-NG bindings use splitType, which needs LLVM codegen in Zig 0.16.
     const exe = b.addExecutable(.{ .name = "seggs", .root_module = app, .use_llvm = true });
     exe.root_module.linkLibrary(qjs.artifact("quickjs-ng"));
     exe.root_module.linkLibrary(yoga_lib);
+    exe.root_module.linkLibrary(microtex_lib);
+    exe.root_module.addIncludePath(microtex_root.path(b, "src"));
+    exe.root_module.addIncludePath(microtex_root.path(b, "src/graphic"));
+    exe.root_module.addIncludePath(b.path("src/ui"));
+    // The backing that turns the engine's abstract Graphics2D into calls on
+    // this renderer. It is one translation unit and it belongs to the app, not
+    // to the engine: the engine ships one of these per toolkit and knows
+    // nothing about ours.
+    exe.root_module.addCSourceFiles(.{
+        .root = b.path("."),
+        .flags = &.{"-std=c++17"},
+        .files = &.{"src/ui/microtex_shim.cpp"},
+    });
+    exe.root_module.linkSystemLibrary("tinyxml2", .{ .use_pkg_config = .force });
+    exe.root_module.link_libcpp = true;
+    // The C surface of the shim, so Zig can call it without a C++ compiler in
+    // the loop: the same translate-c step the Yoga module above uses.
+    const microtex_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/ui/microtex.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    microtex_c.addIncludePath(b.path("src/ui"));
+    const microtex_module = microtex_c.createModule();
+    microtex_module.link_libc = true;
+    exe.root_module.addImport("microtex", microtex_module);
+
     b.installArtifact(exe);
     b.installFile("tools/mock_agent.py", "share/seggs/mock_agent.py");
     const run = b.addRunArtifact(exe);
@@ -204,6 +347,18 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         }),
     });
+    native_test.root_module.linkLibrary(microtex_lib);
+    native_test.root_module.addIncludePath(microtex_root.path(b, "src"));
+    native_test.root_module.addIncludePath(microtex_root.path(b, "src/graphic"));
+    native_test.root_module.addIncludePath(b.path("src/ui"));
+    native_test.root_module.addCSourceFiles(.{
+        .root = b.path("."),
+        .flags = &.{"-std=c++17"},
+        .files = &.{"src/ui/microtex_shim.cpp"},
+    });
+    native_test.root_module.linkSystemLibrary("tinyxml2", .{ .use_pkg_config = .force });
+    native_test.root_module.link_libcpp = true;
+    native_test.root_module.addImport("microtex", microtex_module);
     native_test.root_module.addImport("native", native);
     native_test.root_module.addImport("ghostty", ghostty);
     native_test.root_module.addImport("zignal", zignal.module("zignal"));

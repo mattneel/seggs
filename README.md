@@ -223,6 +223,7 @@ Function keys depend on the system keyboard settings.
 | Ctrl+Shift+X | Cancel the current agent's turn |
 | Ctrl+I | Show the language server's hover for the symbol at the cursor |
 | Alt+Y / Alt+N | Allow once / reject the visible permission request |
+| Ctrl+T | Open the theme list: hovering or moving previews the row, Escape keeps the theme you had, Enter takes the new one |
 | Ctrl+Shift+T | Open a shell from the list this machine offers, in a new terminal tab |
 | Ctrl+Shift+Left / Right | Move the terminal tab along the strip |
 | Ctrl+` | Open, hide, or show the terminal dock |

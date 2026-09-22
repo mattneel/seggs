@@ -20,7 +20,8 @@ const help =
     \\Config files execute programs. Only load a config that you trust.
     \\F5 starts the selected agent. Ctrl+L focuses the prompt.
     \\Ctrl+Enter sends to that agent. Ctrl+Shift+Enter picks a destination.
-    \\Ctrl+Shift+A opens an agent. F11 toggles fullscreen. Ctrl+Q quits.
+    \\Ctrl+Shift+A opens an agent. Ctrl+T lists the themes. F11 toggles
+    \\fullscreen. Ctrl+Q quits.
     \\
     \\--version prints the version and exits. -h is a synonym for --help.
     \\

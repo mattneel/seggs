@@ -193,7 +193,8 @@ anything**: the cost of the list is 65 stats and 65 head reads rather than 65
 parses, and a row's label comes from the file name for exactly that reason, with
 the few names that differ from the theme's own `displayName` accepted as the
 price. A theme is loaded only when a row is chosen, which is what makes a preview
-affordable. `src/ui/theme_picker.zig` holds the switcher's state - the filtered
+affordable. `Ctrl+T` opens the switcher over that catalog, and `src/ui/theme_picker.zig`
+holds its state - the filtered
 rows, the selection, and the three things a picker can do: preview the row the
 pointer is on, put the previous theme back on Escape, and take the chosen one on
 Enter. Applying repaints what is **already drawn** and not only what comes after,
